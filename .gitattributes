@@ -1,0 +1,15 @@
+# GitHub reports languages by bytes of code, and the vendored tree-sitter
+# grammars carry ~41 MB of machine-generated parser tables — one of them,
+# TreeSitterSqlVendored/src/parser.c, is 39.7 MB on its own. That made the
+# repository look like 97.7% C when no C is written for this app at all.
+
+# Third-party grammars, vendored wholesale.
+TreeSitterSqlVendored/**   linguist-vendored
+TreeSitterYAMLVendored/**  linguist-vendored
+TreeSitterDiffVendored/**  linguist-vendored
+
+# Our own grammar: the parser tables are generated, but grammar.js and the
+# queries are hand-written and should still count.
+TreeSitterBestTextLog/src/parser.c      linguist-generated
+TreeSitterBestTextLog/src/grammar.json  linguist-generated
+TreeSitterBestTextLog/src/node-types.json linguist-generated

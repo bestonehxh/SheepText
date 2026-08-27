@@ -1,0 +1,30 @@
+{
+  "configurations" : [
+    {
+      "id" : "94045E2D-6544-43FF-A808-501251E6B360",
+      "name" : "Test Scheme Action",
+      "options" : {
+
+      }
+    }
+  ],
+  "defaultOptions" : {
+    "performanceAntipatternCheckerEnabled" : true,
+    "targetForVariableExpansion" : {
+      "containerPath" : "container:SheepText.xcodeproj",
+      "identifier" : "63B9A6432F9A582B00A7A357",
+      "name" : "SheepText"
+    }
+  },
+  "testTargets" : [
+    {
+      "parallelizable" : true,
+      "target" : {
+        "containerPath" : "container:SheepText.xcodeproj",
+        "identifier" : "63B9A6502F9A582D00A7A357",
+        "name" : "SheepTextTests"
+      }
+    }
+  ],
+  "version" : 1
+}

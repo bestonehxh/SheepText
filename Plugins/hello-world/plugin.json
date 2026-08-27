@@ -1,0 +1,19 @@
+{
+  "id": "hello-world",
+  "name": "Hello World",
+  "version": "0.1.0",
+  "main": "src/index.js",
+  "activationEvents": ["onStartup"],
+  "contributes": {
+    "commands": [
+      { "id": "hello.greet",       "title": "Hello: Greet" },
+      { "id": "hello.reverseLine", "title": "Hello: Reverse Current Line" },
+      { "id": "hello.countLines",  "title": "Hello: Count Lines in Document" },
+      { "id": "hello.applyHighlightDefaults", "title": "Hello: Apply Highlight Extension Rules" },
+      { "id": "hello.clearHighlightDefaults", "title": "Hello: Clear Highlight Extension Rules" }
+    ],
+    "keybindings": [
+      { "command": "hello.reverseLine", "key": "cmd+alt+r" }
+    ]
+  }
+}
