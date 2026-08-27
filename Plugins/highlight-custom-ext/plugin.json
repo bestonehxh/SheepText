@@ -1,0 +1,13 @@
+{
+  "id": "highlight-custom-ext",
+  "name": "Highlight Custom Extension",
+  "version": "1.0.0",
+  "main": "src/index.js",
+  "activationEvents": ["onStartup"],
+  "contributes": {
+    "commands": [
+      { "id": "highlight.applyDefaults", "title": "Highlight: Apply Custom Extension Rules" },
+      { "id": "highlight.clearDefaults", "title": "Highlight: Clear Custom Extension Rules" }
+    ]
+  }
+}
