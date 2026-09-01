@@ -1,6 +1,6 @@
 //
 //  UpdateChecker.swift
-//  Checks https://github.com/bestonehxh/SheepText-app/releases/latest for a newer version.
+//  Checks https://github.com/bestonehxh/SheepText/releases/latest for a newer version.
 //
 
 import AppKit
@@ -32,7 +32,7 @@ final class UpdateChecker {
     // MARK: - Private
 
     private static func fetchLatestRelease() async throws -> GitHubRelease {
-        let url = URL(string: "https://api.github.com/repos/bestonehxh/SheepText-app/releases/latest")!
+        let url = URL(string: "https://api.github.com/repos/bestonehxh/SheepText/releases/latest")!
         var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 15)
         request.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
         let (data, _) = try await URLSession.shared.data(for: request)
