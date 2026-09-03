@@ -21,6 +21,74 @@
 import SwiftUI
 import AppKit
 
+// MARK: - Matching
+
+/// The find bar's matching, as pure functions over text.
+///
+/// It lives outside the view for two reasons. It is the part with the sharp
+/// edge — `stillMatching` is what stands between a stale range and a corrupted
+/// document — and it is the part worth testing without a window.
+nonisolated enum FindMatching {
+
+    static func regex(pattern: String,
+                      useRegex: Bool,
+                      wholeWord: Bool,
+                      caseSensitive: Bool) throws -> NSRegularExpression {
+        var regexPattern = useRegex ? pattern : NSRegularExpression.escapedPattern(for: pattern)
+        if wholeWord {
+            regexPattern = #"\b"# + regexPattern + #"\b"#
+        }
+        var options: NSRegularExpression.Options = []
+        if !caseSensitive { options.insert(.caseInsensitive) }
+        return try NSRegularExpression(pattern: regexPattern, options: options)
+    }
+
+    /// All matches, capped at `limit`.
+    ///
+    /// The cap used to apply only in large-file mode. A two-character query in an
+    /// ordinary ~1 MB file can still match six figures of ranges, all of them held
+    /// as NSRange and shipped through a notification; past the cap the count is
+    /// meaningless to a human anyway and Replace All is disabled (matchesTruncated).
+    static func matches(in text: String,
+                        regex: NSRegularExpression,
+                        limit: Int) -> (ranges: [NSRange], truncated: Bool) {
+        let fullRange = NSRange(location: 0, length: (text as NSString).length)
+        var ranges: [NSRange] = []
+        var truncated = false
+        regex.enumerateMatches(in: text, options: [], range: fullRange) { match, _, stop in
+            guard let range = match?.range, range.location != NSNotFound else { return }
+            if ranges.count >= limit {
+                truncated = true
+                stop.pointee = true
+                return
+            }
+            ranges.append(range)
+        }
+        return (ranges, truncated)
+    }
+
+    /// The subset of `ranges` that still describes a match of `regex` in `text`.
+    ///
+    /// Match ranges were computed once and then applied blind. Anything that
+    /// edited the document in between — the user typing, a plugin, a compare
+    /// transfer, an external reload — moved the text out from under them, and
+    /// Replace wrote the replacement over whatever now occupied those offsets.
+    /// A range survives only if the text at exactly those offsets is exactly a
+    /// match: `.anchored` pins the start, and the length has to come back equal
+    /// so a longer or shorter match at the same place is rejected too.
+    static func stillMatching(_ ranges: [NSRange],
+                              in text: NSString,
+                              regex: NSRegularExpression) -> [NSRange] {
+        let length = text.length
+        return ranges.filter { range in
+            guard range.location >= 0, range.length > 0, NSMaxRange(range) <= length else { return false }
+            guard let found = regex.firstMatch(in: text as String, options: [.anchored], range: range)
+            else { return false }
+            return found.range == range
+        }
+    }
+}
+
 // MARK: - Controller
 
 @Observable
@@ -183,6 +251,19 @@ struct FindReplaceBar: View {
         .onReceive(NotificationCenter.default.publisher(for: .findBarPrevious)) { _ in
             if controller.isVisible { goToPrevious() }
         }
+        // The match list was computed on appear and on option/query changes and
+        // then never again, so every edit to the document left it describing text
+        // that had moved. The count went wrong, the highlights drifted, and
+        // Replace applied a stale range. AppKit already posts this for every edit
+        // that goes through the text view, so nothing in EditorView has to change.
+        //
+        // Filtered to EditorTextView on purpose: a plain NSTextField's field
+        // editor posts the same notification, so typing in the find bar's OWN
+        // query box would otherwise schedule a second, redundant pass.
+        .onReceive(NotificationCenter.default.publisher(for: NSText.didChangeNotification)) { note in
+            guard controller.isVisible, note.object is EditorTextView else { return }
+            scheduleRefresh()
+        }
     }
 
     // MARK: - Count label
@@ -249,10 +330,17 @@ struct FindReplaceBar: View {
     }
 
     private func replaceCurrent() {
-        guard !controller.matches.isEmpty else { return }
+        guard controller.matches.indices.contains(controller.currentIndex) else { return }
         let range = controller.matches[controller.currentIndex]
+        // Verify against the document as it is NOW. `replaceOccurrences` only
+        // bounds-checks, so a range left over from before an edit would happily
+        // overwrite whatever moved into those offsets.
+        guard verified([range]).count == 1 else {
+            recompute(navigating: false)
+            return
+        }
         onReplace(range, controller.replacement)
-        recompute()
+        recompute(navigating: false)
         if !controller.matches.isEmpty {
             // After replacement the indices shift; keep pointer at the
             // same position if possible.
@@ -263,8 +351,24 @@ struct FindReplaceBar: View {
 
     private func replaceAll() {
         guard !controller.matches.isEmpty, !controller.matchesTruncated else { return }
-        onReplaceAll(controller.matches, controller.replacement)
-        recompute()
+        let survivors = verified(controller.matches)
+        guard !survivors.isEmpty else {
+            recompute(navigating: false)
+            return
+        }
+        onReplaceAll(survivors, controller.replacement)
+        recompute(navigating: false)
+    }
+
+    /// The ranges that still match the query in the document's current text.
+    private func verified(_ ranges: [NSRange]) -> [NSRange] {
+        guard !controller.query.isEmpty,
+              let re = try? FindMatching.regex(pattern: controller.query,
+                                               useRegex: controller.useRegex,
+                                               wholeWord: controller.wholeWord,
+                                               caseSensitive: controller.caseSensitive)
+        else { return [] }
+        return FindMatching.stillMatching(ranges, in: currentText() as NSString, regex: re)
     }
 
     // MARK: - Match computation
@@ -277,10 +381,29 @@ struct FindReplaceBar: View {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.18, execute: item)
     }
 
-    private func recompute() {
+    /// Same coalescing, for edits to the document rather than to the query.
+    /// Never navigates: the user is typing in the editor, and yanking the caret
+    /// to match #1 on every keystroke would make the find bar unusable.
+    private func scheduleRefresh() {
+        controller.pendingRecompute?.cancel()
+        let item = DispatchWorkItem { recompute(navigating: false) }
+        controller.pendingRecompute = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.18, execute: item)
+    }
+
+    /// - Parameter navigating: whether to jump to (and select) the first match.
+    ///   True for a fresh query, false when re-syncing after a document edit.
+    private func recompute(navigating: Bool = true) {
         controller.pendingRecompute?.cancel()
         controller.pendingRecompute = nil
         controller.errorMessage = nil
+
+        // Where the current match was, so a refresh after an edit can land on
+        // the nearest match to it instead of snapping back to the top.
+        let previousAnchor = controller.matches.indices.contains(controller.currentIndex)
+            ? controller.matches[controller.currentIndex].location
+            : 0
+
         controller.matches = []
         controller.currentIndex = 0
         controller.matchesTruncated = false
@@ -293,49 +416,32 @@ struct FindReplaceBar: View {
         let text = currentText()
         let result: (ranges: [NSRange], truncated: Bool)
         do {
-            result = try computeMatches(in: text, pattern: controller.query)
+            let regex = try FindMatching.regex(pattern: controller.query,
+                                               useRegex: controller.useRegex,
+                                               wholeWord: controller.wholeWord,
+                                               caseSensitive: controller.caseSensitive)
+            result = FindMatching.matches(in: text, regex: regex,
+                                          limit: LargeFilePolicy.largeFindMatchLimit)
         } catch {
             controller.errorMessage = "Invalid regex"
+            NotificationCenter.default.post(name: .findBarClearHighlights, object: nil)
             return
         }
         controller.matches = result.ranges
         controller.matchesTruncated = result.truncated
-        if !result.ranges.isEmpty {
-            onNavigate(result.ranges[0])
-            postCurrentHighlight()
-        } else {
+
+        guard !result.ranges.isEmpty else {
             NotificationCenter.default.post(name: .findBarClearHighlights, object: nil)
+            return
         }
-    }
 
-    private func computeMatches(in text: String, pattern: String) throws -> (ranges: [NSRange], truncated: Bool) {
-        let fullRange = NSRange(location: 0, length: (text as NSString).length)
-
-        var regexPattern = controller.useRegex ? pattern : NSRegularExpression.escapedPattern(for: pattern)
-        if controller.wholeWord {
-            regexPattern = #"\b"# + regexPattern + #"\b"#
+        if navigating {
+            onNavigate(result.ranges[0])
+        } else {
+            controller.currentIndex = result.ranges.firstIndex { $0.location >= previousAnchor }
+                ?? (result.ranges.count - 1)
         }
-        var options: NSRegularExpression.Options = []
-        if !controller.caseSensitive { options.insert(.caseInsensitive) }
-
-        let regex = try NSRegularExpression(pattern: regexPattern, options: options)
-        // The cap used to apply only in large-file mode. A two-character query in an
-        // ordinary ~1 MB file can still match six figures of ranges, all of them held
-        // as NSRange and shipped through a notification; past the cap the count is
-        // meaningless to a human anyway and Replace All is disabled (matchesTruncated).
-        let limit = LargeFilePolicy.largeFindMatchLimit
-        var ranges: [NSRange] = []
-        var truncated = false
-        regex.enumerateMatches(in: text, options: [], range: fullRange) { match, _, stop in
-            guard let range = match?.range, range.location != NSNotFound else { return }
-            if ranges.count >= limit {
-                truncated = true
-                stop.pointee = true
-                return
-            }
-            ranges.append(range)
-        }
-        return (ranges, truncated)
+        postCurrentHighlight()
     }
 }
 

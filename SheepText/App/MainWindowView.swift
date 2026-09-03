@@ -2,12 +2,16 @@
 //  MainWindowView.swift
 //  Top-level layout for a window.
 //
-//  Custom split layout (no NavigationSplitView): the tab bar spans the full
-//  window width and shares the titlebar row with the traffic lights, and the
-//  sidebar lives strictly BELOW it. NavigationSplitView left a collapsed
-//  column frame painted behind the content and animated its own hidden
-//  column, so toggling flickered and a ghost sidebar border stayed on screen.
-//  A plain HStack has neither problem. ⌘0 toggles the sidebar.
+//  Custom split layout (no NavigationSplitView): the sidebar is a FULL-HEIGHT
+//  column that owns the traffic-light row, and the tab bar spans only the
+//  detail pane beside it. Same layout as SheepTerm — one family, one shape —
+//  and it is what lets the sidebar's glass be a tall column instead of a
+//  stripe across the top of the window.
+//
+//  NavigationSplitView left a collapsed column frame painted behind the
+//  content and animated its own hidden column, so toggling flickered and a
+//  ghost sidebar border stayed on screen. A plain HStack has neither problem.
+//  ⌘0 toggles the sidebar.
 //
 
 import SwiftUI
@@ -28,20 +32,38 @@ struct MainWindowView: View {
     @AppStorage("sheeptext.sidebarWidth") private var sidebarWidth: Double = 240
     @State private var selectedPanel: SidebarView.Panel = .files
     @State private var isShowingRecoveredDrafts = false
-    private let diskChangeTimer = Timer.publish(every: 4, on: .main, in: .common).autoconnect()
+    /// @State, not `let`. A View is a struct that SwiftUI re-initialises on
+    /// every parent update, and `Timer.publish(...).autoconnect()` in a stored
+    /// property meant a brand-new timer (and a brand-new subscription) each
+    /// time — the 4-second poll restarted from zero on every re-init and, while
+    /// the view was updating often, could go long stretches without firing.
+    @State private var diskChangeTimer = Timer.publish(every: 4, on: .main, in: .common).autoconnect()
 
     var body: some View {
-        VStack(spacing: 0) {
-            // Lives in the titlebar row. It tracks fullscreen itself so that
-            // showing the sidebar never animates this bar.
-            TabBarView(onToggleSidebar: toggleSidebar)
+        HStack(spacing: 0) {
+            if sidebarShown {
+                SidebarView(selectedPanel: $selectedPanel)
+                    .frame(width: sidebarWidth)
+                    // NO .clipped() here. The outer .ignoresSafeArea(.top)
+                    // draws this column up into the titlebar row, which puts
+                    // that strip OUTSIDE the view's layout bounds — and
+                    // `.clipped()` limits hit testing to those bounds, so the
+                    // FILES / SEARCH switcher living in the strip stopped
+                    // taking clicks (the tab bar, unclipped, kept working,
+                    // which is what made this look like a titlebar problem).
+                    // Nothing needs the clip: the switcher's own background
+                    // covers the rows that scroll under it.
+                SidebarResizeHandle(width: $sidebarWidth)
+            }
 
-            HStack(spacing: 0) {
-                if sidebarShown {
-                    SidebarView(selectedPanel: $selectedPanel)
-                        .frame(width: sidebarWidth)
-                    SidebarResizeHandle(width: $sidebarWidth)
-                }
+            VStack(spacing: 0) {
+                // Spans the detail pane only. It reserves the traffic-light
+                // gap itself when the sidebar is hidden, since it is then the
+                // view sitting under them.
+                TabBarView(
+                    onToggleSidebar: toggleSidebar,
+                    reservesTrafficLightGap: !sidebarShown
+                )
                 detailContent
             }
             // ignoresSafeAreaEdges: [] is load-bearing — a plain background
@@ -91,6 +113,10 @@ struct MainWindowView: View {
             documents.showDraftsFolder()
         }
         .onReceive(diskChangeTimer) { _ in
+            // Nothing open, nothing to stat. (checkForExternalChanges guards
+            // this too; keeping it here means the timer tick costs nothing at
+            // all in an empty window.)
+            guard !documents.documents.isEmpty else { return }
             documents.checkForExternalChanges()
         }
         .onChange(of: scenePhase) { _, phase in
@@ -124,10 +150,11 @@ struct MainWindowView: View {
 private struct SidebarResizeHandle: View {
     @Binding var width: Double
     @State private var dragStartWidth: Double?
+    @Environment(AppPreferences.self) private var preferences
 
     var body: some View {
         Rectangle()
-            .fill(Color(nsColor: .bestTextBorder))
+            .fill(preferences.chromeStyle.separator)
             .frame(width: 1)
             .overlay(
                 Color.clear

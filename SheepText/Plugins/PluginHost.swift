@@ -25,6 +25,10 @@ final class PluginHost {
     let manifest: PluginManifest
     let folder: URL
     private let context: JSContext
+    /// Held directly rather than fished back out of the context on every call:
+    /// `deactivate()` has to reach it after the JS side may already be torn
+    /// down, and `invokeCommand` should not pay a JS round trip per command.
+    private var commandsBridge: CommandsBridge?
     private weak var commands: CommandRegistry?
     private weak var workspace: WorkspaceStore?
 
@@ -101,6 +105,12 @@ final class PluginHost {
             _ = deactivate.call(withArguments: [])
         }
         commands?.unregisterAll(from: .plugin(manifest.id))
+        // Drops the plugin's JS handlers and their managed references. Without
+        // this the JSContext ⇄ bridge cycle survived every reload, leaking a
+        // whole JS heap per press of Reload.
+        commandsBridge?.deactivate()
+        commandsBridge = nil
+        context.exceptionHandler = nil
         PluginLog.shared.log("[\(manifest.id)] deactivated")
     }
 
@@ -108,6 +118,7 @@ final class PluginHost {
 
     private func installBridges() {
         let commandsBridge  = CommandsBridge(host: self)
+        self.commandsBridge = commandsBridge
         let editorBridge    = EditorBridge()
         let workspaceBridge = WorkspaceBridge(workspace: workspace)
         let uiBridge        = UIBridge()
@@ -150,8 +161,7 @@ final class PluginHost {
         // Plugin JS already registered the handler on the commands bridge;
         // we route through the bridge, not back through the Swift registry,
         // to avoid recursion.
-        guard let bridge = context.objectForKeyedSubscript("commands")?.toObject() as? CommandsBridge else { return }
-        bridge.trigger(id: id)
+        commandsBridge?.trigger(id: id)
     }
 
     // MARK: - Module shim

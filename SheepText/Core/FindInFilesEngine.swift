@@ -60,7 +60,15 @@ nonisolated enum FindInFilesEngine {
         "pdf", "png", "so", "sqlite", "tiff", "webp", "xcuserstate", "zip"
     ]
 
-    static func search(root: URL, tree: FileNode?, options: FindInFilesOptions) throws -> FindInFilesSummary {
+    /// - Parameter isCancelled: consulted once per file and once per match, so a
+    ///   superseded search stops reading files instead of running to completion
+    ///   behind the one the user is waiting for.
+    static func search(
+        root: URL,
+        tree: FileNode?,
+        options: FindInFilesOptions,
+        isCancelled: () -> Bool = { false }
+    ) throws -> FindInFilesSummary {
         let query = options.query.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !query.isEmpty else { throw FindInFilesError.emptyQuery }
         let regex = try makeRegex(options: options)
@@ -69,21 +77,32 @@ nonisolated enum FindInFilesEngine {
         var searchedFiles = 0
         var skippedFiles = 0
 
+        // One scope resolve for the whole search. It used to happen per file —
+        // a UserDefaults bookmark-dictionary copy and a
+        // URL(resolvingBookmarkData:) for every file in the workspace — even
+        // though every file in the tree lives under this root's scope.
+        _ = SecurityScopedResourceAccess.prepare(
+            root,
+            bookmarkKey: SecurityScopedResourceAccess.workspaceBookmarksKey,
+            shouldRemember: false
+        )
+
         for node in FileNode.flatten(tree) where !node.isDirectory {
-            guard matches.count < maxMatches else {
+            // `maxMatches` is the absolute cap. The caller used to pass
+            // `maxMatches - matches.count` as a "remaining" budget and
+            // `appendMatches` compared the *total* against it, so the loop
+            // stopped at count >= limit - count — an effective cap of 500 that
+            // never tripped this guard and reported hitLimit false.
+            guard matches.count < maxMatches, !isCancelled() else {
                 return FindInFilesSummary(
                     matches: matches,
                     searchedFiles: searchedFiles,
                     skippedFiles: skippedFiles,
-                    hitLimit: true
+                    hitLimit: matches.count >= maxMatches
                 )
             }
 
-            let url = SecurityScopedResourceAccess.prepare(
-                node.url,
-                bookmarkKey: SecurityScopedResourceAccess.fileBookmarksKey,
-                shouldRemember: false
-            )
+            let url = node.url
             guard shouldSearch(url) else {
                 skippedFiles += 1
                 continue
@@ -97,15 +116,15 @@ nonisolated enum FindInFilesEngine {
                 continue
             }
 
-            let text = TextFileIO.decode(data: data).text
             searchedFiles += 1
             appendMatches(
-                in: text,
+                in: searchText(from: data),
                 url: url,
                 root: root,
                 regex: regex,
-                remainingLimit: maxMatches - matches.count,
-                to: &matches
+                limit: maxMatches,
+                to: &matches,
+                isCancelled: isCancelled
             )
         }
 
@@ -115,6 +134,17 @@ nonisolated enum FindInFilesEngine {
             skippedFiles: skippedFiles,
             hitLimit: matches.count >= maxMatches
         )
+    }
+
+    /// Search only needs the characters, not the encoding, and the overwhelming
+    /// majority of a source tree is BOM-less UTF-8 — which the full detection
+    /// chain reaches only after building and discarding a whole decode.
+    private static func searchText(from data: Data) -> String {
+        if !data.starts(with: [0xEF, 0xBB, 0xBF]),
+           let utf8 = String(data: data, encoding: .utf8) {
+            return utf8
+        }
+        return TextFileIO.decode(data: data).text
     }
 
     static func replaceAll(
@@ -136,12 +166,15 @@ nonisolated enum FindInFilesEngine {
         var skippedFiles = 0
         var backupDirectory: URL?
 
+        // One scope resolve for the whole pass; see `search`.
+        _ = SecurityScopedResourceAccess.prepare(
+            root,
+            bookmarkKey: SecurityScopedResourceAccess.workspaceBookmarksKey,
+            shouldRemember: false
+        )
+
         for node in FileNode.flatten(tree) where !node.isDirectory {
-            let url = SecurityScopedResourceAccess.prepare(
-                node.url,
-                bookmarkKey: SecurityScopedResourceAccess.fileBookmarksKey,
-                shouldRemember: false
-            )
+            let url = node.url
             guard shouldSearch(url) else {
                 skippedFiles += 1
                 continue
@@ -237,9 +270,15 @@ nonisolated enum FindInFilesEngine {
             ? options.query
             : NSRegularExpression.escapedPattern(for: options.query)
         if options.wholeWord {
-            pattern = #"\b"# + pattern + #"\b"#
+            // Non-capturing group, because alternation binds looser than
+            // concatenation: `\bfoo|bar\b` is "\bfoo" OR "bar\b", not what the
+            // user asked for.
+            pattern = #"\b(?:"# + pattern + #")\b"#
         }
-        var regexOptions: NSRegularExpression.Options = []
+        // The scan runs over the whole file in one pass now (it used to feed the
+        // regex one line at a time), so ^ and $ have to be told to keep meaning
+        // "start/end of line".
+        var regexOptions: NSRegularExpression.Options = [.anchorsMatchLines]
         if !options.caseSensitive {
             regexOptions.insert(.caseInsensitive)
         }
@@ -269,60 +308,100 @@ nonisolated enum FindInFilesEngine {
         TextFileIO.looksBinary(data)
     }
 
+    /// One regex pass over the whole file.
+    ///
+    /// This used to walk the file line by line: `lineRange`, `substring` (a
+    /// fresh String, re-bridged to NSString for its length) and a separate
+    /// `regex.matches` call — per line, for every file, whether or not the line
+    /// contained anything. Now the regex runs once over the text and the line
+    /// number comes from a table of line starts, which is only built when a file
+    /// actually matches.
     private static func appendMatches(
         in text: String,
         url: URL,
         root: URL,
         regex: NSRegularExpression,
-        remainingLimit: Int,
-        to matches: inout [FindInFilesMatch]
+        limit: Int,
+        to matches: inout [FindInFilesMatch],
+        isCancelled: () -> Bool
     ) {
-        guard remainingLimit > 0 else { return }
+        guard matches.count < limit else { return }
 
         let ns = text as NSString
+        guard ns.length > 0 else { return }
         let relativePath = url.path(relativeTo: root)
-        var lineStart = 0
-        var lineNumber = 1
 
-        while lineStart < ns.length, matches.count < remainingLimit {
-            let paragraphRange = ns.lineRange(for: NSRange(location: lineStart, length: 0))
-            var contentRange = paragraphRange
-            while contentRange.length > 0 {
-                let last = ns.character(at: NSMaxRange(contentRange) - 1)
-                if last == 10 || last == 13 {
-                    contentRange.length -= 1
-                } else {
-                    break
-                }
+        var lineStarts: [Int]?
+        var previewCache: (line: Int, text: String)?
+
+        regex.enumerateMatches(
+            in: text,
+            options: [],
+            range: NSRange(location: 0, length: ns.length)
+        ) { result, _, stop in
+            guard let range = result?.range, range.location != NSNotFound else { return }
+            if isCancelled() {
+                stop.pointee = true
+                return
             }
 
-            let line = ns.substring(with: contentRange)
-            let lineMatches = regex.matches(
-                in: line,
-                options: [],
-                range: NSRange(location: 0, length: (line as NSString).length)
-            )
+            let starts = lineStarts ?? Self.lineStartOffsets(in: ns)
+            lineStarts = starts
 
-            for match in lineMatches where match.range.location != NSNotFound {
-                matches.append(
-                    FindInFilesMatch(
-                        url: url,
-                        relativePath: relativePath,
-                        lineNumber: lineNumber,
-                        column: match.range.location + 1,
-                        preview: previewLine(line)
-                    )
+            let lineIndex = Self.lineIndex(for: range.location, in: starts)
+            let preview: String
+            if let cached = previewCache, cached.line == lineIndex {
+                preview = cached.text
+            } else {
+                preview = previewLine(Self.lineContent(at: lineIndex, starts: starts, ns: ns))
+                previewCache = (lineIndex, preview)
+            }
+
+            matches.append(
+                FindInFilesMatch(
+                    url: url,
+                    relativePath: relativePath,
+                    lineNumber: lineIndex + 1,
+                    column: range.location - starts[lineIndex] + 1,
+                    preview: preview
                 )
-                if matches.count >= remainingLimit {
-                    break
-                }
+            )
+            if matches.count >= limit {
+                stop.pointee = true
             }
-
-            let next = NSMaxRange(paragraphRange)
-            if next <= lineStart { break }
-            lineStart = next
-            lineNumber += 1
         }
+    }
+
+    /// UTF-16 offset of the first character of every line.
+    private static func lineStartOffsets(in ns: NSString) -> [Int] {
+        var starts: [Int] = [0]
+        var buffer = CFStringInlineBuffer()
+        let length = ns.length
+        CFStringInitInlineBuffer(ns as CFString, &buffer, CFRange(location: 0, length: length))
+        for index in 0..<length where CFStringGetCharacterFromInlineBuffer(&buffer, index) == 10 {
+            starts.append(index + 1)
+        }
+        return starts
+    }
+
+    private static func lineIndex(for location: Int, in starts: [Int]) -> Int {
+        var low = 0
+        var high = starts.count - 1
+        while low < high {
+            let mid = (low + high + 1) / 2
+            if starts[mid] <= location { low = mid } else { high = mid - 1 }
+        }
+        return low
+    }
+
+    private static func lineContent(at lineIndex: Int, starts: [Int], ns: NSString) -> String {
+        let start = starts[lineIndex]
+        var end = lineIndex + 1 < starts.count ? starts[lineIndex + 1] : ns.length
+        while end > start {
+            let last = ns.character(at: end - 1)
+            if last == 10 || last == 13 { end -= 1 } else { break }
+        }
+        return ns.substring(with: NSRange(location: start, length: end - start))
     }
 
     private static func previewLine(_ line: String) -> String {

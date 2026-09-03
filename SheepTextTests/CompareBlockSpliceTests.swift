@@ -68,6 +68,72 @@ final class CompareBlockSpliceTests: XCTestCase {
         XCTAssertEqual(result, "a\r\nc\r\n")
     }
 
+    // MARK: - CR-only documents (audit C7)
+    //
+    // `apply` split every document on "\n". A CR-only document contains none, so
+    // it was a single element: the range guard rejected every block except one at
+    // line 0, and that one rewrote the whole file. Splitting on the document's own
+    // separator makes mid-file blocks address the lines they name.
+
+    func testCRDocumentMidFileReplace() {
+        let result = CompareBlockSplice.apply(
+            text: "a\rb\rc\rd",
+            replaceStart: 1,
+            replaceCount: 2,
+            replacementLines: ["X", "Y", "Z"],
+            lineEnding: .cr
+        )
+        XCTAssertEqual(result, "a\rX\rY\rZ\rd")
+        XCTAssertFalse((result ?? "").contains("\n"), "an LF leaked into a CR-only document")
+    }
+
+    func testCRDocumentMidFileSingleLineReplace() {
+        XCTAssertEqual(
+            CompareBlockSplice.apply(
+                text: "a\rb\rc\r", replaceStart: 1, replaceCount: 1,
+                replacementLines: ["B"], lineEnding: .cr
+            ),
+            "a\rB\rc\r"
+        )
+    }
+
+    func testCRDocumentMidFileInsertion() {
+        XCTAssertEqual(
+            CompareBlockSplice.apply(
+                text: "a\rb\rc", replaceStart: 2, replaceCount: 0,
+                replacementLines: ["X"], lineEnding: .cr
+            ),
+            "a\rb\rX\rc"
+        )
+    }
+
+    func testCRDocumentMidFileDeletion() {
+        XCTAssertEqual(
+            CompareBlockSplice.apply(
+                text: "a\rb\rc\rd", replaceStart: 1, replaceCount: 2,
+                replacementLines: [], lineEnding: .cr
+            ),
+            "a\rd"
+        )
+    }
+
+    func testCRDocumentLastLineReplace() {
+        XCTAssertEqual(
+            CompareBlockSplice.apply(
+                text: "a\rb\rc", replaceStart: 2, replaceCount: 1,
+                replacementLines: ["C"], lineEnding: .cr
+            ),
+            "a\rb\rC"
+        )
+    }
+
+    func testCRDocumentOutOfRangeStillReturnsNil() {
+        XCTAssertNil(CompareBlockSplice.apply(
+            text: "a\rb\rc", replaceStart: 4, replaceCount: 1,
+            replacementLines: ["X"], lineEnding: .cr
+        ))
+    }
+
     func testCRDocumentNeverGainsAnLF() {
         let result = CompareBlockSplice.apply(
             text: "a\rb\rc",

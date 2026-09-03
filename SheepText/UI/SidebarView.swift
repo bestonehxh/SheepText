@@ -2,6 +2,11 @@
 //  SidebarView.swift
 //  File tree sidebar with fast, full-width row hit targets.
 //
+//  Full-height column: it owns the traffic-light row, so everything inside
+//  starts below `trafficLightGap`. Folders are set as letterpress section
+//  headers and files carry an extension chip instead of an icon — see
+//  Letterpress.swift for why.
+//
 
 import SwiftUI
 import AppKit
@@ -17,13 +22,28 @@ struct SidebarView: View {
 
     @Environment(WorkspaceStore.self) private var workspace
     @Environment(DocumentStore.self)  private var documents
+    @Environment(AppPreferences.self) private var preferences
     @State private var expandedFolders: Set<URL> = []
     @State private var selectedTreeURL: URL?
+    /// Mirrors the tab bar's own fullscreen tracking so the gap changes DURING
+    /// the system transition rather than popping after it.
+    @State private var isFullScreen = false
+
+    /// The titlebar strip this column sits under. Controls placed INSIDE it do
+    /// not reliably receive clicks — verified by driving the real app: the
+    /// switcher was dead there as a Button and as an onTapGesture, clipped and
+    /// unclipped, and came alive the moment it moved below the strip. The tab
+    /// bar works there only because it is a plain view, not a control target.
+    /// SheepTerm's sidebar keeps its search field below the same gap for the
+    /// same reason. macOS hides the lights in fullscreen, so the strip shrinks.
+    private var trafficLightGap: CGFloat {
+        isFullScreen ? 0 : SheepTextChromeMetrics.topBarHeight
+    }
 
     var body: some View {
         VStack(spacing: 0) {
-            panelTabs
-            Divider()
+            panelSwitcher
+
             if selectedPanel == .search {
                 FindInFilesView()
             } else if let tree = workspace.tree {
@@ -46,51 +66,71 @@ struct SidebarView: View {
                 emptyState
             }
         }
-        .background(Color(nsColor: .bestTextSidebarBackground))
+        .background { ChromeBackground(zone: .sidebar) }
+        // Filtered to THIS column's own window, and seeded from it rather than
+        // from NSApp.keyWindow — which is another window entirely when two are
+        // open, and nil whenever the app is not active.
+        .trackingHostWindowFullScreen($isFullScreen)
     }
 
-    private var panelTabs: some View {
-        HStack(spacing: 4) {
-            panelButton(
-                title: "Files",
-                systemImage: "folder",
-                isSelected: selectedPanel == .files
-            ) {
-                selectedPanel = .files
-            }
+    /// Two words, no buttons, no icons, no tile — the same letterpress
+    /// treatment as the tabs, and it stays put in both panels so switching
+    /// never moves the rest of the column.
+    ///
+    /// It shares its band with the traffic lights and is exactly as tall as
+    /// the tab bar next to it, so the window has ONE top band with one bottom
+    /// rule running across it, not two stacked rows of different heights.
+    private var panelSwitcher: some View {
+        VStack(spacing: 0) {
+            // The titlebar strip itself: traffic lights only, and draggable
+            // like a real titlebar. Its bottom rule lines up with the tab
+            // bar's, so the window still reads as one band across the top.
+            Color.clear
+                .frame(height: trafficLightGap)
+                .contentShape(Rectangle())
+                .gesture(WindowDragGesture())
+                .overlay(alignment: .bottom) {
+                    // An overlay does NOT collapse with a zero-height host, so
+                    // in fullscreen (gap 0) this rule used to keep drawing at
+                    // y≈0 while the tab bar's rule sat at y=30 — a stray
+                    // hairline across the sidebar, breaking the one-band /
+                    // one-rule invariant this strip exists to hold.
+                    if trafficLightGap > 0 {
+                        Rectangle()
+                            .fill(preferences.chromeStyle.separator)
+                            .frame(height: 1)
+                    }
+                }
+                .animation(.easeOut(duration: 0.18), value: isFullScreen)
 
-            panelButton(
-                title: "Search",
-                systemImage: "magnifyingglass",
-                isSelected: selectedPanel == .search
-            ) {
-                selectedPanel = .search
+            HStack(spacing: 16) {
+                switchItem("Files", panel: .files)
+                switchItem("Search", panel: .search)
+                Spacer(minLength: 0)
             }
+            .padding(.horizontal, 14)
+            .frame(height: 26)
         }
-        .padding(.horizontal, 6)
-        .padding(.vertical, 6)
-        .background(Color(nsColor: .bestTextSidebarBackground))
     }
 
-    private func panelButton(
-        title: String,
-        systemImage: String,
-        isSelected: Bool,
-        action: @escaping () -> Void
-    ) -> some View {
-        SidebarPanelTabButton(
-            title: title,
-            systemImage: systemImage,
-            isSelected: isSelected,
-            action: action
-        )
+    private func switchItem(_ title: String, panel: Panel) -> some View {
+        // fixedSize: these two words keep their width no matter how narrow the
+        // sidebar is dragged — they are the column's only navigation.
+        let isOn = selectedPanel == panel
+        return PressLabel(text: title, size: 10, emphasized: isOn,
+                          color: isOn ? Color(nsColor: .bestTextAccent) : nil)
+            .fixedSize()
+            .padding(.vertical, 6)
+            .contentShape(Rectangle())
+            .onTapGesture { selectedPanel = panel }
+            .help(panel == .search ? "Find in Files (⇧⌘F)" : "Files")
     }
 
     private var emptyState: some View {
         VStack(spacing: 10) {
             Spacer()
             Image(systemName: "folder")
-                .font(.largeTitle)
+                .chromeSymbol(size: 30, weight: .regular)
                 .foregroundStyle(Color(nsColor: .bestTextFolderIcon))
             Text("No folder open")
                 .foregroundStyle(.secondary)
@@ -109,7 +149,32 @@ struct SidebarView: View {
     }
 }
 
-private struct FileTreeView: View {
+/// Everything a row needs that is the SAME for every row, resolved once per
+/// tree render instead of once per row.
+///
+/// `FileTreeNodeView` carries closures and bindings, so SwiftUI can never prove
+/// two instances equal: any parent invalidation (a tab switch, opening a
+/// document, entering compare) re-runs the body of every instantiated row. At
+/// ~5000 files, standardizing the selected / active / compare URLs inside each
+/// row meant thousands of `standardizedFileURL` calls per tab switch. Reading
+/// `preferences.chromeStyle` in each row also registered 5000 separate
+/// `@Observable` dependencies on preferences.
+private struct FileTreeContext {
+    let selectedURL: URL?
+    let activeURL: URL?
+    /// BOTH compare sides. Only the left one used to be tracked, so entering
+    /// compare mode marked one of the two files in the tree and left the other
+    /// looking untouched — while the tab bar badged both.
+    let compareLeftURL: URL?
+    let compareRightURL: URL?
+    let hoverFill: Color
+    let onOpenFile: (URL) -> Void
+}
+
+struct FileTreeView: View {
+    @Environment(DocumentStore.self) private var documents
+    @Environment(AppPreferences.self) private var preferences
+
     let nodes: [FileNode]
     @Binding var expandedFolders: Set<URL>
     @Binding var selectedURL: URL?
@@ -117,73 +182,73 @@ private struct FileTreeView: View {
     let onOpenFile: (URL) -> Void
 
     var body: some View {
+        let context = FileTreeContext(
+            selectedURL: selectedURL?.standardizedFileURL,
+            activeURL: activeURL?.standardizedFileURL,
+            compareLeftURL: documents.compareLeftDocument?.url?.standardizedFileURL,
+            compareRightURL: documents.compareRightDocument?.url?.standardizedFileURL,
+            hoverFill: preferences.chromeStyle.hoverFill,
+            onOpenFile: onOpenFile
+        )
+
+        // No ChromeBackground here: the whole sidebar column already sits on
+        // one, and a second behind-window NSVisualEffectView nested inside it
+        // is fully occluded — a blur/sample pass paid per composite for
+        // nothing.
         ScrollView {
             LazyVStack(alignment: .leading, spacing: 1) {
-                ForEach(nodes) { node in
+                ForEach(Self.flatten(nodes, expandedFolders: expandedFolders)) { row in
                     FileTreeNodeView(
-                        node: node,
-                        level: 0,
+                        node: row.node,
+                        level: row.level,
                         expandedFolders: $expandedFolders,
                         selectedURL: $selectedURL,
-                        activeURL: activeURL,
-                        onOpenFile: onOpenFile
+                        context: context
                     )
                 }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(.horizontal, 8)
-            .padding(.vertical, 8)
+            .padding(.horizontal, 10)
+            .padding(.top, 4)
+            .padding(.bottom, 14)
         }
-        .background(Color(nsColor: .bestTextSidebarBackground))
     }
-}
 
-private struct SidebarPanelTabButton: View {
-    let title: String
-    let systemImage: String
-    let isSelected: Bool
-    let action: () -> Void
+    /// One visible row: the node and how deep it sits.
+    struct Row: Identifiable {
+        let node: FileNode
+        let level: Int
+        var id: URL { node.url }
+    }
 
-    @State private var isHovering = false
-
-    var body: some View {
-        Button(action: action) {
-            VStack(spacing: 3) {
-                Image(systemName: systemImage)
-                    .font(.system(size: 15, weight: .semibold))
-                    .frame(height: 16)
-
-                Text(title)
-                    .font(.system(size: 10.5, weight: .semibold))
-                    .lineLimit(1)
-                    .minimumScaleFactor(0.75)
+    /// Depth-first walk of the *expanded* tree, produced once per render.
+    ///
+    /// The rows used to nest: the outer `LazyVStack` held only the roots, and
+    /// each row rendered its own children in a plain `VStack`/`ForEach`. A
+    /// LazyVStack is lazy in its OWN children only, so as soon as a folder was
+    /// open every descendant row was built and laid out whether or not it was
+    /// anywhere near the viewport — opening a `node_modules` meant thousands of
+    /// row bodies, hover trackers and context menus per render pass.
+    ///
+    /// Flattened, the LazyVStack sees every visible row directly and builds only
+    /// the ones on screen. Geometry is unchanged: sibling spacing was 1 in both
+    /// the outer and the inner stack, and each row still carries its own
+    /// `.padding(.top, 12)` for a folder header, so the flattened list lays out
+    /// exactly like the nested one did.
+    static func flatten(_ nodes: [FileNode], expandedFolders: Set<URL>) -> [Row] {
+        var rows: [Row] = []
+        func walk(_ nodes: [FileNode], level: Int) {
+            for node in nodes {
+                rows.append(Row(node: node, level: level))
+                guard node.isDirectory,
+                      expandedFolders.contains(node.url.standardizedFileURL),
+                      let children = node.children
+                else { continue }
+                walk(children, level: level + 1)
             }
-            .foregroundStyle(isSelected ? Color(nsColor: .bestTextAccent) : Color(nsColor: .bestTextPrimaryForeground))
-            .frame(maxWidth: .infinity, minHeight: 42)
-            .contentShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
-            .background(
-                RoundedRectangle(cornerRadius: 8, style: .continuous)
-                    .fill(tabBackground)
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: 8, style: .continuous)
-                    .strokeBorder(isSelected ? Color(nsColor: .bestTextAccent).opacity(0.22) : Color.clear)
-            )
         }
-        .buttonStyle(.plain)
-        .frame(maxWidth: .infinity)
-        .onHover { isHovering = $0 }
-        .help(title)
-    }
-
-    private var tabBackground: Color {
-        if isSelected {
-            return Color(nsColor: .bestTextSelectionBackground)
-        }
-        if isHovering {
-            return Color(nsColor: .bestTextHoverBackground)
-        }
-        return Color.clear
+        walk(nodes, level: 0)
+        return rows
     }
 }
 
@@ -195,86 +260,94 @@ private struct FileTreeNodeView: View {
     let level: Int
     @Binding var expandedFolders: Set<URL>
     @Binding var selectedURL: URL?
-    let activeURL: URL?
-    let onOpenFile: (URL) -> Void
+    let context: FileTreeContext
+
+    /// Stored, not computed: this used to be a `var` that four other computed
+    /// properties each re-evaluated, so one body ran `standardizedFileURL`
+    /// about five times. `FileNode` is declared in `Core/WorkspaceStore.swift`,
+    /// so caching it on the node at scan time is the better fix and belongs in
+    /// that file; this is the in-file half.
+    private let normalizedURL: URL
 
     @State private var isHovering = false
 
-    private var normalizedURL: URL { node.url.standardizedFileURL }
+    init(node: FileNode,
+         level: Int,
+         expandedFolders: Binding<Set<URL>>,
+         selectedURL: Binding<URL?>,
+         context: FileTreeContext) {
+        self.node = node
+        self.level = level
+        self._expandedFolders = expandedFolders
+        self._selectedURL = selectedURL
+        self.context = context
+        self.normalizedURL = node.url.standardizedFileURL
+    }
+
     private var isExpanded: Bool { expandedFolders.contains(normalizedURL) }
     private var hasChildren: Bool { !(node.children ?? []).isEmpty }
 
     private var isSelected: Bool {
-        if let selectedURL {
-            return selectedURL.standardizedFileURL == normalizedURL
+        if let selected = context.selectedURL {
+            return selected == normalizedURL
         }
-        return !node.isDirectory && activeURL?.standardizedFileURL == normalizedURL
+        return !node.isDirectory && context.activeURL == normalizedURL
     }
 
-    private var isCompareLeft: Bool {
-        !node.isDirectory &&
-        documents.compareLeftDocument?.url?.standardizedFileURL == normalizedURL
+    /// Either side of a comparison. Named for what it means to the row — this
+    /// file is in the current comparison — rather than for which pane it is in;
+    /// both are drawn the same amber way.
+    private var isInCompare: Bool {
+        guard !node.isDirectory else { return false }
+        return context.compareLeftURL == normalizedURL
+            || context.compareRightURL == normalizedURL
     }
 
+    /// One row only. Descendants are siblings in the flattened list the parent
+    /// `FileTreeView` builds — see `FileTreeView.flatten`.
     var body: some View {
-        VStack(alignment: .leading, spacing: 1) {
-            row
-
-            if node.isDirectory, isExpanded {
-                ForEach(node.children ?? []) { child in
-                    FileTreeNodeView(
-                        node: child,
-                        level: level + 1,
-                        expandedFolders: $expandedFolders,
-                        selectedURL: $selectedURL,
-                        activeURL: activeURL,
-                        onOpenFile: onOpenFile
-                    )
-                }
-            }
-        }
+        row
+            // Outside `row` on purpose: inside, it stretched the row's
+            // highlight upward and the label stopped being centred in it.
+            .padding(.top, node.isDirectory ? 12 : 0)
     }
 
+    @ViewBuilder
     private var row: some View {
-        HStack(spacing: 6) {
-            Image(systemName: "chevron.right")
-                .font(.system(size: 11, weight: .semibold))
-                .foregroundStyle(.secondary)
-                .rotationEffect(.degrees(isExpanded ? 90 : 0))
-                .opacity(node.isDirectory && hasChildren ? 1 : 0)
-                .frame(width: 12, height: 18)
+        HStack(spacing: 9) {
+            if node.isDirectory {
+                // A folder is a section header, full stop: no icon, no
+                // disclosure triangle. Clicking the header opens and closes
+                // it, and the files listed under it are the disclosure.
+                PressLabel(text: node.name, size: 10,
+                           emphasized: isExpanded,
+                           color: Color(nsColor: .bestTextSecondaryForeground))
+                    .opacity(isExpanded ? 1 : 0.68)
+            } else {
+                ExtensionChip(filename: node.name, isEmphasized: isSelected || isInCompare)
 
-            Image(systemName: node.isDirectory ? "folder" : fileIconName(for: node.name))
-                .font(.system(size: node.isDirectory ? 13 : 12, weight: .regular))
-                .foregroundStyle(
-                    Color(nsColor: node.isDirectory ? .bestTextFolderIcon : .bestTextFileIcon)
-                )
-                .frame(width: 17)
-
-            Text(node.name)
-                .font(.system(size: 13, weight: (isSelected || isCompareLeft) ? .semibold : .regular))
-                .foregroundStyle(
-                    Color(nsColor: isCompareLeft ? .editorModifiedAmber : .bestTextPrimaryForeground)
-                )
-                .lineLimit(1)
-                .truncationMode(.middle)
+                Text(pressBaseName(node.name))
+                    .font(.system(size: 12,
+                                  weight: (isSelected || isInCompare) ? .semibold : .regular))
+                    .foregroundStyle(Color(nsColor: isInCompare
+                                           ? .editorModifiedAmber
+                                           : (isSelected ? .bestTextAccent : .bestTextPrimaryForeground)))
+                    .lineLimit(1)
+                    // Middle: source files share long prefixes AND suffixes
+                    // (CompareDisplayBuilder / CompareBlockSplice), so both
+                    // ends have to survive.
+                    .truncationMode(.middle)
+                    .help(node.name)
+            }
 
             Spacer(minLength: 0)
         }
-        .padding(.leading, CGFloat(level) * 18)
-        .padding(.horizontal, 6)
-        .padding(.vertical, 4)
+        .padding(.leading, CGFloat(level) * 14)
+        .padding(.horizontal, 8)
+        .padding(.vertical, node.isDirectory ? 4 : 4.5)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(rowBackground)
-        .clipShape(RoundedRectangle(cornerRadius: 6))
-        .overlay(alignment: .leading) {
-            if isSelected {
-                Rectangle()
-                    .fill(Color(nsColor: .bestTextAccent))
-                    .frame(width: 2)
-                    .padding(.vertical, 3)
-            }
-        }
+        .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
         .contentShape(Rectangle())
         .onTapGesture(perform: handleClick)
         .onHover { isHovering = $0 }
@@ -315,15 +388,14 @@ private struct FileTreeNodeView: View {
         }
     }
 
-    private var rowBackground: some ShapeStyle {
-        if isCompareLeft {
+    private var rowBackground: Color {
+        if isInCompare {
             return Color(nsColor: .editorModifiedAmber).opacity(0.16)
         }
-        if isSelected {
-            return Color(nsColor: .bestTextSelectionBackground)
-        }
+        // Selection is carried by the accent ink and the chip's border — the
+        // fill would be a slab, which is the thing this design is avoiding.
         if isHovering {
-            return Color(nsColor: .bestTextHoverBackground)
+            return context.hoverFill
         }
         return Color.clear
     }
@@ -348,7 +420,7 @@ private struct FileTreeNodeView: View {
         } else {
             let url = node.url
             DispatchQueue.main.async {
-                onOpenFile(url)
+                context.onOpenFile(url)
             }
         }
     }
@@ -366,7 +438,7 @@ private struct FileTreeNodeView: View {
         if node.isDirectory {
             expandedFolders.insert(normalizedURL)
         }
-        onOpenFile(url)
+        context.onOpenFile(url)
     }
 
     private func createFolder() {
@@ -397,10 +469,12 @@ private struct FileTreeNodeView: View {
             return
         }
         selectedURL = newURL.standardizedFileURL
-        if !node.isDirectory,
-           let document = documents.documents.first(where: { $0.url?.standardizedFileURL == normalizedURL }) {
-            document.url = newURL
-        }
+        // Not `document.url = newURL`: that leaves the security-scoped bookmark,
+        // the accessible URL the disk poll stats through, the recorded disk
+        // state, the recents list and the restored session all pointing at the
+        // old path. Renaming a FOLDER moves everything under it, which the store
+        // handles by prefix-matching, so this call is made either way.
+        documents.documentDidMove(from: node.url, to: newURL)
     }
 
     private func deleteNode() {
@@ -441,16 +515,4 @@ private struct FileTreeNodeView: View {
         alert.runModal()
     }
 
-    private func fileIconName(for name: String) -> String {
-        let ext = (name as NSString).pathExtension.lowercased()
-        switch ext {
-        case "swift":                         return "swift"
-        case "js", "ts", "jsx", "tsx":        return "curlybraces"
-        case "py":                            return "chevron.left.slash.chevron.right"
-        case "md":                            return "doc.richtext"
-        case "json", "yml", "yaml":           return "list.bullet.indent"
-        case "png", "jpg", "jpeg", "gif":     return "photo"
-        default:                              return "doc"
-        }
-    }
 }

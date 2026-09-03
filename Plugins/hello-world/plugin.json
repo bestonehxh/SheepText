@@ -11,9 +11,6 @@
       { "id": "hello.countLines",  "title": "Hello: Count Lines in Document" },
       { "id": "hello.applyHighlightDefaults", "title": "Hello: Apply Highlight Extension Rules" },
       { "id": "hello.clearHighlightDefaults", "title": "Hello: Clear Highlight Extension Rules" }
-    ],
-    "keybindings": [
-      { "command": "hello.reverseLine", "key": "cmd+alt+r" }
     ]
   }
 }

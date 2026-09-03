@@ -33,15 +33,31 @@ import UserNotifications
         }
     }
 
+    /// Transient one-line message for the status bar.
+    ///
+    /// Posts `.statusMessage`. **Nothing observes it yet** — `StatusBarView`
+    /// needs a slot for it — so today this call is silent, which is why the
+    /// contract is written down here rather than left implicit:
+    ///
+    ///   name:     `.statusMessage` ("sheeptext.ui.statusMessage")
+    ///   object:   nil (app-wide, not per document or per window)
+    ///   userInfo: `["message": String]` under `UIBridge.statusMessageKey`
+    ///
+    /// The method is kept rather than removed: the bundled hello-world plugin
+    /// calls it, and the notification is the right shape for the observer —
+    /// only the observer is missing.
     func showStatusMessage(_ message: String) {
         pluginMainAsync {
             NotificationCenter.default.post(
                 name: .statusMessage,
                 object: nil,
-                userInfo: ["message": message]
+                userInfo: [UIBridge.statusMessageKey: message]
             )
         }
     }
+
+    /// `userInfo` key carrying the `String` message of a `.statusMessage` post.
+    nonisolated static let statusMessageKey = "message"
 }
 
 extension Notification.Name {

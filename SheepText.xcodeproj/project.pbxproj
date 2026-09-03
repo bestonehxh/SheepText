@@ -35,6 +35,8 @@
 		64A100832FA5000000000083 /* TreeSitterSql in Frameworks */ = {isa = PBXBuildFile; productRef = 64A100622FA5000000000062 /* TreeSitterSql */; };
 		64A100842FA5000000000084 /* TreeSitterDiff in Frameworks */ = {isa = PBXBuildFile; productRef = 64A100632FA5000000000063 /* TreeSitterDiff */; };
 		64A100912FA5000000000091 /* TreeSitterBestTextLog in Frameworks */ = {isa = PBXBuildFile; productRef = 64A100902FA5000000000090 /* TreeSitterBestTextLog */; };
+		64A100A32FA50000000000A3 /* NetworkHighlightKit in Frameworks */ = {isa = PBXBuildFile; productRef = 64A100A12FA50000000000A1 /* NetworkHighlightKit */; };
+		64A100A42FA50000000000A4 /* NetworkHighlightKit in Frameworks */ = {isa = PBXBuildFile; productRef = 64A100A22FA50000000000A2 /* NetworkHighlightKit */; };
 		A1B2C3D42F9A5E3200A7B003 /* SheepTextTreeSitterQueries in Resources */ = {isa = PBXBuildFile; fileRef = A1B2C3D42F9A5E3200A7B002 /* SheepTextTreeSitterQueries */; };
 /* End PBXBuildFile section */
 
@@ -101,6 +103,7 @@
 				64A100822FA5000000000082 /* TreeSitterYAML in Frameworks */,
 				64A100832FA5000000000083 /* TreeSitterSql in Frameworks */,
 				64A100842FA5000000000084 /* TreeSitterDiff in Frameworks */,
+				64A100A32FA50000000000A3 /* NetworkHighlightKit in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -108,6 +111,7 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				64A100A42FA50000000000A4 /* NetworkHighlightKit in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -190,6 +194,7 @@
 				64A100622FA5000000000062 /* TreeSitterSql */,
 				64A100632FA5000000000063 /* TreeSitterDiff */,
 				64A100902FA5000000000090 /* TreeSitterBestTextLog */,
+				64A100A12FA50000000000A1 /* NetworkHighlightKit */,
 			);
 			productName = BestText;
 			productReference = 63B9A6442F9A582B00A7A357 /* SheepText.app */;
@@ -213,6 +218,7 @@
 			);
 			name = SheepTextTests;
 			packageProductDependencies = (
+				64A100A22FA50000000000A2 /* NetworkHighlightKit */,
 			);
 			productName = BestTextTests;
 			productReference = 63B9A6512F9A582D00A7A357 /* SheepTextTests.xctest */;
@@ -275,6 +281,7 @@
 				64A100422FA5000000000042 /* XCLocalSwiftPackageReference "TreeSitterSqlVendored" */,
 				64A100432FA5000000000043 /* XCLocalSwiftPackageReference "TreeSitterDiffVendored" */,
 				64A1008F2FA500000000008F /* XCLocalSwiftPackageReference "TreeSitterBestTextLog" */,
+				64A100A02FA50000000000A0 /* XCLocalSwiftPackageReference "NetworkHighlightKit" */,
 			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = 63B9A6452F9A582B00A7A357 /* Products */;
@@ -462,7 +469,7 @@
 				"CODE_SIGN_IDENTITY[sdk=macosx*]" = "-";
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 15;
+				CURRENT_PROJECT_VERSION = 2;
 				DEAD_CODE_STRIPPING = YES;
 				DEVELOPMENT_TEAM = CU6RLF74Z7;
 				ENABLE_APP_SANDBOX = YES;
@@ -474,7 +481,7 @@
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
-				MARKETING_VERSION = 1.3.4;
+				MARKETING_VERSION = 3.1;
 				PRODUCT_BUNDLE_IDENTIFIER = Bestchaan.SheepText;
 				PRODUCT_NAME = SheepText;
 				REGISTER_APP_GROUPS = YES;
@@ -496,7 +503,7 @@
 				"CODE_SIGN_IDENTITY[sdk=macosx*]" = "-";
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 15;
+				CURRENT_PROJECT_VERSION = 2;
 				DEAD_CODE_STRIPPING = YES;
 				DEVELOPMENT_TEAM = CU6RLF74Z7;
 				ENABLE_APP_SANDBOX = YES;
@@ -508,7 +515,7 @@
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
-				MARKETING_VERSION = 1.3.4;
+				MARKETING_VERSION = 3.1;
 				PRODUCT_BUNDLE_IDENTIFIER = Bestchaan.SheepText;
 				PRODUCT_NAME = SheepText;
 				REGISTER_APP_GROUPS = YES;
@@ -527,11 +534,11 @@
 			buildSettings = {
 				BUNDLE_LOADER = "$(TEST_HOST)";
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 15;
+				CURRENT_PROJECT_VERSION = 2;
 				DEAD_CODE_STRIPPING = YES;
 				GENERATE_INFOPLIST_FILE = YES;
 				MACOSX_DEPLOYMENT_TARGET = 26.4;
-				MARKETING_VERSION = 1.3.4;
+				MARKETING_VERSION = 3.1;
 				PRODUCT_BUNDLE_IDENTIFIER = Bestchaan.BestTextTests;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				STRING_CATALOG_GENERATE_SYMBOLS = NO;
@@ -549,11 +556,11 @@
 			buildSettings = {
 				BUNDLE_LOADER = "$(TEST_HOST)";
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 15;
+				CURRENT_PROJECT_VERSION = 2;
 				DEAD_CODE_STRIPPING = YES;
 				GENERATE_INFOPLIST_FILE = YES;
 				MACOSX_DEPLOYMENT_TARGET = 26.4;
-				MARKETING_VERSION = 1.3.4;
+				MARKETING_VERSION = 3.1;
 				PRODUCT_BUNDLE_IDENTIFIER = Bestchaan.BestTextTests;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				STRING_CATALOG_GENERATE_SYMBOLS = NO;
@@ -614,6 +621,10 @@
 		64A1008F2FA500000000008F /* XCLocalSwiftPackageReference "TreeSitterBestTextLog" */ = {
 			isa = XCLocalSwiftPackageReference;
 			relativePath = TreeSitterBestTextLog;
+		};
+		64A100A02FA50000000000A0 /* XCLocalSwiftPackageReference "NetworkHighlightKit" */ = {
+			isa = XCLocalSwiftPackageReference;
+			relativePath = NetworkHighlightKit;
 		};
 /* End XCLocalSwiftPackageReference section */
 
@@ -947,6 +958,16 @@
 			isa = XCSwiftPackageProductDependency;
 			package = 64A1008F2FA500000000008F /* XCLocalSwiftPackageReference "TreeSitterBestTextLog" */;
 			productName = TreeSitterBestTextLog;
+		};
+		64A100A12FA50000000000A1 /* NetworkHighlightKit */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 64A100A02FA50000000000A0 /* XCLocalSwiftPackageReference "NetworkHighlightKit" */;
+			productName = NetworkHighlightKit;
+		};
+		64A100A22FA50000000000A2 /* NetworkHighlightKit */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 64A100A02FA50000000000A0 /* XCLocalSwiftPackageReference "NetworkHighlightKit" */;
+			productName = NetworkHighlightKit;
 		};
 /* End XCSwiftPackageProductDependency section */
 	};

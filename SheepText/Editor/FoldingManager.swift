@@ -12,7 +12,20 @@
 
 import AppKit
 
+nonisolated private struct FoldMainActorNotification: @unchecked Sendable {
+    let value: Notification
+}
+
+/// Explicitly `@MainActor` rather than relying on the target's default
+/// isolation: `isolated deinit` (which removes the edit observer) needs the
+/// isolation stated on the type, and without it a whole-module Release build
+/// rejects it while an incremental Debug build accepts it. The setting already
+/// put this class on the main actor — this only says so out loud.
+@MainActor
 final class FoldingManager {
+
+    /// The attachment character a collapsed fold stands behind.
+    private static let placeholderUnit: unichar = 0xFFFC
 
     // MARK: - Types
 
@@ -60,6 +73,130 @@ final class FoldingManager {
     private(set) var regions: [FoldRegion] = []
     private(set) var isMutating = false
     private var didFoldMutation = false
+
+    // MARK: - Keeping regions aligned with user edits
+    //
+    // A `FoldRegion` is an offset into the *displayed* text. `fold` and `unfold`
+    // shift every other region when they mutate the storage themselves — but for
+    // years nothing shifted them when the USER edited. Type one character above a
+    // collapsed fold and every region below it pointed one unit short: the
+    // reconstruction in `fullText(from:)` then spliced the folded block in at the
+    // wrong offset, dropping a character and leaving the U+FFFC attachment char in
+    // the string that becomes `document.text` — and therefore the draft, and the
+    // file on ⌘S. Clicking the placeholder unfolded the wrong range, or nothing.
+    //
+    // The fix mirrors `DiffLayoutManager.processEditing`, which solves the same
+    // problem for compare-mode highlight ranges. It installs itself: no call site
+    // has to remember to drive it, because forgetting is exactly how the bug
+    // survived so long. The subscription exists only while there are folds.
+
+    private var editObserver: NSObjectProtocol?
+    private weak var observedStorage: NSTextStorage?
+
+    /// Subscribe to `textStorage`'s edits, once per storage.
+    ///
+    /// `NSTextStorage.didProcessEditingNotification` is posted from inside
+    /// `processEditing`, synchronously on the editing thread, while
+    /// `editedRange` / `changeInLength` still describe the edit — and, for a
+    /// `beginEditing`/`endEditing` group, describe the whole group coalesced
+    /// into one range. Delivered with `queue: nil` so it lands before the
+    /// `textDidChange` that reads `fullText`.
+    private func observeEdits(of textStorage: NSTextStorage) {
+        guard observedStorage !== textStorage else { return }
+        stopObservingEdits()
+        observedStorage = textStorage
+        editObserver = NotificationCenter.default.addObserver(
+            forName: NSTextStorage.didProcessEditingNotification,
+            object: textStorage,
+            queue: nil
+        ) { [weak self] note in
+            let payload = FoldMainActorNotification(value: note)
+            MainActor.assumeIsolated {
+                guard let self, let storage = payload.value.object as? NSTextStorage else { return }
+                self.storageDidProcessEditing(storage)
+            }
+        }
+    }
+
+    private func stopObservingEdits() {
+        if let editObserver {
+            NotificationCenter.default.removeObserver(editObserver)
+        }
+        editObserver = nil
+        observedStorage = nil
+    }
+
+    /// Drop the subscription once the last fold is gone; `fold` reinstalls it.
+    private func stopObservingIfIdle() {
+        if regions.isEmpty { stopObservingEdits() }
+    }
+
+    private func storageDidProcessEditing(_ textStorage: NSTextStorage) {
+        // fold/unfold/unfoldAll shift the regions themselves.
+        guard !isMutating, !regions.isEmpty else { return }
+        guard textStorage.editedMask.contains(.editedCharacters) else { return }
+        adjustRegions(editedRange: textStorage.editedRange,
+                      changeInLength: textStorage.changeInLength)
+        stopObservingIfIdle()
+    }
+
+    /// Re-point every region for one text edit.
+    ///
+    /// `editedRange` is in NEW coordinates and `changeInLength` is the delta, so
+    /// the span the edit replaced was `[start, start + length - delta)` in the
+    /// old ones — the same arithmetic `DiffLayoutManager.processEditing` does.
+    /// A placeholder that lay inside the replaced span no longer exists, so its
+    /// region is dropped rather than moved: keeping it would splice a folded
+    /// block back into text the user deleted.
+    ///
+    /// Runs for zero-delta edits too. Typing over a one-character selection that
+    /// happens to be the placeholder changes no length at all, and a fix that
+    /// only reacted to length changes would leave a region pointing at a
+    /// character that is no longer an attachment.
+    func adjustRegions(editedRange: NSRange, changeInLength delta: Int) {
+        guard !regions.isEmpty else { return }
+        let editStart = editedRange.location
+        let oldEditEnd = editStart + (editedRange.length - delta)
+
+        regions = regions.compactMap { region in
+            var region = region
+            let loc = region.displayLocation
+            if loc + 1 <= editStart {
+                return region                    // entirely before the edit
+            } else if loc >= oldEditEnd {
+                region.displayLocation = loc + delta
+                return region                    // entirely after the replaced span
+            } else {
+                return nil                       // the placeholder was replaced
+            }
+        }
+    }
+
+    /// Arm the one-shot "the next `textDidChange` came from folding, not the
+    /// user" handshake.
+    ///
+    /// This is deliberately NOT done by `fold`/`unfold`/`unfoldAll` themselves.
+    /// Those mutate the storage directly, which posts no
+    /// `NSText.didChangeNotification` on its own — the notification exists only
+    /// because the INTERACTIVE call sites (the gutter chevron, and clicking a
+    /// fold placeholder) call `didChangeText()` right afterwards. Every other
+    /// caller is programmatic — restoring folds when a view is built, expanding
+    /// them across a tab switch, collapsing them on the way into compare mode —
+    /// and emits no notification at all.
+    ///
+    /// While the mutators armed the flag themselves, those programmatic paths
+    /// left it armed with nothing coming to consume it, so the user's next REAL
+    /// edit ate it: `textDidChange` saw `isFoldMutation == true` and skipped
+    /// both `isDirty` and the safety saves. One text view serves every tab, so
+    /// that meant the first edit after every tab switch went unmarked and
+    /// unsaved while the status bar still read "Saved".
+    ///
+    /// So the mutators stay silent and the two sites that actually emit a
+    /// notification arm it explicitly: a path that emits nothing can no longer
+    /// leave anything armed.
+    func armFoldMutationFlag() {
+        didFoldMutation = true
+    }
 
     func consumeFoldMutationFlag() -> Bool {
         defer { didFoldMutation = false }
@@ -228,12 +365,15 @@ final class FoldingManager {
             .foregroundColor: NSColor.bestTextEditorForeground
         ], range: NSRange(location: 0, length: 1))
 
+        // Install (once per storage) before the mutation, so a manager that
+        // gains its first fold is already tracking edits.
+        observeEdits(of: textStorage)
+
         isMutating = true
         textStorage.beginEditing()
         textStorage.replaceCharacters(in: range, with: attrStr)
         textStorage.endEditing()
         isMutating = false
-        didFoldMutation = true
 
         let delta = 1 - range.length
         for i in regions.indices where regions[i].displayLocation >= NSMaxRange(range) {
@@ -254,10 +394,16 @@ final class FoldingManager {
             $0.displayLocation == location
         }) else { return }
         let region = regions[idx]
+        // Belt and braces: the region must still be pointing at its own
+        // attachment character. If an edit moved or ate it and the adjustment
+        // above somehow missed, restoring here would splice the folded block
+        // into arbitrary text — so treat a mismatch as "this region is gone".
         guard region.displayLocation >= 0,
-              NSMaxRange(region.displayRange) <= textStorage.length
+              NSMaxRange(region.displayRange) <= textStorage.length,
+              (textStorage.string as NSString).character(at: region.displayLocation) == Self.placeholderUnit
         else {
             regions.remove(at: idx)
+            stopObservingIfIdle()
             return
         }
 
@@ -268,7 +414,6 @@ final class FoldingManager {
         textStorage.replaceCharacters(in: region.displayRange, with: restored)
         textStorage.endEditing()
         isMutating = false
-        didFoldMutation = true
 
         // UTF-16 units, not Characters — see FoldRegion.originalUTF16Length.
         let delta = region.originalUTF16Length - 1
@@ -276,6 +421,7 @@ final class FoldingManager {
         for i in regions.indices where regions[i].displayLocation > region.displayLocation {
             regions[i].displayLocation += delta
         }
+        stopObservingIfIdle()
     }
 
     /// Forget every fold region WITHOUT touching the text storage.
@@ -287,6 +433,7 @@ final class FoldingManager {
     /// contains it, duplicating every folded block in the file.
     func discardRegions() {
         regions.removeAll()
+        stopObservingEdits()
     }
 
     func unfoldAll(in textStorage: NSTextStorage) {
@@ -302,7 +449,11 @@ final class FoldingManager {
         }
         regions.removeAll()
         isMutating = false
-        didFoldMutation = true
+        stopObservingEdits()
+    }
+
+    isolated deinit {
+        stopObservingEdits()
     }
 
     // MARK: - Full text reconstruction
@@ -315,12 +466,20 @@ final class FoldingManager {
         var result = ""
         var pos    = 0
         for region in regions {
-            if region.displayLocation > pos {
-                result += ns.substring(with: NSRange(location: pos,
-                                                     length: region.displayLocation - pos))
+            let loc = region.displayLocation
+            // Only splice where the region's own attachment character actually
+            // is. This text becomes `document.text`, the recovery draft and the
+            // bytes written on ⌘S: a region that has drifted must cost the user
+            // a stale fold, never a corrupted file. `regions` is kept sorted, so
+            // `loc >= pos` also rejects any pair that has crossed over.
+            guard loc >= pos, loc < ns.length,
+                  ns.character(at: loc) == Self.placeholderUnit
+            else { continue }
+            if loc > pos {
+                result += ns.substring(with: NSRange(location: pos, length: loc - pos))
             }
             result += region.originalText
-            pos = region.displayLocation + 1
+            pos = loc + 1
         }
         if pos < ns.length { result += ns.substring(from: pos) }
         return result

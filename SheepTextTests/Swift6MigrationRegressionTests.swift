@@ -90,8 +90,10 @@ final class Swift6AppKitRegressionTests: XCTestCase {
         SyntaxEngine.shared.discardSession(for: documentID)
     }
 
-    /// Markdown keeps the full rebuild because its fenced-code pass is a
-    /// document-wide regex that the changed-range machinery cannot bound.
+    /// Markdown takes the incremental path since September 2026 (fences come
+    /// from the block grammar, and a changed range is widened to the fence it
+    /// overlaps), so this is a genuine incremental-vs-clean check, not a check
+    /// that a full rebuild equals itself.
     func testIncrementalHighlightMatchesCleanParseForMarkdownFence() {
         let documentID = UUID()
         let opened = "# Title\n\n```swift\nlet x = 1\n```\n\ntrailing text\n"
@@ -257,6 +259,10 @@ final class Swift6AppKitRegressionTests: XCTestCase {
         if let incremental, let clean {
             XCTAssertTrue(incremental.isEqual(to: clean))
         }
+        // Unlike its three siblings this used to end without discarding, leaking
+        // one session — text, tree copy and attributed string — into the LRU for
+        // the rest of the test run.
+        SyntaxEngine.shared.discardSession(for: documentID)
     }
 }
 

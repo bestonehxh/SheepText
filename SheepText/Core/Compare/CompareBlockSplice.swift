@@ -16,9 +16,15 @@ nonisolated enum CompareBlockSplice {
         line.hasSuffix("\r") ? String(line.dropLast()) : line
     }
 
-    /// Replace `replaceCount` lines starting at `replaceStart` (0-based, counted the
-    /// same way `text.components(separatedBy: "\n")` counts them) with `replacementLines`,
-    /// which must be line-ending neutral.
+    /// Replace `replaceCount` lines starting at `replaceStart` (0-based) with
+    /// `replacementLines`, which must be line-ending neutral.
+    ///
+    /// Lines are counted by splitting on the document's own separator: the newline
+    /// scalar for `.lf` and `.crlf` (a CRLF document's lines then still carry the
+    /// trailing `\r`, which is what the compare pipeline's line numbers assume), and
+    /// the carriage-return scalar for `.cr`. Splitting a CR-only document on `\n`
+    /// used to make the whole file one element, so every `replaceStart` but 0 was
+    /// rejected and the one that was accepted rewrote the entire document.
     ///
     /// Returns nil when the range does not address the text, or when the edit would be
     /// a no-op (replacing nothing with nothing).
@@ -29,7 +35,10 @@ nonisolated enum CompareBlockSplice {
         replacementLines: [String],
         lineEnding: TextLineEnding
     ) -> String? {
-        var docLines = text.components(separatedBy: "\n")
+        // components(separatedBy:) splits on the scalar, so "\r" and "\n" are both safe
+        // here — unlike a Character-level split, which sees CRLF as one cluster.
+        let separator = lineEnding == .cr ? "\r" : "\n"
+        var docLines = text.components(separatedBy: separator)
         guard replaceStart >= 0,
               replaceCount >= 0,
               replaceStart + replaceCount <= docLines.count
@@ -48,11 +57,12 @@ nonisolated enum CompareBlockSplice {
             docLines[docLines.count - 1] = String(last.dropLast())
         }
 
-        var result = docLines.joined(separator: "\n")
+        var result = docLines.joined(separator: separator)
         if lineEnding == .cr {
-            // A CR-only document contains no "\n" at all, so the whole file is a single
-            // element above and the splice is necessarily coarse. Convert wholesale
-            // rather than let an LF separator leak in.
+            // Belt and braces: the join above already uses CR separators, so this only
+            // catches a stray LF that was inside the document (or inside a transferred
+            // line) before the splice. It must never be possible to end up with an LF
+            // in a CR-only document.
             result = TextContentTransforms.convertLineEndings(in: result, to: .cr)
         }
         return result

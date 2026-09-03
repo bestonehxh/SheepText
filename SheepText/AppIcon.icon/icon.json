@@ -1,23 +1,11 @@
 {
-  "fill": {
-    "linear-gradient": [
-      "extended-srgb:0.259,0.447,0.753,1.000",
-      "extended-srgb:0.165,0.298,0.561,1.000"
-    ]
-  },
-  "groups": [
+  "fill" : { "linear-gradient" : [ "extended-srgb:0.302,0.443,0.859,1.000", "extended-srgb:0.180,0.349,0.733,1.000" ] },
+  "groups" : [
     {
-      "layers": [
-        {
-          "glass": false,
-          "image-name": "sheeptext-artwork.png"
-        }
+      "layers" : [
+        { "glass" : false, "image-name" : "sheeptext-artwork.png" }
       ]
     }
   ],
-  "supported-platforms": {
-    "squares": [
-      "macOS"
-    ]
-  }
+  "supported-platforms" : { "squares" : [ "macOS" ] }
 }

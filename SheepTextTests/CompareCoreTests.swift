@@ -120,9 +120,15 @@ final class DiffCalcTests: XCTestCase {
         XCTAssertEqual(deletes, 1)
     }
 
-    /// Force the prefix/suffix fallback (n*m > 4_000_000) and verify it still
-    /// matches common prefix/suffix and pairs the middle as removes+inserts.
-    func testPrefixSuffixFallbackOnHugeInputs() {
+    /// 2101 x 2101 elements with one differing line at the end.
+    ///
+    /// This used to be the *fallback* case: `n*m > 4_000_000` sent it to
+    /// `prefixSuffixDiff`, which happened to produce the right answer here
+    /// because the difference is a single trailing line. Since the Myers rewrite
+    /// (audit C2) the size no longer decides anything — the edit distance is 2,
+    /// so this is now diffed exactly. The expected output is identical either
+    /// way, which is exactly why it is worth keeping.
+    func testHugeInputsWithOneTrailingDifference() {
         let a = Array(0..<2100) + [999999]      // 2101 elements
         let b = Array(0..<2100) + [888888]      // 2101 * 2101 > 4_000_000
         let result = ops(a, b)
@@ -178,16 +184,27 @@ final class DiffCalcTests: XCTestCase {
     func testFallbackInterleavesMiddleSoChangedPairingCanFire() {
         // Two fully different middles must come out interleaved A/B, not all-A
         // then all-B, otherwise TextComparator cannot form changed pairs.
-        let n = 2100
-        let a = Array(0..<n) + [1, 2] + Array(5000..<(5000 + n))
-        let b = Array(0..<n) + [3, 4] + Array(5000..<(5000 + n))
+        //
+        // Updated for audit C2: the fallback is no longer chosen by INPUT SIZE
+        // (the old `n*m > 4_000_000`, which this test used to reach with a
+        // two-element middle) but by EDIT DISTANCE. So the middles here have to
+        // be genuinely unrelated and large enough to exceed the Myers ceiling —
+        // 1600 disjoint lines a side is edit distance 3200, above the 3000 cap.
+        // A two-element middle is now diffed exactly instead, which is the point
+        // of the rewrite.
+        let prefix = Array(0..<50)
+        let suffix = Array(500_000..<500_050)
+        let a = prefix + Array(100_000..<101_600) + suffix
+        let b = prefix + Array(200_000..<201_600) + suffix
         let result = ops(a, b)
-        // Find the middle ops (after the 2100-prefix matches).
-        let middle = Array(result.dropFirst(n).dropLast(n))
-        XCTAssertEqual(middle.count, 4)
-        guard case .onlyInA = middle[0], case .onlyInB = middle[1],
-              case .onlyInA = middle[2], case .onlyInB = middle[3] else {
-            return XCTFail("middle not interleaved A/B/A/B")
+        let middle = Array(result.dropFirst(prefix.count).dropLast(suffix.count))
+        XCTAssertEqual(middle.count, 3_200, "the whole middle should be add/remove ops")
+        for index in 0..<8 {
+            if index.isMultiple(of: 2) {
+                guard case .onlyInA = middle[index] else { return XCTFail("middle[\(index)] should be onlyInA") }
+            } else {
+                guard case .onlyInB = middle[index] else { return XCTFail("middle[\(index)] should be onlyInB") }
+            }
         }
     }
 }

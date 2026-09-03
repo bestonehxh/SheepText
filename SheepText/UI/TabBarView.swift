@@ -16,7 +16,11 @@ struct TabBarView: View {
 
     @Environment(DocumentStore.self)  private var documents
     @Environment(WorkspaceStore.self) private var workspace
+    @Environment(AppPreferences.self) private var preferences
     let onToggleSidebar: () -> Void
+    /// True when the sidebar is hidden and this bar is the view sitting under
+    /// the traffic lights. With the sidebar shown, the sidebar owns that row.
+    let reservesTrafficLightGap: Bool
 
     /// Tracked here rather than passed in from the parent so the traffic-light
     /// gap is the ONLY thing that animates. Driving it from parent state made
@@ -34,8 +38,9 @@ struct TabBarView: View {
     @State private var dragSourceIndex: Int?
     @State private var dragTargetIndex: Int?
 
-    init(onToggleSidebar: @escaping () -> Void = {}) {
+    init(onToggleSidebar: @escaping () -> Void = {}, reservesTrafficLightGap: Bool = true) {
         self.onToggleSidebar = onToggleSidebar
+        self.reservesTrafficLightGap = reservesTrafficLightGap
     }
 
     // MARK: - Navigation
@@ -72,6 +77,12 @@ struct TabBarView: View {
 
     // MARK: - Body
 
+    /// Chrome glyphs are ink, not controls: `.borderless` tints them with the
+    /// accent, which in this palette is a colour that means "selected".
+    private func chromeGlyph(enabled: Bool) -> Color {
+        Color(nsColor: .bestTextSecondaryForeground).opacity(enabled ? 1 : 0.35)
+    }
+
     var body: some View {
         HStack(spacing: 0) {
             // Room for the traffic lights sharing this row — collapsed in
@@ -79,33 +90,33 @@ struct TabBarView: View {
             // notifications so the tabs slide over DURING the system
             // transition; switching on did* pops after the animation settles.
             Spacer()
-                .frame(width: isFullScreen ? 0 : 72)
+                .frame(width: (isFullScreen || !reservesTrafficLightGap) ? 0 : 72)
                 .animation(.easeOut(duration: 0.18), value: isFullScreen)
 
             HStack(spacing: 0) {
                 Button(action: navigatePrevious) {
                     Image(systemName: "chevron.left")
-                        .font(.system(size: 11, weight: .semibold))
+                        .chromeSymbol(size: 11)
                         .frame(width: 22, height: 22)
                         .contentShape(Rectangle())
                 }
-                .buttonStyle(.borderless)
+                .buttonStyle(.plain)
+                .foregroundStyle(chromeGlyph(enabled: hasPrevious))
                 .disabled(!hasPrevious)
                 .help("Previous Tab")
 
                 Button(action: navigateNext) {
                     Image(systemName: "chevron.right")
-                        .font(.system(size: 11, weight: .semibold))
+                        .chromeSymbol(size: 11)
                         .frame(width: 22, height: 22)
                         .contentShape(Rectangle())
                 }
-                .buttonStyle(.borderless)
+                .buttonStyle(.plain)
+                .foregroundStyle(chromeGlyph(enabled: hasNext))
                 .disabled(!hasNext)
                 .help("Next Tab")
             }
-            .padding(.horizontal, 2)
-
-            Divider().frame(height: 16)
+            .padding(.horizontal, 4)
 
             ScrollViewReader { proxy in
                 ScrollView(.horizontal, showsIndicators: false) {
@@ -137,55 +148,45 @@ struct TabBarView: View {
 
             Button(action: onToggleSidebar) {
                 Image(systemName: "sidebar.left")
-                    .font(.system(size: 12, weight: .semibold))
+                    .chromeSymbol(size: 12)
                     .frame(width: 22, height: 22)
                     .contentShape(Rectangle())
             }
-            .buttonStyle(.borderless)
+            .buttonStyle(.plain)
+            .foregroundStyle(chromeGlyph(enabled: true))
             .padding(.leading, 6)
             .help("Toggle Sidebar")
 
             Button { documents.newUntitled() } label: {
                 Image(systemName: "plus")
-                    .font(.system(size: 12, weight: .semibold))
+                    .chromeSymbol(size: 12)
                     .frame(width: 22, height: 22)
                     .contentShape(Rectangle())
             }
-            .buttonStyle(.borderless)
+            .buttonStyle(.plain)
+            .foregroundStyle(chromeGlyph(enabled: true))
             .padding(.horizontal, 6)
             .help("New untitled file")
         }
-        .frame(height: 30)
+        .frame(height: SheepTextChromeMetrics.topBarHeight)
         // A view background rather than a ShapeStyle one: ShapeStyle
         // backgrounds auto-expand into the titlebar safe area this bar lives
         // in. The drag gesture makes the empty strip move the window, the way
         // a real titlebar does.
-        .background(
-            Color(nsColor: .bestTextChromeBackground)
+        .background {
+            ChromeBackground(zone: .topBar)
                 .gesture(WindowDragGesture())
-        )
+        }
         .overlay(alignment: .bottom) {
             Rectangle()
-                .fill(Color(nsColor: .bestTextBorder))
+                .fill(preferences.chromeStyle.separator)
                 .frame(height: 1)
         }
         .zIndex(1)
-        .onAppear {
-            isFullScreen = NSApp.keyWindow?.styleMask.contains(.fullScreen) ?? false
-        }
-        .onReceive(NotificationCenter.default.publisher(for: NSWindow.willEnterFullScreenNotification)) { _ in
-            isFullScreen = true
-        }
-        .onReceive(NotificationCenter.default.publisher(for: NSWindow.willExitFullScreenNotification)) { _ in
-            isFullScreen = false
-        }
-        // Safety net for aborted/restored transitions that skip the will* pair.
-        .onReceive(NotificationCenter.default.publisher(for: NSWindow.didEnterFullScreenNotification)) { _ in
-            isFullScreen = true
-        }
-        .onReceive(NotificationCenter.default.publisher(for: NSWindow.didExitFullScreenNotification)) { _ in
-            isFullScreen = false
-        }
+        // Filtered to THIS bar's own window, and seeded from it: with two main
+        // windows open, window B entering fullscreen used to collapse window
+        // A's 72 pt reservation while A's traffic lights were still drawn.
+        .trackingHostWindowFullScreen($isFullScreen)
     }
 
     // MARK: - Helpers
@@ -309,6 +310,7 @@ private struct TabChip: View {
     let onDragEnded: () -> Void
 
     @Environment(DocumentStore.self) private var documents
+    @Environment(AppPreferences.self) private var preferences
     @State private var isHovering = false
     @State private var isHoveringClose = false
 
@@ -328,34 +330,40 @@ private struct TabChip: View {
                     .strokeBorder(Color(nsColor: .editorModifiedAmber), lineWidth: 1.5)
                     .frame(width: 7, height: 7)
                     .help("Recovered draft")
+            } else if document.isDirty {
+                // Leads the name, the way a printer's mark leads a line —
+                // the close button only appears on hover, so this is what
+                // "unsaved" looks like at rest.
+                Circle()
+                    .fill(Color(nsColor: .editorModifiedAmber))
+                    .frame(width: 5, height: 5)
             }
 
             if isInCompare {
                 Image(systemName: "arrow.left.arrow.right")
-                    .font(.system(size: 9, weight: .semibold))
+                    .chromeSymbol(size: 9)
                     .foregroundStyle(Color(nsColor: .editorModifiedAmber))
                     .help("Used in Compare")
             }
 
-            Text(document.displayName)
-                .font(.system(size: 12, weight: isActive ? .semibold : .regular))
-                .foregroundStyle(
-                    Color(nsColor: isActive ? .bestTextPrimaryForeground : .bestTextSecondaryForeground)
-                )
-                .lineLimit(1)
-                .truncationMode(.middle)
-                .frame(maxWidth: 160, alignment: .leading)
+            PressLabel(
+                text: pressBaseName(document.displayName),
+                size: 12,
+                emphasized: isActive
+            )
+            .frame(minWidth: 34, maxWidth: 190, alignment: .leading)
+
             closeControl
         }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 6)
+        .padding(.horizontal, 14)
+        .frame(maxHeight: .infinity)
         .background(tabBackground)
+        // The rail is the whole marker for the active tab — no filled tile.
+        // It sits flush with the bar's bottom rule, the way a printed rule
+        // sits under a running head.
         .overlay(alignment: .bottom) {
             if isActive {
-                accentColor
-                    .frame(height: 2)
-                    .clipShape(Capsule())
-                    .padding(.horizontal, 10)
+                accentColor.frame(height: 2)
             }
         }
         .background(
@@ -379,11 +387,6 @@ private struct TabChip: View {
                 .onEnded { _ in onDragEnded() }
         )
         .help(tabHelp)
-        .overlay(alignment: .trailing) {
-            Rectangle()
-                .fill(Color(nsColor: .bestTextBorder).opacity(0.72))
-                .frame(width: 1, height: 16)
-        }
     }
 
     @ViewBuilder
@@ -391,32 +394,34 @@ private struct TabChip: View {
         Button(action: onClose) {
             ZStack {
                 if shouldShowCloseIcon {
+                    // Bold at 9 pt on purpose: this glyph is small enough
+                    // that the medium chrome weight disappears on glass.
                     Image(systemName: "xmark")
                         .font(.system(size: 9, weight: .bold))
-                        .foregroundStyle(.secondary)
-                } else if document.isDirty {
-                    Circle()
-                        .fill(Color(nsColor: .editorModifiedAmber))
-                        .frame(width: 6, height: 6)
+                        .foregroundStyle(Color(nsColor: .bestTextSecondaryForeground))
                 }
             }
             .frame(width: 14, height: 14)
             .contentShape(Rectangle())
         }
-        .buttonStyle(.borderless)
+        .buttonStyle(.plain)
         .frame(width: 14, height: 14)
         .onHover { isHoveringClose = $0 }
         .help(document.isDirty ? "Unsaved changes. Click to close." : "Close Tab")
     }
 
     private var shouldShowCloseIcon: Bool {
-        isHoveringClose || (!document.isDirty && (isHovering || isActive))
+        isHoveringClose || isHovering || isActive
     }
 
     private var tabBackground: Color {
-        if isDragging       { return Color(nsColor: .bestTextSelectionBackground) }
-        if isActive         { return Color(nsColor: .bestTextEditorBackground) }
-        if isHovering       { return Color(nsColor: .bestTextHoverBackground) }
+        let style = preferences.chromeStyle
+        if isDragging { return style.selectionFill }
+        // The active tab keeps the editor's own ground: it has to read as the
+        // same sheet of paper as the document under it. It is the one place in
+        // the chrome that is deliberately opaque.
+        if isActive   { return Color(nsColor: .bestTextEditorBackground) }
+        if isHovering { return style.hoverFill }
         return .clear
     }
 

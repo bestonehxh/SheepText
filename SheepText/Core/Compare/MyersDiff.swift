@@ -7,10 +7,40 @@ nonisolated enum DiffOp<T> {
 }
 
 nonisolated enum DiffCalc {
-    // ~32 MB ceiling for the LCS table (Int is 8 bytes on 64-bit).
-    // Above this limit we fall back to a prefix/suffix heuristic that still
-    // catches bulk unchanged regions without allocating a massive 2-D array.
-    private static let maxLCSCells = 4_000_000
+
+    /// Ceiling on the edit distance the Myers search explores before giving up.
+    ///
+    /// Myers is O(D x (n+m)) in time and — with the packed V trace below —
+    /// O(D^2 / 2) `Int32` in space, so both have to be bounded for inputs that
+    /// are not related at all (there D approaches n+m).
+    ///
+    /// * `myersWorkBudget / (rn + rm)` bounds the TIME: roughly 24 million
+    ///   element comparisons before we give up.
+    /// * `myersMaxDistance` bounds the MEMORY: D <= 3000 means a trace of
+    ///   3000*3001/2 `Int32` = 18 MB, the same order as the 16 MB the old exact
+    ///   LCS table allocated for two 2000-line files (and that table grew
+    ///   quadratically from there, which is why the old code refused above it).
+    ///
+    /// What the ceiling means in practice. D is about twice the number of lines
+    /// that actually differ, so:
+    ///
+    /// * anything whose trimmed middles total 3000 lines or fewer is diffed
+    ///   EXACTLY whatever it contains — including the two 2001-line files
+    ///   differing in two lines that the old size-based cliff reported as 1991
+    ///   changed lines;
+    /// * above that, the ceiling is only reached when the sides are mostly
+    ///   unrelated. Measured on 2000-line pairs: 50 % changed -> D = 2000,
+    ///   75 % changed -> D = 3000, both exact; fully disjoint -> D = 4000,
+    ///   which falls back.
+    ///
+    /// The fallback is the existing `prefixSuffixDiff`, i.e. exactly the output
+    /// the old code produced in its own fallback regime — so nothing that used
+    /// to fall back changes shape, it just falls back on relatedness instead of
+    /// on size. The cost is that a hopeless pair now spends ~24 ms proving it
+    /// (two disjoint 2000-line files) where the old exact DP took ~4 ms to
+    /// return the same zero matches.
+    private static let myersWorkBudget = 24_000_000
+    private static let myersMaxDistance = 3_000
 
     static func diff<T>(
         _ a: [T],
@@ -22,19 +52,10 @@ nonisolated enum DiffCalc {
         if n == 0 { return b.map { .onlyInB($0) } }
         if m == 0 { return a.map { .onlyInA($0) } }
 
-        // The fallback decision deliberately uses the untrimmed sizes: changing
-        // which algorithm runs would change the output, and this must not.
-        if n * m > maxLCSCells {
-            return prefixSuffixDiff(a, b, equal: equal)
-        }
-
-        // Consume a common prefix directly. This is exactly what the backtrack
-        // below would do anyway — it tests `equal` before consulting the table —
-        // and because the table is filled backwards, dp[i][j] depends only on
-        // elements at or after i and j, so dropping a prefix cannot change a
-        // single value the backtrack reads. The win is large in the common case
-        // of editing near the end of an otherwise unchanged file, and total when
-        // the two sides are identical.
+        // Consume a common prefix directly. A common prefix always belongs to
+        // some optimal edit script, so removing it cannot change the answer,
+        // and the win is large in the common case of editing near the end of an
+        // otherwise unchanged file (total when the two sides are identical).
         var prefix = 0
         while prefix < n && prefix < m && equal(a[prefix], b[prefix]) { prefix += 1 }
 
@@ -48,22 +69,12 @@ nonisolated enum DiffCalc {
             return result
         }
 
-        // Consume a common suffix too. A common suffix always belongs to some
-        // optimal LCS, so trimming it adds a constant to every DP value in the
-        // middle region and cannot change the comparisons the backtrack makes —
-        // the same argument as the prefix trim above. The win is large in the
-        // common case of editing near the START of an otherwise unchanged file:
-        // without this the table was still sized for both full inputs.
+        // Consume a common suffix too, for the same reason — the win here is
+        // the mirror case of editing near the START of an unchanged file.
         var suffix = 0
         while suffix < n - prefix && suffix < m - prefix
               && equal(a[n - 1 - suffix], b[m - 1 - suffix]) { suffix += 1 }
 
-        // Dynamic-programming LCS backtracking; stable for editor-sized inputs.
-        // The table is a single flat buffer of Int32 rather than an array of
-        // arrays: the backtrack needs the whole table, but nesting arrays costs
-        // n+1 separate heap allocations plus a double indirection on every one
-        // of the n*m accesses, and Int32 halves the footprint (a 2000x2000
-        // compare drops from 32 MB to 16 MB).
         // Indices below are relative to the trimmed middle of each input.
         let rn = n - prefix - suffix
         let rm = m - prefix - suffix
@@ -79,35 +90,121 @@ nonisolated enum DiffCalc {
             return result
         }
 
-        let stride1 = rm + 1
-        var dp = [Int32](repeating: 0, count: (rn + 1) * stride1)
-        dp.withUnsafeMutableBufferPointer { t in
-            for i in stride(from: rn - 1, through: 0, by: -1) {
-                let row = i * stride1
-                let next = row + stride1
-                for j in stride(from: rm - 1, through: 0, by: -1) {
-                    t[row + j] = equal(a[prefix + i], b[prefix + j])
-                        ? t[next + j + 1] + 1
-                        : max(t[next + j], t[row + j + 1])
-                }
-            }
+        let maxD = min(myersMaxDistance, myersWorkBudget / (rn + rm))
+        if let middle = myersMiddle(a, b, aOffset: prefix, bOffset: prefix,
+                                    n: rn, m: rm, maxD: maxD, equal: equal) {
+            result.append(contentsOf: middle)
+            appendSuffixMatches()
+            return result
         }
 
-        var i = 0, j = 0
-        while i < rn && j < rm {
-            if equal(a[prefix + i], b[prefix + j]) {
-                result.append(.match(a[prefix + i], b[prefix + j]))
-                i += 1; j += 1
-            } else if dp[(i + 1) * stride1 + j] >= dp[i * stride1 + j + 1] {
-                result.append(.onlyInA(a[prefix + i])); i += 1
-            } else {
-                result.append(.onlyInB(b[prefix + j])); j += 1
+        // Edit distance above the ceiling: the two sides are not meaningfully
+        // related. Same output the old size-based cliff produced (this recomputes
+        // the trim, which is O(n) and only happens on this cold path).
+        return prefixSuffixDiff(a, b, equal: equal)
+    }
+
+    /// Greedy forward Myers (O(ND)) over `a[aOffset ..< aOffset+n]` and
+    /// `b[bOffset ..< bOffset+m]`, with a saved V trace for the backtrack.
+    ///
+    /// Returns nil when the edit distance exceeds `maxD`, so the caller can fall
+    /// back rather than spend O(n*m) proving what it already suspects.
+    ///
+    /// The trace is packed: row `d` stores only the diagonals reachable at
+    /// distance `d-1`, i.e. k in `-(d-1) ... (d-1)` stepping by 2 — `d` entries
+    /// at offset `d*(d-1)/2`. Storing a full copy of V per round (the textbook
+    /// formulation) would be O(D*(n+m)), which is 6 MB *per round* on a
+    /// 200 000-line file.
+    private static func myersMiddle<T>(
+        _ a: [T],
+        _ b: [T],
+        aOffset: Int,
+        bOffset: Int,
+        n: Int,
+        m: Int,
+        maxD: Int,
+        equal: (T, T) -> Bool
+    ) -> [DiffOp<T>]? {
+        let bound = min(max(maxD, 0), n + m)
+        var v = [Int32](repeating: 0, count: 2 * bound + 3)
+        let vOffset = bound + 1
+        var trace: [Int32] = []
+        trace.reserveCapacity(256)
+
+        var found = -1
+        var d = 0
+        search: while d <= bound {
+            // Snapshot the diagonals the backtrack will read for this round.
+            if d > 0 {
+                var k = -(d - 1)
+                while k <= d - 1 {
+                    trace.append(v[vOffset + k])
+                    k += 2
+                }
             }
+
+            var k = -d
+            while k <= d {
+                var x: Int
+                if k == -d || (k != d && v[vOffset + k - 1] < v[vOffset + k + 1]) {
+                    x = Int(v[vOffset + k + 1])          // down: b contributes a line
+                } else {
+                    x = Int(v[vOffset + k - 1]) + 1      // right: a contributes a line
+                }
+                var y = x - k
+                while x < n && y < m && equal(a[aOffset + x], b[bOffset + y]) {
+                    x += 1
+                    y += 1
+                }
+                v[vOffset + k] = Int32(x)
+                if x >= n && y >= m {
+                    found = d
+                    break search
+                }
+                k += 2
+            }
+            d += 1
         }
-        while i < rn { result.append(.onlyInA(a[prefix + i])); i += 1 }
-        while j < rm { result.append(.onlyInB(b[prefix + j])); j += 1 }
-        appendSuffixMatches()
-        return result
+        guard found >= 0 else { return nil }
+
+        var reversed: [DiffOp<T>] = []
+        reversed.reserveCapacity(n + m)
+        var x = n
+        var y = m
+        var step = found
+        while step > 0 {
+            let row = step * (step - 1) / 2
+            let k = x - y
+            let prevK: Int
+            if k == -step
+                || (k != step
+                    && trace[row + (k - 1 + step - 1) / 2] < trace[row + (k + 1 + step - 1) / 2]) {
+                prevK = k + 1
+            } else {
+                prevK = k - 1
+            }
+            let prevX = Int(trace[row + (prevK + step - 1) / 2])
+            let prevY = prevX - prevK
+            while x > prevX && y > prevY {
+                reversed.append(.match(a[aOffset + x - 1], b[bOffset + y - 1]))
+                x -= 1
+                y -= 1
+            }
+            if x > prevX {
+                reversed.append(.onlyInA(a[aOffset + x - 1]))
+                x -= 1
+            } else {
+                reversed.append(.onlyInB(b[bOffset + y - 1]))
+                y -= 1
+            }
+            step -= 1
+        }
+        while x > 0 && y > 0 {
+            reversed.append(.match(a[aOffset + x - 1], b[bOffset + y - 1]))
+            x -= 1
+            y -= 1
+        }
+        return reversed.reversed()
     }
 
     /// Fast O(n) fallback: matches common prefix/suffix exactly, marks the

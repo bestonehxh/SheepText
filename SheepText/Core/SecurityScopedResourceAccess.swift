@@ -9,36 +9,67 @@ nonisolated enum SecurityScopedResourceAccess {
     static let fileBookmarksKey = "sheeptext.securityScoped.fileBookmarks"
     static let workspaceBookmarksKey = "sheeptext.securityScoped.workspaceBookmarks"
 
-    private static let activePathsLock = NSLock()
-    nonisolated(unsafe) private static var activePaths = Set<String>()
+    /// **Invariant: the URL instance that started a scope is the one that must
+    /// be used for I/O, and it is never released.**
+    ///
+    /// `startAccessingSecurityScopedResource()` grants access to the *instance*
+    /// it was called on, not to the path. This table used to be a `Set<String>`
+    /// of paths, so the second `prepare` of a path resolved a fresh bookmark,
+    /// saw the path already listed, skipped `startAccessing` — and handed back a
+    /// URL that had never been granted anything. It worked only because the
+    /// first instance was still holding the scope open somewhere else in the
+    /// process, and would have broken the moment we started balancing the calls
+    /// with `stopAccessingSecurityScopedResource()`.
+    ///
+    /// Now the owning instance is stored and returned, so every caller does its
+    /// I/O through a URL that actually holds the grant. Scopes are deliberately
+    /// held for the lifetime of the process: the app can have the same file open
+    /// in a tab, in Find in Files and in the disk-change poll at once, and there
+    /// is no refcount that would make a balanced `stop` correct.
+    private static let activeScopesLock = NSLock()
+    nonisolated(unsafe) private static var activeScopes: [String: URL] = [:]
 
     static func prepare(_ url: URL, bookmarkKey: String, shouldRemember: Bool) -> URL {
         let path = url.standardizedFileURL.path
 
-        if let resolved = resolveBookmark(forPath: path, bookmarkKey: bookmarkKey) {
-            startAccessing(resolved)
+        // Already scoped: skip the bookmark dictionary decode entirely. That
+        // decode is a UserDefaults dictionary copy plus a
+        // URL(resolvingBookmarkData:) per call, and this is called per open
+        // document every 4 seconds and per file in Find in Files.
+        if let owner = activeScope(forPath: path) {
             if shouldRemember {
-                remember(resolved, bookmarkKey: bookmarkKey)
+                remember(owner, bookmarkKey: bookmarkKey)
             }
-            return resolved
+            return owner
         }
 
-        startAccessing(url)
-        if shouldRemember {
-            remember(url, bookmarkKey: bookmarkKey)
+        if let resolved = resolveBookmark(forPath: path, bookmarkKey: bookmarkKey) {
+            let owner = startAccessing(resolved)
+            if shouldRemember {
+                remember(owner, bookmarkKey: bookmarkKey)
+            }
+            return owner
         }
-        return url
+
+        let owner = startAccessing(url)
+        if shouldRemember {
+            remember(owner, bookmarkKey: bookmarkKey)
+        }
+        return owner
     }
 
     static func restore(path: String, bookmarkKey: String) -> URL {
+        if let owner = activeScope(forPath: path) { return owner }
+
         if let resolved = resolveBookmark(forPath: path, bookmarkKey: bookmarkKey) {
-            startAccessing(resolved)
-            return resolved
+            return startAccessing(resolved)
         }
 
-        let url = URL(fileURLWithPath: path)
-        startAccessing(url)
-        return url
+        return startAccessing(URL(fileURLWithPath: path))
+    }
+
+    private static func activeScope(forPath path: String) -> URL? {
+        activeScopesLock.withLock { activeScopes[path] }
     }
 
     static func remember(_ url: URL, bookmarkKey: String) {
@@ -53,17 +84,19 @@ nonisolated enum SecurityScopedResourceAccess {
         UserDefaults.standard.set(bookmarks, forKey: bookmarkKey)
     }
 
+    /// Starts (or re-uses) the scope for this path and returns the URL instance
+    /// that owns it — which may not be the one passed in. Do the I/O through the
+    /// returned instance.
     @discardableResult
-    static func startAccessing(_ url: URL) -> Bool {
+    static func startAccessing(_ url: URL) -> URL {
         let path = url.standardizedFileURL.path
-        return activePathsLock.withLock {
-            guard !activePaths.contains(path) else { return true }
+        return activeScopesLock.withLock {
+            if let owner = activeScopes[path] { return owner }
 
-            let didStart = url.startAccessingSecurityScopedResource()
-            if didStart {
-                activePaths.insert(path)
+            if url.startAccessingSecurityScopedResource() {
+                activeScopes[path] = url
             }
-            return didStart
+            return url
         }
     }
 

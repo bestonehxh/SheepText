@@ -9,6 +9,7 @@
 
 import SwiftUI
 import AppKit
+import NetworkHighlightKit
 
 struct StatusBarView: View {
 
@@ -16,8 +17,22 @@ struct StatusBarView: View {
     @Environment(CursorState.self) private var cursor
     @Environment(AppPreferences.self) private var preferences
 
+    /// Transient message posted by a plugin through `ui.showStatusMessage`.
+    /// Sits on the left, where nothing else lives, so it never shifts the
+    /// readouts on the right while it comes and goes.
+    @State private var pluginMessage: String?
+    @State private var pluginMessageTask: Task<Void, Never>?
+
+    /// How long a plugin's status message stays up.
+    private static let pluginMessageDuration: Duration = .seconds(4)
+
     var body: some View {
         HStack(spacing: 0) {
+            if let pluginMessage {
+                StatusItem(label: pluginMessage, color: Color(nsColor: .bestTextAccent))
+                    .lineLimit(1)
+                    .transition(.opacity)
+            }
             Spacer()
 
             // Cursor position — primary info, always shown.
@@ -62,6 +77,10 @@ struct StatusBarView: View {
                 lineEndingMenu(for: doc)
                 StatusDivider()
                 languageMenu(for: doc)
+                if NetworkConfigLanguage.isNetworkConfig(doc.language) {
+                    StatusDivider()
+                    vendorMenu(for: doc)
+                }
                 StatusDivider()
                 indentationMenu(for: doc)
                 StatusDivider()
@@ -70,8 +89,25 @@ struct StatusBarView: View {
         }
         .font(.system(size: 11, design: .monospaced))
         .frame(height: 22)
-        .background(Color(nsColor: .bestTextChromeBackground))
+        .background { ChromeBackground(zone: .statusBar) }
         .overlay(alignment: .top) { Divider() }
+        // U13: `ui.showStatusMessage` has been posting `.statusMessage` with
+        // nobody listening — the bundled hello-world plugin calls it and nothing
+        // appeared. This is that observer. The message inherits the bar's own
+        // 11 pt monospace; the only thing it adds is the accent ink.
+        .onReceive(NotificationCenter.default.publisher(for: .statusMessage)) { note in
+            guard let message = note.userInfo?[UIBridge.statusMessageKey] as? String,
+                  !message.isEmpty
+            else { return }
+            pluginMessageTask?.cancel()
+            pluginMessage = message
+            pluginMessageTask = Task {
+                try? await Task.sleep(for: Self.pluginMessageDuration)
+                guard !Task.isCancelled else { return }
+                pluginMessage = nil
+            }
+        }
+        .onDisappear { pluginMessageTask?.cancel() }
     }
 
     private func languageMenu(for document: Document) -> some View {
@@ -84,7 +120,30 @@ struct StatusBarView: View {
 
             Divider()
 
-            ForEach(LanguageDetector.supportedLanguages) { language in
+            // Device families first, by name, the way SheepTerm's picker lists
+            // them: a network engineer opening this menu is choosing a vendor
+            // far more often than a programming language.
+            let isNetwork = NetworkConfigLanguage.isNetworkConfig(document.language)
+            Section("Network Config") {
+                ForEach(LanguageDetector.networkVendorMenuOrder) { vendor in
+                    Toggle(
+                        vendor.label,
+                        isOn: choiceBinding(isNetwork && document.networkVendor == vendor) {
+                            documents.setNetworkLanguage(document.id, vendor: vendor)
+                        }
+                    )
+                }
+                Toggle(
+                    "Auto-detect Vendor",
+                    isOn: choiceBinding(isNetwork && !document.networkVendorIsManual) {
+                        documents.setNetworkLanguage(document.id, vendor: nil)
+                    }
+                )
+            }
+
+            Divider()
+
+            ForEach(LanguageDetector.nonNetworkLanguages) { language in
                 Toggle(
                     language.displayName,
                     isOn: choiceBinding(document.language == language.id) {
@@ -97,6 +156,36 @@ struct StatusBarView: View {
 
     private func languageMenuLabel(for document: Document) -> String {
         LanguageDetector.displayName(for: document.language)
+    }
+
+    /// The device family a `network_config` document is highlighted as.
+    ///
+    /// A second menu rather than eleven more entries in the language list: the
+    /// language and the vendor are different questions, and the badge has to
+    /// show the ANSWER — a detected `Huawei` next to `Network Config` is the
+    /// whole point, and a language menu cannot show that.
+    private func vendorMenu(for document: Document) -> some View {
+        StatusMenu(label: document.networkVendor.badge, secondary: !document.networkVendorIsManual) {
+            Button("Auto-detect from Content") {
+                documents.resetNetworkVendorFromContent(document.id)
+            }
+
+            Divider()
+
+            ForEach(LanguageDetector.networkVendorMenuOrder) { vendor in
+                Toggle(
+                    vendor.label,
+                    isOn: choiceBinding(document.networkVendor == vendor) {
+                        documents.setNetworkVendor(document.id, vendor: vendor)
+                    }
+                )
+            }
+        }
+        .help(
+            document.networkVendorIsManual
+                ? "Device family: \(document.networkVendor.label) (chosen manually)"
+                : "Device family: \(document.networkVendor.label) (detected)"
+        )
     }
 
     private func textToolsMenu(for document: Document) -> some View {
@@ -177,12 +266,36 @@ struct StatusBarView: View {
                 Toggle(
                     lineEnding.displayName,
                     isOn: choiceBinding(document.lineEnding == lineEnding) {
-                        documents.setLineEnding(document.id, lineEnding: lineEnding)
-                        EditorCommandTarget.focusedEditor?.convertLineEndings(to: lineEnding)
+                        applyLineEnding(lineEnding, to: document)
                     }
                 )
             }
         }
+    }
+
+    /// Mirrors `applyIndentation`. It used to convert through
+    /// `focusedEditor`, which in compare mode is whichever pane has focus and
+    /// not necessarily the document whose menu this is — so picking CRLF on the
+    /// right pane's status bar rewrote the left pane's buffer. And with no
+    /// editor at all (a background tab), nothing converted the text: the label
+    /// changed and the file was saved with its old endings.
+    private func applyLineEnding(_ lineEnding: TextLineEnding, to document: Document) {
+        if let editor = EditorCommandTarget.editor(for: document.id) {
+            editor.convertLineEndings(to: lineEnding)
+        } else {
+            let converted = TextContentTransforms.convertLineEndings(in: document.text, to: lineEnding)
+            if converted != document.text {
+                document.text = converted
+                document.isDirty = true
+                documents.scheduleDraftSave(for: document.id)
+                documents.scheduleAutoSave(
+                    for: document.id,
+                    isEnabled: preferences.autoSaveEnabled,
+                    delay: preferences.autoSaveDelay
+                )
+            }
+        }
+        documents.setLineEnding(document.id, lineEnding: lineEnding)
     }
 
     private func indentationMenu(for document: Document) -> some View {

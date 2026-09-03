@@ -16,27 +16,34 @@ import Observation
 
 // MARK: - Manifest
 
+/// Two fields are deliberately absent, and their absence is the fix:
+///
+/// - `permissions`: parsed but never read by anything, while `FSBridge`'s header
+///   advertised it as the way to widen a plugin's file scope. A security control
+///   that does not exist is worse than none, because it is documented.
+/// - `contributes.keybindings`: also parsed and never read. `CommandRegistry` has
+///   no notion of a keybinding — shortcuts are `.keyboardShortcut` modifiers on
+///   SwiftUI menu items, resolved at compile time — so there was nothing to
+///   register a plugin binding WITH. Adding one is a real feature (a runtime key
+///   map ahead of the menu's own shortcuts), not a wiring fix, so the dead field
+///   is gone rather than left implying it works.
+///
+/// `JSONDecoder` ignores unknown keys, so a plugin.json that still carries either
+/// one keeps loading.
 struct PluginManifest: Codable {
     let id: String
     let name: String
     let version: String
     let main: String
     let activationEvents: [String]?
-    let permissions: [String]?
     let contributes: Contributes?
 
     struct Contributes: Codable {
         let commands: [Command]?
-        let keybindings: [Keybinding]?
 
         struct Command: Codable {
             let id: String
             let title: String
-        }
-        struct Keybinding: Codable {
-            let command: String
-            let key: String
-            let when: String?
         }
     }
 }
@@ -247,19 +254,75 @@ nonisolated final class PluginLog: @unchecked Sendable {
     static let shared = PluginLog()
     private let queue = DispatchQueue(label: "sheeptext.pluginlog")
 
+    /// Above this the file is truncated back to empty. A plugin in a `console.log`
+    /// loop used to grow this file without limit — there was no rotation at all.
+    static let maxLogBytes: UInt64 = 4 * 1024 * 1024
+
+    /// One formatter for the process. `ISO8601DateFormatter()` was constructed per
+    /// line, and date formatters are among the most expensive objects in
+    /// Foundation to create.
+    /// `nonisolated(unsafe)` because `ISO8601DateFormatter` is not Sendable, and
+    /// this one is touched from exactly one place: `write`, on `queue`, which is
+    /// serial. The whole class is already `@unchecked Sendable` on that basis.
+    nonisolated(unsafe) private static let stampFormatter: ISO8601DateFormatter = {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime]
+        return formatter
+    }()
+
+    /// Kept open across lines. Each line used to `ensureExists()` (three
+    /// `createDirectory` syscalls), open a fresh `FileHandle`, seek, write and
+    /// close — six-plus syscalls to append one line.
+    ///
+    /// The trade-off: deleting the log file out from under a running app no
+    /// longer restarts it, because the open descriptor keeps writing into the
+    /// unlinked inode until the process exits. Re-checking existence per line
+    /// would put the syscall straight back.
+    private var handle: FileHandle?
+    private var bytesWritten: UInt64 = 0
+    private var didEnsureDirectories = false
+
     func log(_ message: String) {
-        queue.async {
-            PluginPaths.ensureExists()
-            let stamp = ISO8601DateFormatter().string(from: Date())
-            let line = "[\(stamp)] \(message)\n"
-            guard let data = line.data(using: .utf8) else { return }
-            if let handle = try? FileHandle(forWritingTo: PluginPaths.logFile) {
-                handle.seekToEndOfFile()
-                handle.write(data)
-                try? handle.close()
-            } else {
-                try? data.write(to: PluginPaths.logFile)
-            }
+        queue.async { [self] in
+            let stamp = Self.stampFormatter.string(from: Date())
+            guard let data = "[\(stamp)] \(message)\n".data(using: .utf8) else { return }
+            write(data)
         }
+    }
+
+    // MARK: - Queue-confined
+
+    private func write(_ data: Data) {
+        guard let handle = openedHandle() else { return }
+        if bytesWritten > Self.maxLogBytes {
+            try? handle.truncate(atOffset: 0)
+            bytesWritten = 0
+        }
+        do {
+            try handle.write(contentsOf: data)
+            bytesWritten += UInt64(data.count)
+        } catch {
+            // The file was deleted or the volume went away — drop the handle so
+            // the next line reopens rather than writing into nothing forever.
+            try? handle.close()
+            self.handle = nil
+        }
+    }
+
+    private func openedHandle() -> FileHandle? {
+        if let handle { return handle }
+
+        if !didEnsureDirectories {
+            PluginPaths.ensureExists()
+            didEnsureDirectories = true
+        }
+        let fm = FileManager.default
+        if !fm.fileExists(atPath: PluginPaths.logFile.path) {
+            fm.createFile(atPath: PluginPaths.logFile.path, contents: nil)
+        }
+        guard let opened = try? FileHandle(forWritingTo: PluginPaths.logFile) else { return nil }
+        bytesWritten = (try? opened.seekToEnd()) ?? 0
+        handle = opened
+        return opened
     }
 }

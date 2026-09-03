@@ -34,11 +34,19 @@
 (comment) @comment @spell
 (marginalia) @comment
 
+; SheepText: these two predicates were written as Lua patterns ("%d"), but
+; SwiftTreeSitter compiles #match? with NSRegularExpression, where "%" is a
+; literal. Both patterns matched nothing, so every numeric literal kept the
+; (literal) @string capture above and rendered as a string.
 ((literal) @number
-   (#match? @number "^[-+]?%d+$"))
+   (#match? @number "^[-+]?\\d+$"))
 
-((literal) @float
-  (#match? @float "^[-+]?%d*\.%d*$"))
+; @number.float, not @float: SheepText's palette has no "float" scope, and an
+; unresolvable capture name yields no attributes at all — which left floats
+; green even once the pattern matched. Dotted names fall back to their prefix
+; ("number"), and @number.float is the current tree-sitter convention anyway.
+((literal) @number.float
+  (#match? @number.float "^[-+]?\\d*\\.\\d*$"))
 
 (parameter) @parameter
 

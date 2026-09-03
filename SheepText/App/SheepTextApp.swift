@@ -28,6 +28,11 @@ struct SheepTextApp: App {
     @State private var palette   = CommandPaletteController()
     @State private var cursor    = CursorState()
     @State private var preferences = AppPreferences()
+    // The plugin subsystem was fully built but never instantiated: nothing
+    // constructed a PluginManager, so no plugin ever loaded and PluginsView —
+    // which reads it out of the environment — would have trapped had anything
+    // shown it. It is created here and handed to both scenes.
+    @State private var plugins = PluginManager()
     @State private var didRestoreSession = false
 
     var body: some Scene {
@@ -39,6 +44,7 @@ struct SheepTextApp: App {
                 .environment(palette)
                 .environment(cursor)
                 .environment(preferences)
+                .environment(plugins)
                 .preferredColorScheme(preferences.themeMode.colorScheme)
                 .tint(Color(nsColor: .bestTextAccent))
                 // No .frame here: MainWindowView sets its own minimum size
@@ -69,29 +75,52 @@ struct SheepTextApp: App {
                     if !didRestoreSession {
                         didRestoreSession = true
                         let launchFileURLs = appDelegate.consumePendingOpenFileURLs()
-                        if launchFileURLs.isEmpty && documents.documents.isEmpty {
+
+                        if documents.documents.isEmpty {
                             switch preferences.launchBehavior {
                             case .newBlankDocument:
-                                documents.newUntitled(preferences: preferences)
+                                // Only when nothing else is about to open: a
+                                // double-clicked file should not also produce a
+                                // blank Untitled tab beside it.
+                                if launchFileURLs.isEmpty {
+                                    documents.newUntitled(preferences: preferences)
+                                }
                             case .reopenLastSession:
+                                // Restore FIRST, then open the launch files.
+                                // Launching by double-clicking a file used to
+                                // skip this branch entirely — restoreSessionTabs
+                                // is the only caller of restoreDrafts — and then
+                                // open() → documents.didSet → persistSession
+                                // overwrote the saved session with that single
+                                // file, so the user's tabs were gone for good.
                                 workspace.restoreLastSessionWorkspace()
                                 documents.restoreSessionTabs()
-                                if documents.activeDocument == nil {
+                                if launchFileURLs.isEmpty, documents.activeDocument == nil {
                                     documents.newUntitled(preferences: preferences)
                                 }
                             case .showOpenPanel:
-                                let urls = workspace.promptOpenFiles()
-                                for url in urls {
-                                    documents.open(url: url, preferences: preferences)
-                                }
-                                if urls.isEmpty {
-                                    documents.newUntitled(preferences: preferences)
+                                if launchFileURLs.isEmpty {
+                                    let urls = workspace.promptOpenFiles()
+                                    for url in urls {
+                                        documents.open(url: url, preferences: preferences)
+                                    }
+                                    if urls.isEmpty {
+                                        documents.newUntitled(preferences: preferences)
+                                    }
                                 }
                             }
-                        } else {
+                        }
+
+                        // open() dedupes by URL, so a launch file that the
+                        // restored session already had simply becomes active.
+                        if !launchFileURLs.isEmpty {
                             documents.openExternalFileURLs(launchFileURLs, preferences: preferences)
                         }
                     }
+
+                    await plugins.loadAll(commands: commands, workspace: workspace)
+
+                    UpdateChecker.shared.checkForUpdatesOnLaunchIfDue(preferences: preferences)
                 }
                 .onOpenURL { url in
                     documents.openExternalFileURLs([url], preferences: preferences)
@@ -118,6 +147,7 @@ struct SheepTextApp: App {
         Settings {
             PreferencesView()
                 .environment(preferences)
+                .environment(plugins)
                 .preferredColorScheme(preferences.themeMode.colorScheme)
                 .tint(Color(nsColor: .bestTextAccent))
                 .onChange(of: preferences.themeMode) { _, _ in
@@ -171,9 +201,20 @@ final class SheepTextAppDelegate: NSObject, NSApplicationDelegate {
         if !hasMainWindow { reopenMainWindowHandler?() }
     }
 
+    /// Dock click / `open -a` on the running app.
+    ///
+    /// Returning `true` tells AppKit to run its own reopen behaviour *as well*.
+    /// When the user had closed the last main window with the red X, that meant
+    /// two windows: the one `reopenMainWindowHandler` creates and the one
+    /// SwiftUI restores for the WindowGroup. So we only hand the event back to
+    /// AppKit when a main window still exists (on screen or minimised in the
+    /// Dock) — that is the case where AppKit's default un-miniaturise is
+    /// exactly what we want and creating one ourselves would be the duplicate.
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows: Bool) -> Bool {
-        ensureMainWindowVisible()
-        return true
+        guard !hasMainWindow else { return true }
+        guard let reopenMainWindowHandler else { return true }
+        reopenMainWindowHandler()
+        return false
     }
 
     func applicationWillFinishLaunching(_ notification: Notification) {

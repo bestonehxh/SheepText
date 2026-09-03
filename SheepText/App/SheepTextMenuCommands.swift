@@ -19,6 +19,15 @@ struct SheepTextMenuCommands: Commands {
 
     var body: some Commands {
 
+        // MARK: SheepText (app menu)
+        CommandGroup(after: .appInfo) {
+            // "Check for Updates…" always checks and always reports, unlike the
+            // throttled silent check SheepTextApp runs at launch.
+            Button("Check for Updates…") {
+                UpdateChecker.shared.checkForUpdates()
+            }
+        }
+
         // MARK: File
         CommandGroup(replacing: .newItem) {
             Button("New File") {
@@ -90,29 +99,29 @@ struct SheepTextMenuCommands: Commands {
         }
 
         CommandGroup(replacing: .saveItem) {
+            // Trim and save resolve the SAME document id — they used to
+            // disagree (focused editor vs. active tab), which in compare mode
+            // trimmed one pane and wrote the other pane's file. See
+            // BuiltInCommands.saveTargetDocumentID.
             Button("Save") {
-                if EditorCommandTarget.focusedEditor?.document?.autoTrimTrailingWhitespace == true {
-                    EditorCommandTarget.focusedEditor?.trimTrailingWhitespace(markDirty: false)
-                }
-                if let id = documents.activeDocumentID { documents.save(id) }
+                guard let id = BuiltInCommands.saveTargetDocumentID(documents) else { return }
+                BuiltInCommands.trimDocumentIfNeeded(id, in: documents)
+                documents.save(id)
             }
             .keyboardShortcut("s", modifiers: .command)
             .disabled(documents.activeDocument == nil)
 
             Button("Save All") {
-                if EditorCommandTarget.focusedEditor?.document?.autoTrimTrailingWhitespace == true {
-                    EditorCommandTarget.focusedEditor?.trimTrailingWhitespace(markDirty: false)
-                }
+                BuiltInCommands.trimAllDirtyDocumentsIfNeeded(in: documents)
                 documents.saveAllDirty()
             }
             .keyboardShortcut("s", modifiers: [.command, .option])
             .disabled(!documents.documents.contains { $0.isDirty })
 
             Button("Save As…") {
-                if EditorCommandTarget.focusedEditor?.document?.autoTrimTrailingWhitespace == true {
-                    EditorCommandTarget.focusedEditor?.trimTrailingWhitespace(markDirty: false)
-                }
-                if let id = documents.activeDocumentID { documents.saveAs(id) }
+                guard let id = BuiltInCommands.saveTargetDocumentID(documents) else { return }
+                BuiltInCommands.trimDocumentIfNeeded(id, in: documents)
+                documents.saveAs(id)
             }
             .keyboardShortcut("s", modifiers: [.command, .shift])
             .disabled(documents.activeDocument == nil)

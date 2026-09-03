@@ -7,6 +7,7 @@ import SwiftUI
 import AppKit
 
 struct FindInFilesView: View {
+    @Environment(AppPreferences.self) private var preferences
     @Environment(WorkspaceStore.self) private var workspace
     @Environment(DocumentStore.self) private var documents
 
@@ -16,6 +17,11 @@ struct FindInFilesView: View {
     @State private var wholeWord = false
     @State private var useRegex = false
     @State private var matches: [FindInFilesMatch] = []
+    /// Grouped once, when `matches` changes. It used to be a computed property
+    /// read twice per `body` (once by the list, once by the ForEach id), so a
+    /// 1000-hit result grouped and sorted 1000 matches twice on every redraw —
+    /// including every keystroke in the query field.
+    @State private var groupedResults: [MatchGroup] = []
     @State private var searchedFiles = 0
     @State private var skippedFiles = 0
     @State private var hitLimit = false
@@ -140,13 +146,13 @@ struct FindInFilesView: View {
             }
         }
         .padding(10)
-        .background(Color(nsColor: .bestTextPanelBackground))
+        .background(preferences.chromeStyle.panelFill)
     }
 
     private var resultsList: some View {
         ScrollView {
             LazyVStack(alignment: .leading, spacing: 0) {
-                ForEach(groupedResults, id: \.path) { group in
+                ForEach(groupedResults) { group in
                     VStack(alignment: .leading, spacing: 0) {
                         HStack(spacing: 6) {
                             Image(systemName: "doc")
@@ -236,10 +242,16 @@ struct FindInFilesView: View {
         .frame(maxWidth: .infinity)
     }
 
-    private var groupedResults: [(path: String, matches: [FindInFilesMatch])] {
+    struct MatchGroup: Identifiable {
+        var id: String { path }
+        let path: String
+        let matches: [FindInFilesMatch]
+    }
+
+    private static func group(_ matches: [FindInFilesMatch]) -> [MatchGroup] {
         let grouped = Dictionary(grouping: matches, by: \.relativePath)
         return grouped.keys.sorted().map { path in
-            (path, grouped[path] ?? [])
+            MatchGroup(path: path, matches: grouped[path] ?? [])
         }
     }
 
@@ -271,16 +283,36 @@ struct FindInFilesView: View {
         isBusy = true
 
         searchTask = Task { @MainActor in
-            let outcome = await Task.detached(priority: .userInitiated) {
-                Result { try FindInFilesEngine.search(root: root, tree: tree, options: options) }
-            }.value
+            // The engine runs detached, so cancelling THIS task only stopped the
+            // await — the search kept reading and regexing every file in the
+            // workspace behind the one the user was waiting for. It polls the
+            // handle now, per file and per match.
+            let handle = SearchCancellationHandle()
+            let outcome = await withTaskCancellationHandler {
+                await Task.detached(priority: .userInitiated) {
+                    Result {
+                        try FindInFilesEngine.search(
+                            root: root,
+                            tree: tree,
+                            options: options,
+                            isCancelled: { handle.isCancelled }
+                        )
+                    }
+                }.value
+            } onCancel: {
+                handle.cancel()
+            }
 
+            // A cancelled task deliberately does NOT clear isBusy: whoever
+            // cancelled it has either started a new search (which owns the
+            // spinner now) or called clearResults (which cleared it).
             guard !Task.isCancelled else { return }
             isBusy = false
 
             switch outcome {
             case .success(let summary):
                 matches = summary.matches
+                groupedResults = Self.group(summary.matches)
                 searchedFiles = summary.searchedFiles
                 skippedFiles = summary.skippedFiles
                 hitLimit = summary.hitLimit
@@ -288,6 +320,7 @@ struct FindInFilesView: View {
                 if clearingReplaceMessage { replaceMessage = nil }
             case .failure(let error):
                 matches = []
+                groupedResults = []
                 searchedFiles = 0
                 skippedFiles = 0
                 hitLimit = false
@@ -372,6 +405,7 @@ struct FindInFilesView: View {
         searchTask?.cancel()
         isBusy = false
         matches = []
+        groupedResults = []
         searchedFiles = 0
         skippedFiles = 0
         hitLimit = false
@@ -398,11 +432,46 @@ struct FindInFilesView: View {
         alert.runModal()
     }
 
+    /// Opening a tab creates the editor asynchronously (SwiftUI has to run an
+    /// update before `EditorCommandTarget` knows about it), so the jump used to
+    /// be posted behind a flat 0.15 s delay — and was silently dropped whenever
+    /// the open took longer than that, which is exactly what a big file does.
+    /// Retry with backoff instead, giving up after ~2 s.
     private func open(_ match: FindInFilesMatch) {
         guard let document = documents.open(url: match.url) else { return }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
-            EditorCommandTarget.editor(for: document.id)?.goToLine(match.lineNumber)
+        if let editor = EditorCommandTarget.editor(for: document.id) {
+            editor.goToLine(match.lineNumber)
+            return
         }
+        Task { @MainActor in
+            var delay: UInt64 = 30_000_000        // 30 ms
+            var waited: Double = 0
+            while waited < 2.0 {
+                try? await Task.sleep(nanoseconds: delay)
+                waited += Double(delay) / 1_000_000_000
+                if let editor = EditorCommandTarget.editor(for: document.id) {
+                    editor.goToLine(match.lineNumber)
+                    return
+                }
+                delay = min(delay * 2, 250_000_000)
+            }
+        }
+    }
+}
+
+/// Cancellation flag the detached Find in Files work can poll. `Task.isCancelled`
+/// is per-task and a `Task.detached` does not inherit it, so the engine needs
+/// something it can be handed.
+nonisolated private final class SearchCancellationHandle: @unchecked Sendable {
+    private let lock = NSLock()
+    private var cancelled = false
+
+    var isCancelled: Bool {
+        lock.withLock { cancelled }
+    }
+
+    func cancel() {
+        lock.withLock { cancelled = true }
     }
 }
 

@@ -71,9 +71,11 @@ final class LineNumberRulerView: NSView {
     /// the transfer arrow.
     weak var widthConstraint: NSLayoutConstraint?
 
-    /// High-water mark of the largest line number drawn. Monotonic within a
-    /// document so the gutter does not twitch narrower and wider as you scroll.
-    private var widestNumberSeen: Int = 0
+    /// High-water mark of the largest line number drawn. Monotonic *within a
+    /// document* so the gutter does not twitch narrower and wider as you scroll
+    /// — `syncDocumentIdentity` resets it when the document changes. Internal
+    /// rather than private so the reset can be asserted without a window.
+    var widestNumberSeen: Int = 0
 
     private weak var scrollView: NSScrollView?
     private weak var textView: NSTextView?
@@ -115,9 +117,23 @@ final class LineNumberRulerView: NSView {
     }
 
 
+    /// Which document the gutter last drew. `widestNumberSeen` is a high-water
+    /// mark, so without this it never came back down: open a 12,000-line file in
+    /// one tab and every other tab in the window kept a five-digit gutter for the
+    /// life of the session.
+    private var lastDrawnDocumentID: Document.ID?
+
     private var boundsObserver: NSObjectProtocol?
     private var textDidChangeObserver: NSObjectProtocol?
     private var selectionObserver: NSObjectProtocol?
+    private var storageObserver: NSObjectProtocol?
+
+    /// Memo for the first-visible-row line lookup. That lookup is O(offset), and
+    /// it runs on every scroll tick and every keystroke — scrolled to the end of
+    /// a 5 MB file it was ~4.6 ms per frame counting the same newlines. Keyed on
+    /// `textChangeStamp`, which now moves on every storage edit, programmatic
+    /// ones included.
+    private var lineCursor = TextLineIndex.Cursor()
 
     // MARK: - Foldable-marker cache
     //
@@ -137,6 +153,20 @@ final class LineNumberRulerView: NSView {
     }
 
     private var foldMarkerCache: FoldMarkerCache?
+
+    /// `foldLineSpans` used to call the single-offset line lookup once per fold
+    /// region, per frame — O(regions x length) while scrolling. One batched pass
+    /// answers all of them, and the answer only changes when the text or the
+    /// fold set does.
+    private struct FoldSpanCache {
+        let documentID: Document.ID?
+        let textLength: Int
+        let regionCount: Int
+        let changeStamp: Int
+        let spans: [(displayLine: Int, hidden: Int)]
+    }
+
+    private var foldSpanCache: FoldSpanCache?
 
     /// Bumped on every text change. Length alone is not enough of a key: typing
     /// over a one-character selection leaves the document exactly as long as it
@@ -173,6 +203,28 @@ final class LineNumberRulerView: NSView {
             self.needsDisplay = true
         }
 
+        // NSText.didChangeNotification only fires for edits that went through the
+        // text view. Folding, a tab switch and the compare display all rewrite
+        // the storage directly, and the caches keyed on this stamp have to see
+        // those too — a stale line cursor is a wrong line number, not a slow one.
+        if let storage = textView.textStorage {
+            storageObserver = NotificationCenter.default.addMainActorObserver(
+                forName: NSTextStorage.didProcessEditingNotification,
+                object: storage,
+                queue: .main
+            ) { [weak self] _ in
+                guard let self else { return }
+                // Deliberately not filtered on `editedMask`: that property is
+                // only meaningful while `processEditing` is on the stack, and a
+                // main-queue observer is not guaranteed to be delivered inline.
+                // Reading it here could answer "no characters changed" for an
+                // edit that changed plenty, and the cost of an occasional extra
+                // cache miss is nothing next to a wrong line number.
+                self.textChangeStamp &+= 1
+                self.needsDisplay = true
+            }
+        }
+
         selectionObserver = NotificationCenter.default.addMainActorObserver(
             forName: EditorTextView.selectionDidChange,
             object: textView,
@@ -191,7 +243,7 @@ final class LineNumberRulerView: NSView {
     }
 
     isolated deinit {
-        for observer in [boundsObserver, textDidChangeObserver, selectionObserver] {
+        for observer in [boundsObserver, textDidChangeObserver, selectionObserver, storageObserver] {
             if let observer {
                 NotificationCenter.default.removeObserver(observer)
             }
@@ -220,6 +272,24 @@ final class LineNumberRulerView: NSView {
     func preferredWidth() -> CGFloat {
         let font = textView?.font ?? NSFont.monospacedSystemFont(ofSize: 13, weight: .regular)
         return requiredWidth(font: font)
+    }
+
+    /// Drop everything that describes the previous document.
+    ///
+    /// `widestNumberSeen` is a high-water mark, and nothing used to lower it:
+    /// open a 12,000-line file in one tab and every other tab in that window
+    /// kept a five-digit gutter for the rest of the session. The caches and the
+    /// line cursor go with it — they are keyed on a change stamp that says
+    /// nothing about which file it is counting.
+    func syncDocumentIdentity(_ documentID: Document.ID?) {
+        guard documentID != lastDrawnDocumentID else { return }
+        lastDrawnDocumentID = documentID
+        // In compare mode the didSet on `compareLineInfos` has already sized the
+        // gutter from the real line numbers, so leave that alone.
+        if compareLineInfos == nil { widestNumberSeen = 0 }
+        lineCursor.invalidate()
+        foldMarkerCache = nil
+        foldSpanCache = nil
     }
 
     /// Never mutates layout inside the draw pass — that re-enters drawing.
@@ -275,7 +345,11 @@ final class LineNumberRulerView: NSView {
         if visibleGlyphs.length == 0 { return }
 
         let visibleChars = layoutManager.characterRange(forGlyphRange: visibleGlyphs, actualGlyphRange: nil)
-        let isLargeFileMode = (textView as? EditorTextView)?.document?.isLargeFileModeActive == true
+        let document = (textView as? EditorTextView)?.document
+        let documentID = document?.id
+        let isLargeFileMode = document?.isLargeFileModeActive == true
+
+        syncDocumentIdentity(documentID)
 
         // Line number of the first visible row.
         //
@@ -292,12 +366,17 @@ final class LineNumberRulerView: NSView {
         // row one too high until the next unwrapped row scrolled in. Counting
         // newlines strictly before the offset gives the line that CONTAINS it,
         // which is the row the enumeration below starts on.
-        var displayLineNumber = TextLineIndex.lineNumber(in: fullText, at: visibleChars.location)
+        // The length is folded into the stamp so an insertion or deletion
+        // invalidates the memo even if the change notification has not been
+        // delivered yet. `textChangeStamp` covers the same-length edits.
+        let lineStamp = textChangeStamp &* 31 &+ fullText.length
+        var displayLineNumber = lineCursor.lineNumber(in: fullText,
+                                                      at: visibleChars.location,
+                                                      stamp: lineStamp)
 
         let infos     = compareLineInfos
         let markers   = (infos == nil && !isLargeFileMode)
-            ? foldMarkers(displayText: fullText,
-                          documentID: (textView as? EditorTextView)?.document?.id)
+            ? foldMarkers(displayText: fullText, documentID: documentID)
             : (foldable: Set<Int>(), folded: Set<Int>())
         let foldable  = markers.foldable
         let folded    = markers.folded
@@ -305,7 +384,7 @@ final class LineNumberRulerView: NSView {
         // display rows — a collapsed fold hides lines and pushes every mark below it
         // onto the wrong row. These spans translate between the two.
         let foldSpans = (infos == nil && !savedLineMarks.isEmpty)
-            ? foldLineSpans(displayText: fullText)
+            ? foldLineSpans(displayText: fullText, documentID: documentID)
             : []
         var lastLineStart = -1
 
@@ -591,16 +670,35 @@ final class LineNumberRulerView: NSView {
 
     /// One entry per collapsed fold: the display row it sits on, and how many
     /// full-text lines it swallows.
-    private func foldLineSpans(displayText: NSString) -> [(displayLine: Int, hidden: Int)] {
+    func foldLineSpans(displayText: NSString,
+                       documentID: Document.ID?) -> [(displayLine: Int, hidden: Int)] {
         guard let foldingManager, !foldingManager.regions.isEmpty else { return [] }
-        return foldingManager.regions.compactMap { region in
-            guard region.displayLocation >= 0, region.displayLocation < displayText.length
-            else { return nil }
-            let hidden = region.hiddenLineCount
-            guard hidden > 0 else { return nil }
-            return (TextLineIndex.lineNumber(in: displayText, at: region.displayLocation), hidden)
+
+        if let cached = foldSpanCache,
+           cached.documentID == documentID,
+           cached.textLength == displayText.length,
+           cached.regionCount == foldingManager.regions.count,
+           cached.changeStamp == textChangeStamp {
+            return cached.spans
         }
-        .sorted { $0.displayLine < $1.displayLine }
+
+        // One pass for every region instead of one pass per region.
+        let usable = foldingManager.regions.filter {
+            $0.displayLocation >= 0 && $0.displayLocation < displayText.length && $0.hiddenLineCount > 0
+        }
+        let lines = TextLineIndex.lineNumbers(in: displayText, at: usable.map(\.displayLocation))
+        let spans = zip(lines, usable)
+            .map { (displayLine: $0, hidden: $1.hiddenLineCount) }
+            .sorted { $0.displayLine < $1.displayLine }
+
+        foldSpanCache = FoldSpanCache(
+            documentID: documentID,
+            textLength: displayText.length,
+            regionCount: foldingManager.regions.count,
+            changeStamp: textChangeStamp,
+            spans: spans
+        )
+        return spans
     }
 
     /// Modified-since-save colour for a display row, accounting for collapsed folds.
@@ -670,11 +768,16 @@ final class LineNumberRulerView: NSView {
                 }) {
                     fm.unfold(at: region.displayLocation, in: storage)
                     tv.discardUndoHistory()
+                    // Arm immediately before the notification this emits, so
+                    // `textDidChange` knows the edit is a fold and does not mark
+                    // the document dirty. See `armFoldMutationFlag`.
+                    fm.armFoldMutationFlag()
                     tv.didChangeText()
                 }
             } else if let range = fm.foldableRange(onLine: line, displayText: displayText) {
                 fm.fold(range: range, in: storage)
                 tv.discardUndoHistory()
+                fm.armFoldMutationFlag()
                 tv.didChangeText()
             }
         } else {

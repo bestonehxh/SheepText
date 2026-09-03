@@ -32,11 +32,40 @@ enum LineEndingHygiene {
          #"`contains("\n")` compares Characters, so it is false for CRLF — and it is worse than that: it answers *true* for a string bridged from NSTextStorage and *false* for a native Swift String, so behaviour depends on where the value came from. Search `unicodeScalars`, or count UTF-8 0x0A."#),
         (#".contains("\r\n")"#,
          #"Do not special-case CRLF. Handle line breaks at the scalar or UTF-8 level and both endings fall out for free."#),
-        (#"split(separator: "\n")"#,
+        // Needles stop before the closing paren on purpose: the argument list may
+        // carry more than the separator. `split(separator: "\n", omittingEmptySubsequences: false)`
+        // is exactly as broken on CRLF as the bare form, and the old exact-substring
+        // needle walked straight past it.
+        (#"split(separator: "\n""#,
          #"`split(separator:)` compares Characters, so it never splits CRLF text at all — the whole file comes back as one element. Use `LineHashing.splitLines`, which splits on the newline scalar."#),
-        (#"split(separator: "\r\n")"#,
+        (#"split(separator: "\r\n""#,
          #"Use `LineHashing.splitLines`."#),
+        // ⇧⌘D shipped a blank-line bug on every CRLF file because nothing here
+        // looked for the affix forms: a line ending in CRLF ends in ONE Character
+        // that is neither "\n" nor "\r", so `hasSuffix("\n")` is false for every
+        // line of a CRLF document.
+        (#"hasSuffix("\n")"#,
+         #"A CRLF line ends in a single Character equal to neither "\n" nor "\r", so this is false for every line of a CRLF file. Test the trailing UTF-16 unit (`ns.character(at: end - 1) == 10`) or the last UTF-8 byte."#),
+        (#"hasPrefix("\n")"#,
+         #"Character-level affix test: a leading CRLF is one Character and does not match "\n". Test the leading UTF-16 unit or UTF-8 byte."#),
+        (#"hasSuffix("\r\n")"#,
+         #"Do not special-case CRLF. Test the trailing UTF-16 unit / UTF-8 byte and both endings fall out for free."#),
+        (#"hasPrefix("\r\n")"#,
+         #"Do not special-case CRLF. Test the leading UTF-16 unit / UTF-8 byte and both endings fall out for free."#),
     ]
+
+    /// `hasSuffix("\r")` is deliberately NOT banned. Every use of it here runs on a
+    /// line that has already been split on the newline scalar, so the `\r` left
+    /// behind is a lone Character and does match — `LineHashing.normalize` and
+    /// `CompareBlockSplice.neutralize` both depend on that. It is only wrong when
+    /// the string might still end in a full CRLF pair, and in that case the
+    /// `hasSuffix("\n")` rule above fires on the same expression.
+
+    /// A value that has been run through `DocumentStore.normalizeLineEndingsToLF`
+    /// contains no CR at all, so Character-level line handling on it is correct.
+    /// The convention in this codebase is to bind that result to `normalized`, and
+    /// naming it on the same line is the evidence this looks for.
+    private static let lfNormalizedEvidence = ["normalizeLineEndingsToLF", "normalized"]
 
     /// Every shape above is only about *Character-level* handling. The same call
     /// on `unicodeScalars` or `utf8` is correct, so a line that mentions one of
@@ -57,6 +86,10 @@ enum LineEndingHygiene {
 
             let looksScalar = scalarEvidence.contains { rawLine.contains($0) }
             if looksScalar { continue }
+
+            // Already converted to LF, so there is no CRLF pair left to miss.
+            let looksNormalized = lfNormalizedEvidence.contains { rawLine.contains($0) }
+            if looksNormalized { continue }
 
             for rule in banned where rawLine.contains(rule.needle) {
                 found.append(Violation(file: path, line: index + 1,
@@ -128,6 +161,37 @@ final class LineEndingHygieneTests: XCTestCase {
         let found = LineEndingHygiene.violations(in: bad, path: "Bad.swift")
         XCTAssertEqual(found.count, 4, "expected one hit per line, got:\n\(found)")
         XCTAssertEqual(Set(found.map(\.line)), [1, 2, 3, 4])
+    }
+
+    /// The two holes that let the ⇧⌘D CRLF blank-line bug through review.
+    ///
+    /// Line 1 is verbatim the shipped bug (`duplicateCurrentLines`). Line 2 is the
+    /// argument form the old exact-substring needle `split(separator: "\n")` could
+    /// not see, because the real call carries a second argument.
+    func testScannerCatchesTheAffixAndArgumentFormsThatShippedABug() {
+        let bad = #"""
+        let endsWithBreak = lineText.hasSuffix("\n") || lineText.hasSuffix("\r")
+        let lines = text.split(separator: "\n", omittingEmptySubsequences: false)
+        if body.hasPrefix("\n") { body.removeFirst() }
+        if body.hasSuffix("\r\n") { body.removeLast(2) }
+        """#
+        let found = LineEndingHygiene.violations(in: bad, path: "Bad.swift")
+        XCTAssertEqual(Set(found.map(\.line)), [1, 2, 3, 4],
+                       "missed a shape:\n\(found.map(\.description).joined(separator: "\n"))")
+    }
+
+    /// `hasSuffix("\r")` on a line that was split on the newline scalar is correct —
+    /// the `\r` left behind is a lone Character and does match. So is anything run
+    /// on a value already normalised to LF. Neither may be reported.
+    func testScannerAllowsTheCorrectCRLFIdioms() {
+        let good = #"""
+        if value.hasSuffix("\r") { value.removeLast() }
+        let hasFinalNewline = normalized.hasSuffix("\n")
+        var lines = normalized.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+        let lf = DocumentStore.normalizeLineEndingsToLF(text).split(separator: "\n")
+        """#
+        let found = LineEndingHygiene.violations(in: good, path: "Good.swift")
+        XCTAssertTrue(found.isEmpty, "false positives:\n\(found.map(\.description).joined(separator: "\n"))")
     }
 
     func testScannerLeavesCorrectCodeAlone() {

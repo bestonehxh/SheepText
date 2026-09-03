@@ -63,6 +63,43 @@ nonisolated final class DiffLayoutManager: NSLayoutManager, NSLayoutManagerDeleg
     /// Full-width line background tints (one per diff line paragraph range).
     var lineHighlights: [(range: NSRange, color: NSColor)] = []
 
+    /// Every character edit, as (edited range in NEW coordinates, length delta).
+    ///
+    /// The editor coordinator uses it to move its highlight runs with the text,
+    /// so the colours on screen stay right through the rehighlight debounce.
+    /// `NSText.didChangeNotification` — the only other hook — does not say WHAT
+    /// changed, and by the time it arrives the offsets are gone.
+    nonisolated(unsafe) var onCharactersEdited: (@MainActor (NSRange, Int) -> Void)?
+
+    /// Called (coalesced, on the next main-queue turn) whenever TextKit finishes
+    /// laying out a chunk.
+    ///
+    /// The editor paints syntax colours for the characters on screen, so it has
+    /// to hear about anything that changes WHICH characters those are. Scroll
+    /// and resize have their own notifications; this catches the rest — the
+    /// first layout of a pane that has just been added to a window, a font-size
+    /// change, a word-wrap toggle — without the coordinator having to enumerate
+    /// them.
+    nonisolated(unsafe) var onDidCompleteLayout: (@MainActor () -> Void)?
+
+    /// One pending paint at a time. A `let` of its own rather than a flag on
+    /// `self`, so the coalescing can be read and cleared from the main-queue
+    /// block without sending the layout manager across isolation.
+    private final class PaintGate: @unchecked Sendable {
+        private let lock = NSLock()
+        private var scheduled = false
+        func begin() -> Bool {
+            lock.lock(); defer { lock.unlock() }
+            if scheduled { return false }
+            scheduled = true
+            return true
+        }
+        func end() {
+            lock.lock(); scheduled = false; lock.unlock()
+        }
+    }
+    private let layoutPaintGate = PaintGate()
+
     override init() {
         super.init()
         delegate = self
@@ -121,6 +158,23 @@ nonisolated final class DiffLayoutManager: NSLayoutManager, NSLayoutManagerDeleg
         return true
     }
 
+    func layoutManager(
+        _ layoutManager: NSLayoutManager,
+        didCompleteLayoutFor textContainer: NSTextContainer?,
+        atEnd layoutFinishedFlag: Bool
+    ) {
+        guard let onDidCompleteLayout, layoutPaintGate.begin() else { return }
+        let gate = layoutPaintGate
+        // Never synchronously: this is called from inside a layout pass, and the
+        // paint touches the same layout manager.
+        DispatchQueue.main.async {
+            MainActor.assumeIsolated {
+                gate.end()
+                onDidCompleteLayout()
+            }
+        }
+    }
+
     override func processEditing(
         for textStorage: NSTextStorage,
         edited editMask: NSTextStorageEditActions,
@@ -168,6 +222,12 @@ nonisolated final class DiffLayoutManager: NSLayoutManager, NSLayoutManagerDeleg
         super.processEditing(for: textStorage, edited: editMask, range: newCharRange,
                              changeInLength: delta,
                              invalidatedRange: invalidatedCharRange)
+
+        // After super, so AppKit has already shifted its own temporary
+        // attributes: the coordinator's painted window has to move the same way.
+        if editMask.contains(.editedCharacters), let onCharactersEdited {
+            MainActor.assumeIsolated { onCharactersEdited(newCharRange, delta) }
+        }
     }
 
     override func drawBackground(forGlyphRange glyphsToShow: NSRange, at origin: NSPoint) {
@@ -257,14 +317,39 @@ final class EditorTextView: NSTextView {
             super.insertTab(sender)
             return
         }
-        insertText(indentation.insertionString, replacementRange: selectedRange())
+        // NSNotFound, not selectedRange(): an explicit range is the primary
+        // cursor only, and Tab has to indent at every cursor. The Thai
+        // sanitiser is suppressed because this is not a keystroke the user
+        // typed into the text (see `suppressesThaiSanitizer`).
+        suppressesThaiSanitizer = true
+        defer { suppressesThaiSanitizer = false }
+        insertText(indentation.insertionString,
+                   replacementRange: NSRange(location: NSNotFound, length: 0))
     }
 
-    override func insertText(_ insertString: Any, replacementRange: NSRange) {
-        let effectiveRange = replacementRange.location == NSNotFound
-            ? selectedRange()
-            : replacementRange
+    /// Set while `paste`/`insertTab` route their text through `insertText`, so
+    /// the Thai combining-mark sanitiser stays off. It exists to stop a *typed*
+    /// mark from being repeated on top of itself; pasted or programmatic text
+    /// carries whatever the source had, doubled marks included, and silently
+    /// dropping one of them corrupts the paste.
+    private var suppressesThaiSanitizer = false
 
+    /// AppKit applies an insertion to **one** range.
+    ///
+    /// With `replacementRange` = NSNotFound the documentation reads as though
+    /// the insertion goes to the whole selection, and on TextKit 1 it does not:
+    /// `NSTextView` resolves `rangeForUserTextChange` — the primary range — and
+    /// every other cursor is discarded (verified with a standalone AppKit
+    /// program; `deleteBackward:` *does* fan out, which is why deleting felt
+    /// like it worked and typing did not). So multi-cursor typing inserted one
+    /// character at one cursor and collapsed the rest.
+    ///
+    /// The fan-out below is the same arithmetic as `duplicateCurrentLines`:
+    /// plural `shouldChangeText` (one undo step, and the filler-line guard sees
+    /// every range), one storage editing group, replacements applied
+    /// back-to-front so the offsets stay valid, then the carets rebuilt by
+    /// carrying the running delta forward.
+    override func insertText(_ insertString: Any, replacementRange: NSRange) {
         guard !hasMarkedText(),
               let insertedText = plainString(from: insertString)
         else {
@@ -272,6 +357,49 @@ final class EditorTextView: NSTextView {
             return
         }
 
+        let ranges: [NSRange]
+        if replacementRange.location == NSNotFound {
+            ranges = (rangesForUserTextChange as? [NSRange])
+                ?? (selectedRanges as? [NSRange])
+                ?? [selectedRange()]
+        } else {
+            ranges = [replacementRange]
+        }
+
+        // Only an interactive single-cluster keystroke is sanitised. `count == 1`
+        // is the grapheme-cluster count, so a Thai base + mark typed as one
+        // dead-key sequence still qualifies while a paste never does.
+        let sanitizes = !suppressesThaiSanitizer
+            && replacementRange.location == NSNotFound
+            && insertedText.count == 1
+
+        if ranges.count > 1 {
+            var strings: [String] = []
+            strings.reserveCapacity(ranges.count)
+            for range in ranges {
+                let text = sanitizes
+                    ? sanitizedThaiCombiningMarks(in: insertedText, replacementRange: range)
+                    : insertedText
+                strings.append(text)
+            }
+            // A mark that would be dropped at EVERY cursor is the duplicate the
+            // sanitiser exists to refuse; beep and insert nothing, as the
+            // single-cursor path does.
+            if strings.allSatisfy(\.isEmpty) {
+                NSSound.beep()
+                return
+            }
+            if strings.contains(where: { $0 != insertedText }) { NSSound.beep() }
+            if insertText(strings, atRanges: ranges) { return }
+            return
+        }
+
+        guard sanitizes else {
+            super.insertText(insertString, replacementRange: replacementRange)
+            return
+        }
+
+        let effectiveRange = ranges.first ?? selectedRange()
         let sanitizedText = sanitizedThaiCombiningMarks(
             in: insertedText,
             replacementRange: effectiveRange
@@ -285,12 +413,54 @@ final class EditorTextView: NSTextView {
             super.insertText(insertString, replacementRange: replacementRange)
         } else {
             NSSound.beep()
-            // Forward the caller's original range: when it is NSNotFound AppKit applies
-            // the insertion at every selected range, keeping multi-cursor typing intact.
-            // `effectiveRange` resolved via selectedRange() covers only the primary
-            // cursor and would silently drop the others.
             super.insertText(sanitizedText, replacementRange: replacementRange)
         }
+    }
+
+    /// One replacement per range, as one edit and one undo step. Returns false
+    /// when nothing was applied (out-of-bounds ranges, or a filler line).
+    @discardableResult
+    private func insertText(_ strings: [String], atRanges ranges: [NSRange]) -> Bool {
+        guard let storage = textStorage, ranges.count == strings.count else { return false }
+        let length = storage.length
+
+        var edits: [(range: NSRange, text: String)] = []
+        edits.reserveCapacity(ranges.count)
+        for (index, range) in ranges.enumerated() {
+            guard range.location != NSNotFound,
+                  range.location >= 0,
+                  range.length >= 0,
+                  NSMaxRange(range) <= length
+            else { continue }
+            edits.append((range, strings[index]))
+        }
+        guard !edits.isEmpty else { return false }
+        edits.sort { $0.range.location < $1.range.location }
+
+        guard shouldChangeText(inRanges: edits.map { NSValue(range: $0.range) },
+                               replacementStrings: edits.map(\.text))
+        else { return false }
+
+        storage.beginEditing()
+        for edit in edits.reversed() {
+            storage.replaceCharacters(in: edit.range, with: edit.text)
+        }
+        storage.endEditing()
+
+        // Each caret lands after its own insertion, displaced by the net length
+        // change of every edit before it.
+        var carets: [NSRange] = []
+        carets.reserveCapacity(edits.count)
+        var shift = 0
+        for edit in edits {
+            let insertedLength = (edit.text as NSString).length
+            let location = edit.range.location + shift + insertedLength
+            shift += insertedLength - edit.range.length
+            carets.append(NSRange(location: min(max(location, 0), storage.length), length: 0))
+        }
+        setSelectedRanges(carets as [NSValue], affinity: .downstream, stillSelecting: false)
+        didChangeText()
+        return true
     }
 
     private func sanitizedThaiCombiningMarks(
@@ -357,6 +527,21 @@ final class EditorTextView: NSTextView {
         }
         guard !touchesFillerLine(affectedCharRange, in: storage) else { return false }
         return super.shouldChangeText(in: affectedCharRange, replacementString: replacementString)
+    }
+
+    /// The plural form is NOT routed through the singular one by AppKit —
+    /// verified: `shouldChangeText(inRanges:replacementStrings:)` on a plain
+    /// NSTextView never calls `shouldChangeText(in:replacementString:)`. So
+    /// every multi-range edit (this file's own multi-cursor insert and Replace
+    /// All, plus anything AppKit routes here) went round the filler-line guard.
+    override func shouldChangeText(inRanges affectedRanges: [NSValue], replacementStrings: [String]?) -> Bool {
+        guard let storage = textStorage, storage.length > 0 else {
+            return super.shouldChangeText(inRanges: affectedRanges, replacementStrings: replacementStrings)
+        }
+        for value in affectedRanges where touchesFillerLine(value.rangeValue, in: storage) {
+            return false
+        }
+        return super.shouldChangeText(inRanges: affectedRanges, replacementStrings: replacementStrings)
     }
 
     /// True when any part of `range` lies on a compare-mode filler line, which is
@@ -428,6 +613,12 @@ final class EditorTextView: NSTextView {
     /// would be faster still, but text typed next to a filler line can inherit
     /// the attribute from the neighbouring run, and dropping it here would erase
     /// what the user just typed.
+    ///
+    /// Lines are found by scanning for LF, never with `NSString.paragraphRange`.
+    /// The display text is `rows.joined(separator: "\n")`, and paragraphRange
+    /// also breaks on a lone CR and on U+2029 — so on a file with any stray CR
+    /// the paragraphs outnumbered the rows, the filler attribute landed a line
+    /// early, and a REAL line was dropped out of the document and then autosaved.
     @MainActor
     func realText(from storage: NSTextStorage) -> String {
         let ns = storage.string as NSString
@@ -438,30 +629,25 @@ final class EditorTextView: NSTextView {
         var runStart = -1          // start of the run of kept lines being accumulated
         var runEnd = 0
 
-        var idx = 0
-        while idx < length {
-            let paraRange = ns.paragraphRange(for: NSRange(location: idx, length: 0))
-            if storage.attribute(.isFillerLine, at: paraRange.location, effectiveRange: nil) != nil {
-                if runStart >= 0 {
-                    var end = runEnd
-                    // Strip the run's trailing newline; runs are rejoined below.
-                    if end > runStart && ns.character(at: end - 1) == 10 { end -= 1 }
-                    keptRuns.append(NSRange(location: runStart, length: end - runStart))
-                    runStart = -1
-                }
-            } else {
-                if runStart < 0 { runStart = paraRange.location }
-                runEnd = NSMaxRange(paraRange)
-            }
-            let next = NSMaxRange(paraRange)
-            if next <= idx { break }
-            idx = next
-        }
-        if runStart >= 0 {
+        func closeRun() {
+            guard runStart >= 0 else { return }
             var end = runEnd
+            // Strip the run's trailing newline; runs are rejoined below.
             if end > runStart && ns.character(at: end - 1) == 10 { end -= 1 }
             keptRuns.append(NSRange(location: runStart, length: end - runStart))
+            runStart = -1
         }
+
+        CompareDisplayLines.forEachLine(in: storage) { lineRange, isFiller in
+            if isFiller {
+                closeRun()
+            } else {
+                if runStart < 0 { runStart = lineRange.location }
+                runEnd = NSMaxRange(lineRange)
+            }
+            return true
+        }
+        closeRun()
         return keptRuns.map { ns.substring(with: $0) }.joined(separator: "\n")
     }
 
@@ -480,7 +666,7 @@ final class EditorTextView: NSTextView {
                 lineRect.origin.x = 0
                 lineRect.size.width = bounds.width
                 lineRect.origin.y += textContainerInset.height
-                NSColor.bestTextSelectionBackground.withAlphaComponent(0.45).setFill()
+                NSColor.bestTextCurrentLine.setFill()
                 lineRect.fill()
             }
         }
@@ -617,9 +803,31 @@ final class EditorTextView: NSTextView {
 
     override func didChangeText() {
         super.didChangeText()
+        textChangeCounter &+= 1
         applyThaiFontFallbackAroundSelection()
         needsDisplay = true
         postSelectionInfo()
+    }
+
+    // MARK: - Memoised line lookup
+
+    /// Bumped by `didChangeText`. Together with the storage length it stamps the
+    /// `TextLineIndex.Cursor` memo below: a different stamp throws the memo away,
+    /// so a stale line number cannot outlive an edit.
+    private var textChangeCounter = 0
+    private var lineIndexCursor = TextLineIndex.Cursor()
+    /// The storage the memo was built against. A tab switch can hand this view a
+    /// different NSTextStorage of the same length under the same counter, which
+    /// would otherwise look like "nothing changed".
+    private var lineIndexStorage: ObjectIdentifier?
+
+    private func lineIndexStamp(totalCount: Int) -> Int {
+        let identifier = textStorage.map(ObjectIdentifier.init)
+        if identifier != lineIndexStorage {
+            lineIndexStorage = identifier
+            lineIndexCursor.invalidate()
+        }
+        return textChangeCounter &* 31 &+ totalCount
     }
 
     override func draw(_ dirtyRect: NSRect) {
@@ -669,6 +877,21 @@ final class EditorTextView: NSTextView {
             ?? NSColor.bestTextEditorForeground(for: effectiveAppearance)
     }
 
+    /// Thai text needs a Thai face: the editor font usually has no Thai glyphs,
+    /// and its kerning/ligature settings mangle the marks that do render.
+    ///
+    /// Two things make this cheap enough to run on every `didChangeText`:
+    ///
+    /// 1. **A single `CFStringFindCharacterFromSet` rejects the whole range**
+    ///    when it holds no Thai — which is every keystroke in every non-Thai
+    ///    document, i.e. almost all of them.
+    /// 2. **The scan reads UTF-16 code units through a `CFStringInlineBuffer`.**
+    ///    It used to iterate `storage.string.unicodeScalars`, and that string is
+    ///    a lazily-bridged NSString, so every step transcoded from UTF-16 —
+    ///    measured at ~6x the cost of a native String (8.3 ms vs 1.3 ms over
+    ///    542k characters). Thai is entirely inside the BMP (U+0E00…U+0E7F), so
+    ///    a code-unit test is exactly equivalent to a scalar test and needs no
+    ///    decoding: a surrogate half can never fall in that block.
     func applyThaiFontFallback(in targetRange: NSRange? = nil) {
         guard let storage = textStorage,
               storage.length > 0,
@@ -679,57 +902,54 @@ final class EditorTextView: NSTextView {
         let boundedRange = NSIntersectionRange(targetRange ?? fullRange, fullRange)
         guard boundedRange.length > 0 else { return }
 
-        let text = storage.string
-        let boundedEnd = NSMaxRange(boundedRange)
+        let cfString = storage.string as CFString
+        let searchRange = CFRange(location: boundedRange.location, length: boundedRange.length)
 
-        // Start AT the target range instead of at the top of the document.
-        //
-        // This runs on every didChangeText for the paragraph around the caret, so
-        // the old version walked the entire prefix before reaching the paragraph it
-        // was asked about — and called `utf16Offset(in:)` twice per scalar along the
-        // way. Seeking once and then carrying the offset forward with
-        // `UTF16.width` makes the work proportional to the range, not to how far
-        // into the file the user is typing.
-        let utf16 = text.utf16
-        let scalars = text.unicodeScalars
-        guard let startUTF16 = utf16.index(
-                utf16.startIndex,
-                offsetBy: boundedRange.location,
-                limitedBy: utf16.endIndex
-              ),
-              let start = startUTF16.samePosition(in: scalars)
-        else { return }
+        // Nothing Thai in range: this pass only ever ADDS the Thai font, never
+        // removes it, so skipping is exactly equivalent to running the loop.
+        var firstThai = CFRange(location: kCFNotFound, length: 0)
+        guard CFStringFindCharacterFromSet(
+            cfString, Self.thaiCharacterSet, searchRange, [], &firstThai
+        ) else { return }
 
-        var offset = boundedRange.location
-        var index = start
-        var thaiRunStart: Int?
+        var buffer = CFStringInlineBuffer()
+        CFStringInitInlineBuffer(cfString, &buffer, searchRange)
+
+        let base = boundedRange.location
+        var runStart: Int?
+        var pendingRuns: [NSRange] = []
+
+        // Start at the first Thai unit the search already found; everything
+        // before it is known not to be Thai.
+        var index = max(firstThai.location - base, 0)
+        while index < boundedRange.length {
+            let unit = CFStringGetCharacterFromInlineBuffer(&buffer, index)
+            if unit >= 0x0E00 && unit <= 0x0E7F {
+                if runStart == nil { runStart = base + index }
+            } else if let start = runStart {
+                pendingRuns.append(NSRange(location: start, length: base + index - start))
+                runStart = nil
+            }
+            index += 1
+        }
+        if let start = runStart {
+            pendingRuns.append(NSRange(location: start, length: NSMaxRange(boundedRange) - start))
+        }
+        guard !pendingRuns.isEmpty else { return }
 
         storage.beginEditing()
-        while index < scalars.endIndex, offset < boundedEnd {
-            let scalar = scalars[index]
-            if Self.isThaiScalar(scalar) {
-                if thaiRunStart == nil { thaiRunStart = offset }
-            } else if let runStart = thaiRunStart {
-                applyThaiFont(
-                    thaiFont,
-                    range: NSRange(location: runStart, length: offset - runStart),
-                    boundedBy: boundedRange
-                )
-                thaiRunStart = nil
-            }
-            offset += UTF16.width(scalar)
-            index = scalars.index(after: index)
-        }
-
-        if let runStart = thaiRunStart {
-            applyThaiFont(
-                thaiFont,
-                range: NSRange(location: runStart, length: offset - runStart),
-                boundedBy: boundedRange
-            )
+        for run in pendingRuns {
+            applyThaiFont(thaiFont, range: run, boundedBy: boundedRange)
         }
         storage.endEditing()
     }
+
+    /// U+0E00…U+0E7F — the whole Thai block, and all of it is BMP.
+    private static let thaiCharacterSet: CFCharacterSet = {
+        let set = CFCharacterSetCreateMutable(kCFAllocatorDefault)!
+        CFCharacterSetAddCharactersInRange(set, CFRange(location: 0x0E00, length: 0x80))
+        return CFCharacterSetCreateCopy(kCFAllocatorDefault, set)
+    }()
 
     private func applyThaiFontFallbackAroundSelection() {
         guard let storage = textStorage, storage.length > 0 else { return }
@@ -956,7 +1176,17 @@ final class EditorTextView: NSTextView {
             let lineText = ns.substring(with: lineRange)
             // The last line of a file has no trailing newline; the copy needs one
             // in front of it or the two lines run together.
-            let endsWithBreak = lineText.hasSuffix("\n") || lineText.hasSuffix("\r")
+            //
+            // Test the trailing UTF-16 unit, NOT `hasSuffix("\n")`: a CRLF pair is
+            // a single Swift Character equal to neither "\n" nor "\r", so the
+            // Character-level check answered false for EVERY line of a CRLF file
+            // and ⇧⌘D inserted a spurious blank line between original and copy.
+            // Same idiom as `realText(from:)` above.
+            let endsWithBreak: Bool = {
+                guard lineRange.length > 0 else { return false }
+                let unit = ns.character(at: NSMaxRange(lineRange) - 1)
+                return unit == 10 || unit == 13
+            }()
             insertions.append((
                 lineStart: lineRange.location,
                 at: NSMaxRange(lineRange),
@@ -966,17 +1196,23 @@ final class EditorTextView: NSTextView {
         guard !insertions.isEmpty else { return }
         insertions.sort { $0.at < $1.at }
 
-        // Apply back-to-front so the offsets computed above stay valid.
+        // Apply back-to-front so the offsets computed above stay valid, and as
+        // ONE storage editing group: without it every line re-ran layout,
+        // syntax and the gutter's caches, so ⇧⌘D with N cursors did N full
+        // relayouts. `shouldChangeText` stays per range — it is what registers
+        // undo and refuses compare-mode filler lines, and one refusal must not
+        // take the other lines with it.
         var appliedByLineStart: [Int: Int] = [:]   // lineStart → inserted UTF-16 length
         var didEdit = false
+        storage.beginEditing()
         for insertion in insertions.reversed() {
             let target = NSRange(location: insertion.at, length: 0)
-            // Registers undo and blocks edits to compare-mode filler lines.
             guard shouldChangeText(in: target, replacementString: insertion.text) else { continue }
             storage.replaceCharacters(in: target, with: insertion.text)
             appliedByLineStart[insertion.lineStart] = (insertion.text as NSString).length
             didEdit = true
         }
+        storage.endEditing()
         guard didEdit else { return }
 
         // Move every cursor onto its copy. A cursor shifts by the text inserted
@@ -1022,14 +1258,18 @@ final class EditorTextView: NSTextView {
         guard !lineRanges.isEmpty else { return }
         lineRanges.sort { $0.location < $1.location }
 
+        // One editing group; see `duplicateCurrentLines` for why the
+        // `shouldChangeText` calls stay inside it and stay per range.
         var deletedLengthByStart: [Int: Int] = [:]
         var didEdit = false
+        storage.beginEditing()
         for lineRange in lineRanges.reversed() {
             guard shouldChangeText(in: lineRange, replacementString: "") else { continue }
             storage.replaceCharacters(in: lineRange, with: "")
             deletedLengthByStart[lineRange.location] = lineRange.length
             didEdit = true
         }
+        storage.endEditing()
         guard didEdit else { return }
 
         // A cursor per deleted line, each pulled back by everything deleted above it.
@@ -1076,6 +1316,22 @@ final class EditorTextView: NSTextView {
         window?.makeFirstResponder(self)
     }
 
+    /// Space / tab / line-ending markers for the visible text.
+    ///
+    /// Two things used to make this the most expensive part of a frame on an
+    /// indented file:
+    ///
+    /// - the visible range was walked with `NSString.character(at:)`, one
+    ///   objc_msgSend per UTF-16 unit — thousands per frame, all of them
+    ///   discarded;
+    /// - every marker asked the layout manager for `glyphRange(forCharacterRange:)`
+    ///   and then `boundingRect(forGlyphRange:in:)`, and a bounding rect is a
+    ///   union computed across line fragments.
+    ///
+    /// Now: one chunked `getCharacters` pass collects the marker positions, then
+    /// ONE `enumerateLineFragments` walk places them — the fragment rect comes
+    /// from the enumeration and the x offset from `location(forGlyphAt:)`, which
+    /// is a lookup inside the fragment rather than a rect computation.
     private func drawInvisibleCharacters(in dirtyRect: NSRect) {
         guard document?.showsInvisibleCharacters == true,
               document?.isLargeFileModeActive != true,
@@ -1094,6 +1350,9 @@ final class EditorTextView: NSTextView {
         let end = min(storage.length, NSMaxRange(charRange))
         guard start < end else { return }
 
+        let markers = invisibleMarkerPositions(in: text, from: start, to: end)
+        guard !markers.isEmpty else { return }
+
         let markerFont = NSFont.monospacedSystemFont(ofSize: 10, weight: .regular)
         let attrs: [NSAttributedString.Key: Any] = [
             .font: markerFont,
@@ -1104,27 +1363,110 @@ final class EditorTextView: NSTextView {
         // and `draw(at:withAttributes:)` each build and lay out a throwaway
         // attributed string; doing that for every space on screen meant thousands
         // of text-shaping calls per frame on an indented file.
-        let spaceMarker = PreparedMarker("·", attributes: attrs)
-        let tabMarker   = PreparedMarker("→", attributes: attrs)
+        let spaceMarker  = PreparedMarker("·", attributes: attrs)
+        let tabMarker    = PreparedMarker("→", attributes: attrs)
+        let returnMarker = PreparedMarker("↵", attributes: attrs)
 
-        for location in start..<end {
-            let character = text.character(at: location)
-            switch character {
-            case 32:
-                drawInvisibleMarker(spaceMarker, atCharacter: location)
-            case 9:
-                drawInvisibleMarker(tabMarker, atCharacter: location)
-            case 10:
-                drawLineEndingMarker(atCharacter: location, attributes: attrs)
-            case 13:
-                if location + 1 < text.length, text.character(at: location + 1) == 10 {
-                    continue
+        var next = 0
+        layoutManager.enumerateLineFragments(forGlyphRange: glyphRange) {
+            rect, usedRect, _, lineGlyphRange, stop in
+            guard next < markers.count else { stop.pointee = true; return }
+            let lineCharRange = layoutManager.characterRange(
+                forGlyphRange: lineGlyphRange, actualGlyphRange: nil
+            )
+            let lineCharEnd = NSMaxRange(lineCharRange)
+
+            // Markers that fell before this fragment (shouldn't happen, but the
+            // enumeration and the scan are two different walks) are dropped.
+            while next < markers.count, markers[next].location < lineCharRange.location {
+                next += 1
+            }
+
+            while next < markers.count, markers[next].location < lineCharEnd {
+                let marker = markers[next]
+                next += 1
+                switch marker.kind {
+                case .lineEnding:
+                    let point = NSPoint(x: usedRect.maxX + inset.width + 4,
+                                        y: usedRect.minY + inset.height)
+                    returnMarker.string.draw(at: point)
+                case .space, .tab:
+                    let prepared = marker.kind == .space ? spaceMarker : tabMarker
+                    let glyphIndex = layoutManager.glyphIndexForCharacter(at: marker.location)
+                    guard glyphIndex != NSNotFound,
+                          glyphIndex >= lineGlyphRange.location,
+                          glyphIndex < NSMaxRange(lineGlyphRange)
+                    else { continue }
+                    let leading = layoutManager.location(forGlyphAt: glyphIndex).x
+                    let trailing: CGFloat = glyphIndex + 1 < NSMaxRange(lineGlyphRange)
+                        ? layoutManager.location(forGlyphAt: glyphIndex + 1).x
+                        : usedRect.maxX - rect.minX
+                    let centreX = rect.minX + (leading + max(trailing, leading)) / 2
+                    let point = NSPoint(
+                        x: centreX + inset.width - (prepared.size.width / 2),
+                        y: rect.midY + inset.height - (prepared.size.height / 2)
+                    )
+                    prepared.string.draw(at: point)
                 }
-                drawLineEndingMarker(atCharacter: location, attributes: attrs)
-            default:
-                continue
             }
         }
+    }
+
+    private enum InvisibleMarkerKind {
+        case space, tab, lineEnding
+    }
+
+    private struct InvisibleMarker {
+        let location: Int
+        let kind: InvisibleMarkerKind
+    }
+
+    /// Chunked scan for the units that get a marker. `getCharacters` pulls 4 KB
+    /// at a time and allocates nothing beyond the reusable buffer; the loop this
+    /// replaced sent one Objective-C message per visible UTF-16 unit.
+    private func invisibleMarkerPositions(
+        in text: NSString, from start: Int, to end: Int
+    ) -> [InvisibleMarker] {
+        var markers: [InvisibleMarker] = []
+        let chunkSize = 4096
+        var buffer = [unichar](repeating: 0, count: chunkSize)
+        var position = start
+
+        while position < end {
+            let length = min(chunkSize, end - position)
+            let base = position
+            buffer.withUnsafeMutableBufferPointer { p in
+                text.getCharacters(p.baseAddress!, range: NSRange(location: base, length: length))
+                var k = 0
+                while k < length {
+                    let unit = p[k]
+                    // One comparison rejects every printable character.
+                    if unit > 32 { k += 1; continue }
+                    switch unit {
+                    case 32:
+                        markers.append(InvisibleMarker(location: base + k, kind: .space))
+                    case 9:
+                        markers.append(InvisibleMarker(location: base + k, kind: .tab))
+                    case 10:
+                        markers.append(InvisibleMarker(location: base + k, kind: .lineEnding))
+                    case 13:
+                        // CRLF gets ONE marker, and it goes on the LF (case 10
+                        // above) — same placement as before this rewrite. The
+                        // partner is read from the string rather than the chunk
+                        // so a pair split across a chunk boundary still resolves.
+                        let next = base + k + 1
+                        if next >= text.length || text.character(at: next) != 10 {
+                            markers.append(InvisibleMarker(location: base + k, kind: .lineEnding))
+                        }
+                    default:
+                        break
+                    }
+                    k += 1
+                }
+            }
+            position += length
+        }
+        return markers
     }
 
     /// A marker glyph with its attributes applied and its size measured once.
@@ -1137,41 +1479,6 @@ final class EditorTextView: NSTextView {
             self.string = attributed
             self.size = attributed.size()
         }
-    }
-
-    private func drawInvisibleMarker(_ marker: PreparedMarker, atCharacter location: Int) {
-        guard let layoutManager, let textContainer else { return }
-        let glyphRange = layoutManager.glyphRange(
-            forCharacterRange: NSRange(location: location, length: 1),
-            actualCharacterRange: nil
-        )
-        guard glyphRange.location != NSNotFound else { return }
-        let rect = layoutManager.boundingRect(forGlyphRange: glyphRange, in: textContainer)
-            .offsetBy(dx: textContainerInset.width, dy: textContainerInset.height)
-        let point = NSPoint(
-            x: rect.midX - (marker.size.width / 2),
-            y: rect.midY - (marker.size.height / 2)
-        )
-        marker.string.draw(at: point)
-    }
-
-    private func drawLineEndingMarker(
-        atCharacter location: Int,
-        attributes: [NSAttributedString.Key: Any]
-    ) {
-        guard let layoutManager, layoutManager.numberOfGlyphs > 0 else { return }
-        let glyphRange = layoutManager.glyphRange(
-            forCharacterRange: NSRange(location: location, length: 1),
-            actualCharacterRange: nil
-        )
-        let glyphIndex = min(
-            max(glyphRange.location == NSNotFound ? 0 : glyphRange.location, 0),
-            layoutManager.numberOfGlyphs - 1
-        )
-        let lineRect = layoutManager.lineFragmentUsedRect(forGlyphAt: glyphIndex, effectiveRange: nil)
-            .offsetBy(dx: textContainerInset.width, dy: textContainerInset.height)
-        let point = NSPoint(x: lineRect.maxX + 4, y: lineRect.minY)
-        ("↵" as NSString).draw(at: point, withAttributes: attributes)
     }
 
     private func replaceAllText(with replacement: String, markDirty: Bool = true) {
@@ -1191,7 +1498,17 @@ final class EditorTextView: NSTextView {
         storage.replaceCharacters(in: range, with: replacement)
         storage.endEditing()
 
-        document?.text = storage.string
+        // NO `document?.text = storage.string` here.
+        //
+        // The storage string is DISPLAY text: in compare mode it carries the
+        // filler rows, and with a fold collapsed it carries a U+FFFC
+        // placeholder instead of the folded block. `document.text` is derived
+        // from it — `realText(from:)` / `FoldingManager.fullText(from:)` — and
+        // that derivation lives in the coordinator's `textDidChange`, which
+        // `didChangeText()` below reaches. Assigning here put the display text
+        // into the model (and into the draft, and onto disk) for the instant
+        // before the coordinator corrected it, and permanently for any path
+        // where the coordinator bails out early.
         if markDirty {
             document?.isDirty = true
         }
@@ -1425,8 +1742,17 @@ final class EditorTextView: NSTextView {
         // which is what Coordinator.push (and therefore the status bar) already
         // reports — the two used to disagree on any line containing a Thai
         // combining mark or an emoji.
+        // The scan is O(offset) from the start of the document, and this runs at
+        // least twice per keystroke — 4.6 ms each with the caret at the end of a
+        // 5 MB file. `TextLineIndex.Cursor` memoises the last result and scans
+        // only the delta; the stamp below is what makes an edit drop the memo.
         let loc = min(primary.location, totalCount)
-        let position = TextLineIndex.lineColumn(in: str, at: loc)
+        let stamp = lineIndexStamp(totalCount: totalCount)
+        let (line, lineStart) = lineIndexCursor.lineAndStart(in: str, at: loc, stamp: stamp)
+        // Column counts grapheme clusters, so Thai combining marks and emoji are
+        // one column each — same definition TextLineIndex.lineColumn uses.
+        let column = str.substring(with: NSRange(location: lineStart, length: loc - lineStart)).count + 1
+        let position = (line: line, column: column)
 
         let selectedCount = selectedRanges.reduce(0) { $0 + $1.length }
 
@@ -1556,23 +1882,46 @@ final class EditorTextView: NSTextView {
 
     // MARK: - Copy / Paste (filler-line + fold aware)
 
+    /// Copy every selected range, not just the primary one.
+    ///
+    /// AppKit's own `copy:` already joins a multi-range selection with newlines,
+    /// so the bug only bit once this override took over — i.e. exactly when
+    /// there were folds or compare-mode filler lines in play, where it read
+    /// `selectedRange()` and silently dropped every cursor but the first.
     override func copy(_ sender: Any?) {
         guard let storage = textStorage else { super.copy(sender); return }
-        let sel = selectedRange()
-        guard sel.length > 0 else { super.copy(sender); return }
+
+        let ranges = ((selectedRanges as? [NSRange]) ?? [selectedRange()])
+            .filter { $0.length > 0 && $0.location != NSNotFound }
+            .sorted { $0.location < $1.location }
+        guard !ranges.isEmpty else { super.copy(sender); return }
 
         let hasFolds: Bool = foldingManager?.regions.isEmpty == false
         var hasFillers = false
-        storage.enumerateAttribute(.isFillerLine, in: sel, options: []) { val, _, stop in
-            if val != nil { hasFillers = true; stop.pointee = true }
+        for range in ranges where !hasFillers {
+            let bounded = NSIntersectionRange(range, NSRange(location: 0, length: storage.length))
+            guard bounded.length > 0 else { continue }
+            storage.enumerateAttribute(.isFillerLine, in: bounded, options: []) { val, _, stop in
+                if val != nil { hasFillers = true; stop.pointee = true }
+            }
         }
         guard hasFolds || hasFillers else { super.copy(sender); return }
 
-        // Walk the selection, skipping filler paragraphs and expanding fold placeholders.
-        let ns     = storage.string as NSString
-        let end    = min(NSMaxRange(sel), ns.length)
-        var pos    = sel.location
-        var text   = ""
+        let text = ranges
+            .map { foldAndFillerAwareText(of: $0, in: storage) }
+            .joined(separator: "\n")
+
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
+    }
+
+    /// One selection's real text: filler paragraphs skipped, fold placeholders
+    /// expanded back to what they stand for.
+    private func foldAndFillerAwareText(of range: NSRange, in storage: NSTextStorage) -> String {
+        let ns    = storage.string as NSString
+        let end   = min(NSMaxRange(range), ns.length)
+        var pos   = max(range.location, 0)
+        var text  = ""
 
         let foldRegions = ((foldingManager?.regions ?? [])
             .filter { $0.displayLocation >= pos && $0.displayLocation < end }
@@ -1601,9 +1950,7 @@ final class EditorTextView: NSTextView {
             }
             pos = segEnd
         }
-
-        NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(text, forType: .string)
+        return text
     }
 
     override func paste(_ sender: Any?) {
@@ -1618,12 +1965,21 @@ final class EditorTextView: NSTextView {
         if loc < storage.length,
            storage.attribute(.isFillerLine, at: loc, effectiveRange: nil) != nil {
             // Cursor is on a filler line — advance to the start of the next real line.
+            // (This collapses to one caret, which is correct: the paste has
+            // nowhere valid to go at the others either.)
             let ns = storage.string as NSString
             let paraRange = ns.paragraphRange(for: NSRange(location: loc, length: 0))
             setSelectedRange(NSRange(location: min(NSMaxRange(paraRange), storage.length), length: 0))
         }
 
-        insertText(text, replacementRange: selectedRange())
+        // NSNotFound, not selectedRange(): an explicit range is the primary
+        // cursor only, so a multi-cursor paste used to land in one place and
+        // drop the other cursors. `suppressesThaiSanitizer` keeps the
+        // combining-mark de-duplication off — pasted text is reproduced
+        // verbatim, doubled marks included.
+        suppressesThaiSanitizer = true
+        defer { suppressesThaiSanitizer = false }
+        insertText(text, replacementRange: NSRange(location: NSNotFound, length: 0))
     }
 
     // MARK: - Fold placeholder click
@@ -1649,6 +2005,9 @@ final class EditorTextView: NSTextView {
                    storage.attribute(.attachment, at: charIdx, effectiveRange: nil) is FoldPlaceholder {
                     fm.unfold(at: charIdx, in: storage)
                     discardUndoHistory()
+                    // See `FoldingManager.armFoldMutationFlag` — only the paths
+                    // that emit a change notification arm the handshake.
+                    fm.armFoldMutationFlag()
                     didChangeText()
                     return
                 }
@@ -1663,11 +2022,25 @@ final class EditorTextView: NSTextView {
         displayIfNeeded()
     }
 
-    private func shouldClampClickToDocumentEnd(at point: NSPoint) -> Bool {
-        guard let layoutManager, let textContainer, let storage = textStorage else { return false }
+    func shouldClampClickToDocumentEnd(at point: NSPoint) -> Bool {
+        guard let layoutManager, textContainer != nil, let storage = textStorage else { return false }
         guard storage.length > 0 else { return false }
 
-        layoutManager.ensureLayout(for: textContainer)
+        // This used to open with `ensureLayout(for: textContainer)` — glyph
+        // generation and layout for the WHOLE document, on the main thread, to
+        // answer one mouse click. Layout is invalidated by every edit, so the
+        // first click after each keystroke paid for it again: ~1.2 s on a 5 MB
+        // file (measured, see PerfHarnessTextViewTests).
+        //
+        // It is not needed. Layout is lazy but the visible rect is always laid
+        // out — drawing forced it — and a mouse click is inside the visible
+        // rect. So while there is text still unlaid BELOW what is on screen,
+        // the click cannot possibly be past the end of the document. And once
+        // `firstUnlaidCharacterIndex` has reached the end, the whole document
+        // IS laid out and `extraLineFragmentRect` / `lineFragmentRect` below
+        // are valid without asking for anything more.
+        guard layoutManager.firstUnlaidCharacterIndex() >= storage.length else { return false }
+
         let ns = storage.string as NSString
         let lastCharacter = ns.character(at: storage.length - 1)
         let endsWithNewline = lastCharacter == 0x0A || lastCharacter == 0x0D

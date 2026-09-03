@@ -39,12 +39,11 @@ final class ConcurrencyStressTests: XCTestCase {
         for (index, id) in documentIDs.enumerated() {
             for pass in 0..<3 {
                 let text = String(repeating: source, count: 4 + index) + "// pass \(pass)\n"
-                SyntaxEngine.shared.highlight(
+                SyntaxEngine.shared.highlightRuns(
                     text: text,
                     language: "swift",
-                    isDark: pass.isMultiple(of: 2),
                     documentID: id
-                ) { _, _, _ in finished.fulfill() }
+                ) { _ in finished.fulfill() }
             }
         }
 
@@ -64,8 +63,8 @@ final class ConcurrencyStressTests: XCTestCase {
         let left = UUID(), right = UUID()
         let done = expectation(description: "both panes")
         done.expectedFulfillmentCount = 2
-        SyntaxEngine.shared.highlight(text: "let a = 1\n", language: "swift", isDark: true, documentID: left) { _, _, _ in done.fulfill() }
-        SyntaxEngine.shared.highlight(text: "let b = 2\n", language: "swift", isDark: false, documentID: right) { _, _, _ in done.fulfill() }
+        SyntaxEngine.shared.highlightRuns(text: "let a = 1\n", language: "swift", documentID: left) { _ in done.fulfill() }
+        SyntaxEngine.shared.highlightRuns(text: "let b = 2\n", language: "swift", documentID: right) { _ in done.fulfill() }
         await fulfillment(of: [done], timeout: 60)
         SyntaxEngine.shared.discardSession(for: left)
         SyntaxEngine.shared.discardSession(for: right)

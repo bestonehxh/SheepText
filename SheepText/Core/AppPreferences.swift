@@ -55,22 +55,6 @@ enum LaunchBehavior: String, CaseIterable, Identifiable {
     }
 }
 
-enum SidebarStyle: String, CaseIterable, Identifiable {
-    case automatic
-    case compact
-    case spacious
-
-    var id: String { rawValue }
-
-    var displayName: String {
-        switch self {
-        case .automatic: return "Automatic"
-        case .compact: return "Compact"
-        case .spacious: return "Spacious"
-        }
-    }
-}
-
 enum HighlightTheme: String, CaseIterable, Identifiable {
     case adaptive
     case oneDark
@@ -103,6 +87,7 @@ final class AppPreferences {
     private let detectsSyntaxByFileExtensionKey = "sheeptext.open.detectSyntaxByFileExtension"
     private let warnsWhenOpeningLargeFilesKey = "sheeptext.open.warnsWhenOpeningLargeFiles"
     private let checksForUpdatesAutomaticallyKey = "sheeptext.updates.checksAutomatically"
+    private let lastAutomaticUpdateCheckKey = "sheeptext.updates.lastAutomaticCheck"
     private let themeModeKey = "sheeptext.themeMode"
     private let editorFontNameKey = "sheeptext.editor.fontName"
     private let editorFontSizeKey = "sheeptext.editor.fontSize"
@@ -114,7 +99,7 @@ final class AppPreferences {
     private let editorDarkTextColorKey = "sheeptext.editor.darkTextColor"
     private let autoSaveEnabledKey = "sheeptext.save.autoSaveEnabled"
     private let autoSaveDelayKey = "sheeptext.save.autoSaveDelay"
-    private let sidebarStyleKey = "sheeptext.appearance.sidebarStyle"
+    private let chromeStyleKey = "sheeptext.appearance.chromeStyle"
     private let highlightThemeKey = "sheeptext.syntax.highlightTheme"
     private let showSidebarByDefaultKey = "sheeptext.appearance.showSidebarByDefault"
 
@@ -252,8 +237,25 @@ final class AppPreferences {
         didSet { UserDefaults.standard.set(checksForUpdatesAutomatically, forKey: checksForUpdatesAutomaticallyKey) }
     }
 
-    var sidebarStyle: SidebarStyle {
-        didSet { UserDefaults.standard.set(sidebarStyle.rawValue, forKey: sidebarStyleKey) }
+    /// When the last *automatic* update check ran. `UpdateChecker` throttles
+    /// launch-time checks against this; the menu item ignores it.
+    /// nil means "never checked".
+    var lastAutomaticUpdateCheck: Date? {
+        didSet {
+            if let lastAutomaticUpdateCheck {
+                UserDefaults.standard.set(lastAutomaticUpdateCheck, forKey: lastAutomaticUpdateCheckKey)
+            } else {
+                UserDefaults.standard.removeObject(forKey: lastAutomaticUpdateCheckKey)
+            }
+        }
+    }
+
+    /// Material used for the tab bar and sidebar. See `GlassChrome.swift`.
+    var chromeStyle: ChromeStyle {
+        didSet {
+            UserDefaults.standard.set(chromeStyle.rawValue, forKey: chromeStyleKey)
+            NotificationCenter.default.post(name: .editorAppearanceDidChange, object: nil)
+        }
     }
 
     var showSidebarByDefault: Bool {
@@ -292,7 +294,10 @@ final class AppPreferences {
         defaultLineEnding = savedLineEnding.flatMap(TextLineEnding.init(rawValue:)) ?? .lf
 
         let savedTheme = UserDefaults.standard.string(forKey: themeModeKey)
-        themeMode = savedTheme.flatMap(AppThemeMode.init(rawValue:)) ?? .system
+        // Dark is the default the app ships with: the chrome is glass, and a
+        // dark ground is what keeps the material reading as material rather
+        // than as a washed-out grey. System Default is still one click away.
+        themeMode = savedTheme.flatMap(AppThemeMode.init(rawValue:)) ?? .dark
 
         editorFontName = defaults.string(forKey: editorFontNameKey) ?? Self.systemEditorFontName
         let savedSize = defaults.double(forKey: editorFontSizeKey)
@@ -319,8 +324,9 @@ final class AppPreferences {
         detectsSyntaxByFileExtension = defaults.object(forKey: detectsSyntaxByFileExtensionKey) as? Bool ?? true
         warnsWhenOpeningLargeFiles = defaults.object(forKey: warnsWhenOpeningLargeFilesKey) as? Bool ?? true
         checksForUpdatesAutomatically = defaults.object(forKey: checksForUpdatesAutomaticallyKey) as? Bool ?? true
-        let savedSidebarStyle = defaults.string(forKey: sidebarStyleKey)
-        sidebarStyle = savedSidebarStyle.flatMap(SidebarStyle.init(rawValue:)) ?? .automatic
+        lastAutomaticUpdateCheck = defaults.object(forKey: lastAutomaticUpdateCheckKey) as? Date
+        let savedChromeStyle = defaults.string(forKey: chromeStyleKey)
+        chromeStyle = savedChromeStyle.flatMap(ChromeStyle.init(rawValue:)) ?? .glass
         let savedHighlightTheme = defaults.string(forKey: highlightThemeKey)
         highlightTheme = savedHighlightTheme.flatMap(HighlightTheme.init(rawValue:)) ?? .adaptive
         showSidebarByDefault = defaults.object(forKey: showSidebarByDefaultKey) as? Bool ?? false
@@ -372,8 +378,49 @@ final class AppPreferences {
         editorDarkTextColor = NSColor.bestTextEditorForeground(for: NSAppearance(named: .darkAqua)!)
     }
 
+    /// Coalescing window for `.editorAppearanceDidChange`.
+    ///
+    /// Every observer of that notification clears its syntax-highlight cache and
+    /// re-highlights the whole document. Dragging the font-size slider from 9 to
+    /// 36 posts it once per step — 27 full re-highlights for one gesture.
+    static let editorAppearanceCoalescingWindow: TimeInterval = 0.15
+
+    @ObservationIgnored private var appearanceCoalesceTimer: Timer?
+    /// A change arrived while the coalescing window was already open, so the
+    /// trailing edge still has something to say.
+    @ObservationIgnored private var appearanceChangePending = false
+
+    /// Leading + trailing edge, deliberately.
+    ///
+    /// Trailing-only would make a slider drag feel dead — nothing would move
+    /// until the user let go. Leading-edge keeps the common case (one click on a
+    /// stepper, a font-name pick, a checkbox) exactly as immediate as it was,
+    /// and collapses everything that follows inside the window into ONE trailing
+    /// post. A 27-step drag costs 2 re-highlights instead of 27.
+    ///
+    /// The timer runs in `.common` modes: a slider drag puts the run loop in
+    /// `.eventTracking`, where a plain scheduled timer would not fire at all
+    /// until the mouse came up, so the editor would freeze mid-drag rather than
+    /// following it at ~7 fps.
     private func notifyEditorAppearanceChanged() {
-        NotificationCenter.default.post(name: .editorAppearanceDidChange, object: nil)
+        if appearanceCoalesceTimer == nil {
+            NotificationCenter.default.post(name: .editorAppearanceDidChange, object: nil)
+        } else {
+            appearanceChangePending = true
+            appearanceCoalesceTimer?.invalidate()
+        }
+
+        let timer = Timer(timeInterval: Self.editorAppearanceCoalescingWindow, repeats: false) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                self.appearanceCoalesceTimer = nil
+                guard self.appearanceChangePending else { return }
+                self.appearanceChangePending = false
+                NotificationCenter.default.post(name: .editorAppearanceDidChange, object: nil)
+            }
+        }
+        appearanceCoalesceTimer = timer
+        RunLoop.main.add(timer, forMode: .common)
     }
 
     private static func color(fromHexString hexString: String) -> NSColor? {

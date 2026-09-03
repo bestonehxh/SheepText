@@ -61,15 +61,9 @@ struct CommandPaletteView: View {
             .frame(maxHeight: 360)
         }
         .frame(width: 560)
-        .background(
-            RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .fill(Color(nsColor: .bestTextPanelBackground))
-                .shadow(color: .black.opacity(0.25), radius: 24, y: 10)
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .strokeBorder(Color(nsColor: .bestTextBorder))
-        )
+        // Floats over the document, so it blends within-window: a
+        // behind-window blur here would punch a hole through the editor.
+        .background { FloatingPanelBackground() }
         .onMoveCommand(perform: moveSelection)
         .onChange(of: palette.query) { _, _ in selectedIndex = 0 }
         .onChange(of: limitedMatches.count) { _, count in

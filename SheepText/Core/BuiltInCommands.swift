@@ -35,17 +35,17 @@ enum BuiltInCommands {
             documents.newUntitled()
         }
         registry.register(id: "file.save", title: "File: Save") { _ in
-            guard let id = documents.activeDocumentID else { return }
-            trimActiveDocumentIfNeeded()
+            guard let id = saveTargetDocumentID(documents) else { return }
+            trimDocumentIfNeeded(id, in: documents)
             documents.save(id)
         }
         registry.register(id: "file.saveAll", title: "File: Save All") { _ in
-            trimActiveDocumentIfNeeded()
+            trimAllDirtyDocumentsIfNeeded(in: documents)
             documents.saveAllDirty()
         }
         registry.register(id: "file.saveAs", title: "File: Save As…") { _ in
-            guard let id = documents.activeDocumentID else { return }
-            trimActiveDocumentIfNeeded()
+            guard let id = saveTargetDocumentID(documents) else { return }
+            trimDocumentIfNeeded(id, in: documents)
             documents.saveAs(id)
         }
         registry.register(id: "file.close", title: "File: Close Tab") { _ in
@@ -178,9 +178,56 @@ enum BuiltInCommands {
 
     }
 
-    private static func trimActiveDocumentIfNeeded() {
-        guard EditorCommandTarget.focusedEditor?.document?.autoTrimTrailingWhitespace == true else { return }
-        EditorCommandTarget.focusedEditor?.trimTrailingWhitespace(markDirty: false)
+    /// The one document a save command acts on.
+    ///
+    /// ⌘S used to trim `EditorCommandTarget.focusedEditor`'s document and then
+    /// save `activeDocumentID` — two different documents whenever the focused
+    /// editor is not the active tab's, which is exactly the case in compare
+    /// mode: focusing the RIGHT pane and pressing ⌘S trimmed the right buffer
+    /// and wrote the left file. Every save path now resolves the target once
+    /// and both trims and saves that.
+    ///
+    /// The focused editor wins over `activeDocumentID` because it is what the
+    /// user is actually typing in.
+    static func saveTargetDocumentID(_ documents: DocumentStore) -> Document.ID? {
+        if let focused = EditorCommandTarget.focusedEditor?.document?.id,
+           documents.documents.contains(where: { $0.id == focused }) {
+            return focused
+        }
+        return documents.activeDocumentID
+    }
+
+    /// Apply the document's on-save trim, through its editor when one is on
+    /// screen so the change lands in that view's undo stack and its text
+    /// storage stays in sync.
+    ///
+    /// `DocumentStore.prepareSave` no longer trims — otherwise auto save would
+    /// silently rewrite text the user did not ask it to touch — so a manual
+    /// save has to do it here, for the document being saved.
+    static func trimDocumentIfNeeded(_ id: Document.ID, in documents: DocumentStore) {
+        guard let doc = documents.documents.first(where: { $0.id == id }),
+              doc.autoTrimTrailingWhitespace
+        else { return }
+
+        if let editor = EditorCommandTarget.editor(for: id) {
+            editor.trimTrailingWhitespace(markDirty: false)
+        } else {
+            // Background tab with no live text view: transform the model
+            // directly. Nothing is displaying it, so there is no storage to
+            // keep in step.
+            doc.text = TextContentTransforms.trimTrailingWhitespace(
+                in: doc.text,
+                lineEnding: doc.lineEnding
+            )
+        }
+    }
+
+    /// Save All writes every dirty document, so every dirty document with the
+    /// option on gets trimmed — not just the focused one.
+    static func trimAllDirtyDocumentsIfNeeded(in documents: DocumentStore) {
+        for doc in documents.documents where doc.isDirty {
+            trimDocumentIfNeeded(doc.id, in: documents)
+        }
     }
 
     private static func promptGoToLine() {

@@ -7,8 +7,23 @@
 import Foundation
 import AppKit
 import OSLog
+import NetworkHighlightKit
 import Observation
 import UniformTypeIdentifiers
+
+extension URL {
+    /// One definition of "the same file" for the whole document layer.
+    ///
+    /// `standardizedFileURL` resolves `.`, `..` and a trailing slash but NOT
+    /// symlinks, and on macOS `/tmp`, `/var` and `/etc` are all symlinks — so
+    /// opening `/tmp/notes.txt` after `/private/tmp/notes.txt` compared unequal
+    /// and gave two tabs onto one file, each overwriting the other's save.
+    /// Everything that asks "is this the document I already have?" goes through
+    /// this.
+    nonisolated var canonicalFileURL: URL {
+        resolvingSymlinksInPath().standardizedFileURL
+    }
+}
 
 @Observable
 @MainActor
@@ -38,10 +53,18 @@ final class DocumentStore {
     private let sessionOpenFilesKey = "sheeptext.session.openFiles"
     private let sessionActiveFileKey = "sheeptext.session.activeFile"
     private var isRestoringSession = false
+    /// `restoreSessionTabs` runs once per launch; see its doc comment for why
+    /// the guard is on this and not on `documents.isEmpty`.
+    private var hasRestoredSession = false
     private var isCheckingExternalChanges = false
     private var draftSaveTasks: [Document.ID: Task<Void, Never>] = [:]
     private var draftSaveRevisions: [Document.ID: UUID] = [:]
     private var autoSaveTasks: [Document.ID: Task<Void, Never>] = [:]
+    /// draftID → the revision this process last wrote to disk, so
+    /// `deleteDraftFiles` can name the files instead of scanning the directory.
+    /// `removeOlderDraftFiles` runs after every write, so this revision names the
+    /// only files that exist for that draft.
+    private var lastWrittenDraftRevisions: [UUID: UUID] = [:]
 
     var activeDocument: Document? {
         documents.first(where: { $0.id == activeDocumentID })
@@ -100,7 +123,7 @@ final class DocumentStore {
             shouldRemember: rememberRecent
         )
 
-        if let existing = documents.first(where: { $0.url?.standardizedFileURL == accessibleURL.standardizedFileURL }) {
+        if let existing = documents.first(where: { $0.url?.canonicalFileURL == accessibleURL.canonicalFileURL }) {
             activeDocumentID = existing.id
             if rememberRecent {
                 addRecent(accessibleURL)
@@ -119,16 +142,16 @@ final class DocumentStore {
 
         let decoded: DecodedFile
         do {
+            // Manual-encoding path. It goes through TextFileIO.decode(data:as:)
+            // rather than String(data:encoding:) so it gets the same BOM answer
+            // and the same binary verdict as the automatic path — it used to
+            // guess `writesBOMByDefault` (losing a real UTF-8 BOM on save) and
+            // to leave `looksBinary` false, which skipped the guard below.
             if preferences?.detectsEncodingAutomatically == false,
                let data = try? Data(contentsOf: accessibleURL),
                let defaultEncoding = preferences?.defaultEncoding,
-               let text = String(data: data, encoding: defaultEncoding.foundationEncoding) {
-                decoded = DecodedFile(
-                    text: text,
-                    encoding: defaultEncoding,
-                    hadBOM: defaultEncoding.writesBOMByDefault,
-                    byteCount: data.count
-                )
+               let manual = TextFileIO.decode(data: data, as: defaultEncoding) {
+                decoded = manual
             } else {
                 decoded = try TextFileIO.read(url: accessibleURL)
             }
@@ -167,7 +190,8 @@ final class DocumentStore {
         if !isRestoringSession {
             precomputeInitialHighlight(for: doc, preferences: preferences)
         }
-        doc.diskModificationDate = modificationDate(for: accessibleURL)
+        doc.accessibleURL = accessibleURL
+        captureDiskState(of: accessibleURL, into: doc)
         documents.append(doc)
         activeDocumentID = doc.id
         if rememberRecent {
@@ -179,9 +203,12 @@ final class DocumentStore {
     private func precomputeInitialHighlight(for doc: Document, preferences: AppPreferences?) {
         guard !doc.isLargeFileModeActive else { return }
 
-        let language = HighlightOverrides.shared.resolvedLanguage(
-            for: doc.url,
-            defaultLanguage: doc.language
+        let language = NetworkConfigLanguage.engineLanguage(
+            for: HighlightOverrides.shared.resolvedLanguage(
+                for: doc.url,
+                defaultLanguage: doc.language
+            ),
+            vendor: doc.networkVendor
         )
         guard SyntaxEngine.supportsHighlighting(language) else { return }
 
@@ -189,23 +216,19 @@ final class DocumentStore {
         guard textLength > 0 else { return }
         guard textLength <= Self.initialHighlightPrecomputeUTF16Limit else { return }
 
-        let isDark = preferences?.isDarkHighlight(for: NSApp.effectiveAppearance)
-            ?? (NSApp.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua)
-        guard let result = SyntaxEngine.shared.highlightImmediately(
+        // No appearance in here any more: runs carry style ids, so one
+        // precomputed list is correct in light and dark alike.
+        guard let result = SyntaxEngine.shared.runsImmediately(
             text: doc.text,
             language: language,
-            isDark: isDark,
             documentID: doc.id
-        ),
-              result.length == textLength
-        else { return }
+        ) else { return }
 
         doc.precomputedSyntaxHighlight = PrecomputedSyntaxHighlight(
             language: language,
-            isDark: isDark,
             utf16Length: textLength,
             textHash: doc.text.hashValue,
-            result: result
+            runs: result.runs
         )
     }
 
@@ -230,11 +253,15 @@ final class DocumentStore {
             shouldRemember: true
         )
         guard let data = try? Data(contentsOf: accessibleURL),
-              let text = String(data: data, encoding: encoding.foundationEncoding) else {
+              let decoded = TextFileIO.decode(data: data, as: encoding) else {
             NSAlert.show(message: "Cannot decode file as \(encoding.displayName).", style: .warning)
             return
         }
+        let text = decoded.text
         doc.text = text
+        // This never set hasBOM at all, so re-opening a BOM'd file with an
+        // explicit encoding dropped the BOM on the next save.
+        doc.hasBOM = decoded.hadBOM
         // The document now matches the file, so this IS the save baseline. Leaving
         // the old value behind made the modified-since-save gutter bars diff the
         // freshly-loaded text against the previous contents and light up the whole
@@ -248,7 +275,8 @@ final class DocumentStore {
         doc.isDirty = false
         doc.wasRecoveredFromDraft = false
         doc.url = accessibleURL
-        doc.diskModificationDate = modificationDate(for: accessibleURL)
+        doc.accessibleURL = accessibleURL
+        captureDiskState(of: accessibleURL, into: doc)
         doc.externalChangeWarningDate = nil
         deleteDraft(for: doc)
     }
@@ -275,6 +303,7 @@ final class DocumentStore {
 
         for document in documents {
             SyntaxEngine.shared.discardSession(for: document.id)
+            EditorHighlightCache.discard(for: document.id)
         }
         documents.removeAll()
         activeDocumentID = nil
@@ -284,6 +313,12 @@ final class DocumentStore {
 
     /// Close a tab. If the document is dirty, prompts the user first.
     /// Returns `true` if the close happened (user confirmed or doc was clean).
+    ///
+    /// **The one close path.** There used to be a second, copy-pasted one
+    /// (`requestCloseTabFromUI`), and the two had already drifted: only this one
+    /// consulted `askBeforeClosingUnsavedDocuments`, so a user who turned that
+    /// preference off still got the prompt from the tab-bar ✕, "Close Other
+    /// Tabs" and "Close All Tabs" — everything except ⌘W.
     @discardableResult
     func close(_ id: Document.ID) -> Bool {
         guard let doc = documents.first(where: { $0.id == id }) else { return true }
@@ -323,6 +358,7 @@ final class DocumentStore {
         // Same story for the incremental-parse session, which pins the full
         // text, a syntax tree copy and the last attributed string.
         SyntaxEngine.shared.discardSession(for: doc.id)
+        EditorHighlightCache.discard(for: doc.id)
         documents.removeAll { $0.id == id }
         if wasActive {
             activeDocumentID = nextActiveID
@@ -545,7 +581,51 @@ final class DocumentStore {
 
     func resetLanguageFromFile(_ id: Document.ID) {
         guard let doc = documents.first(where: { $0.id == id }) else { return }
+        // A language chosen from the extension is not a vendor chosen by hand:
+        // drop the manual pin so the fingerprint gets to speak again.
+        doc.networkVendorIsManual = false
         doc.language = LanguageDetector.detect(for: doc.url)
+        doc.refreshDetectedNetworkVendor()
+        scheduleDraftSaveIfDirty(for: doc)
+        NotificationCenter.default.post(name: .syntaxHighlightSettingsDidChange, object: nil)
+    }
+
+    /// The user's pick from the vendor badge. Wins over detection, and is
+    /// remembered for the document exactly like the language is.
+    func setNetworkVendor(_ id: Document.ID, vendor: Vendor) {
+        guard let doc = documents.first(where: { $0.id == id }) else { return }
+        doc.networkVendorIsManual = true
+        doc.networkVendor = vendor
+        scheduleDraftSaveIfDirty(for: doc)
+        NotificationCenter.default.post(name: .syntaxHighlightSettingsDidChange, object: nil)
+    }
+
+    /// The language menu's network entries: one click sets BOTH the language
+    /// and the family. `vendor == nil` is "Network config, auto-detect" — the
+    /// document becomes a network config and the fingerprint (or the
+    /// extension fallback) names the family; a vendor pins it by hand.
+    func setNetworkLanguage(_ id: Document.ID, vendor: Vendor?) {
+        guard let doc = documents.first(where: { $0.id == id }) else { return }
+        if let vendor {
+            // Pin first: `language`'s didSet re-detects, and a manual pick
+            // must not be overwritten by that pass.
+            doc.networkVendorIsManual = true
+            doc.networkVendor = vendor
+            doc.language = NetworkConfigLanguage.id
+        } else {
+            doc.networkVendorIsManual = false
+            doc.language = NetworkConfigLanguage.id
+            doc.refreshDetectedNetworkVendor()
+        }
+        scheduleDraftSaveIfDirty(for: doc)
+        NotificationCenter.default.post(name: .syntaxHighlightSettingsDidChange, object: nil)
+    }
+
+    /// "Auto-detect": forget the manual pick and fingerprint the file again.
+    func resetNetworkVendorFromContent(_ id: Document.ID) {
+        guard let doc = documents.first(where: { $0.id == id }) else { return }
+        doc.networkVendorIsManual = false
+        doc.refreshDetectedNetworkVendor()
         scheduleDraftSaveIfDirty(for: doc)
         NotificationCenter.default.post(name: .syntaxHighlightSettingsDidChange, object: nil)
     }
@@ -607,10 +687,10 @@ final class DocumentStore {
     }
 
     func reloadCleanOpenDocumentsFromDisk(urls: Set<URL>) {
-        let standardizedURLs = Set(urls.map(\.standardizedFileURL))
+        let canonicalURLs = Set(urls.map(\.canonicalFileURL))
         for doc in documents {
             guard let url = doc.url,
-                  standardizedURLs.contains(url.standardizedFileURL),
+                  canonicalURLs.contains(url.canonicalFileURL),
                   !doc.isDirty
             else { continue }
             let accessibleURL = SecurityScopedResourceAccess.prepare(
@@ -628,8 +708,9 @@ final class DocumentStore {
             doc.indentation = TextIndentation.detect(in: decoded.text)
             doc.refreshLargeFileMetrics(byteCount: decoded.byteCount)
             doc.url = accessibleURL
+            doc.accessibleURL = accessibleURL
             doc.language = LanguageDetector.detect(for: accessibleURL)
-            doc.diskModificationDate = modificationDate(for: accessibleURL)
+            captureDiskState(of: accessibleURL, into: doc)
             doc.externalChangeWarningDate = nil
             deleteDraft(for: doc)
 
@@ -648,42 +729,84 @@ final class DocumentStore {
         let url: URL
         let data: Data
         let text: String
+        /// `Document.revision` at the moment the bytes were encoded. The auto
+        /// save write happens off the main actor, so this is what says whether
+        /// the document the continuation finds is still the one we encoded.
+        let revision: Int
     }
 
-    /// Resolve the security scope, apply the on-save transforms and encode.
-    /// Split out of `saveNow` so auto save can share exactly this logic instead
-    /// of keeping a second copy of it.
-    private func prepareSave(_ doc: Document) throws -> SavePayload? {
+    /// Resolve the security scope and encode. Split out of `saveNow` so auto
+    /// save can share exactly this logic instead of keeping a second copy of it.
+    ///
+    /// **This does not modify the document.** It used to apply the trailing
+    /// whitespace trim by assigning `doc.text`, and auto save calls it without
+    /// going through the editor — so three seconds after the user stopped
+    /// typing, `updateNSView` found `viewText != document.text`, replaced the
+    /// text view's whole string and threw away the undo stack, the folds and the
+    /// caret position. The trim is a manual-save step now; see
+    /// `applyManualSaveTransforms`.
+    ///
+    /// - Parameter rememberBookmark: false on the auto-save path. Remembering
+    ///   rewrites the entire security-scoped bookmark dictionary in
+    ///   UserDefaults, which does not need to happen every few seconds for a
+    ///   file whose bookmark was already stored when it was opened.
+    private func prepareSave(_ doc: Document, rememberBookmark: Bool = true) throws -> SavePayload? {
         guard let url = doc.url else { return nil }
         let accessibleURL = SecurityScopedResourceAccess.prepare(
             url,
             bookmarkKey: SecurityScopedResourceAccess.fileBookmarksKey,
-            shouldRemember: true
+            shouldRemember: rememberBookmark
         )
-        if doc.autoTrimTrailingWhitespace {
-            doc.text = TextContentTransforms.trimTrailingWhitespace(
-                in: doc.text,
-                lineEnding: doc.lineEnding
-            )
-        }
+        doc.accessibleURL = accessibleURL
         let data = try TextFileIO.encode(
             text: doc.text,
             as: doc.encoding,
             writeBOM: doc.hasBOM
         )
-        return SavePayload(url: accessibleURL, data: data, text: doc.text)
+        return SavePayload(url: accessibleURL, data: data, text: doc.text, revision: doc.revision)
+    }
+
+    /// The on-save transforms that mutate the document. Manual saves only —
+    /// never the auto-save path, which must not touch `doc.text` behind the
+    /// editor's back (see `prepareSave`).
+    ///
+    /// ⌘S / ⌘⌥S / ⌘⇧S already trim through the focused editor before calling in
+    /// here, but they trim the *focused* document, which in compare mode is not
+    /// necessarily the one being saved — and `close`, "Save All" and the
+    /// quit-time save have no editor step at all. Routing every manual save
+    /// through this makes the trim follow the document rather than the focus.
+    private func applyManualSaveTransforms(_ doc: Document) {
+        guard doc.autoTrimTrailingWhitespace else { return }
+        if let editor = EditorCommandTarget.editor(for: doc.id) {
+            // Through the editor when there is one, so the change is undoable
+            // and the view's storage stays the source of truth.
+            editor.trimTrailingWhitespace(markDirty: false)
+            return
+        }
+        let trimmed = TextContentTransforms.trimTrailingWhitespace(
+            in: doc.text,
+            lineEnding: doc.lineEnding
+        )
+        if trimmed != doc.text { doc.text = trimmed }
     }
 
     /// Document bookkeeping that follows a successful write.
-    private func commitSave(_ doc: Document, payload: SavePayload) {
+    private func commitSave(_ doc: Document, payload: SavePayload, isAutoSave: Bool = false) {
         doc.isDirty = false
         doc.wasRecoveredFromDraft = false
         doc.url = payload.url
         doc.savedText = payload.text
-        doc.refreshLargeFileMetrics(byteCount: fileSize(for: payload.url))
-        doc.diskModificationDate = modificationDate(for: payload.url)
+        // One stat, three consumers: large-file metrics, and the mtime/size pair
+        // the external-change poll compares against.
+        captureDiskState(of: payload.url, into: doc)
+        doc.refreshLargeFileMetrics(byteCount: doc.diskFileSize)
         doc.externalChangeWarningDate = nil
-        addRecent(payload.url)
+        // An auto save is not the user opening a file, so it does not belong in
+        // Open Recent — and rewriting that list means a UserDefaults write every
+        // few seconds while typing.
+        if !isAutoSave {
+            addRecent(payload.url)
+        }
         deleteDraft(for: doc)
         NotificationCenter.default.post(
             name: .documentDidSave,
@@ -693,6 +816,7 @@ final class DocumentStore {
     }
 
     private func saveNow(_ doc: Document) throws {
+        applyManualSaveTransforms(doc)
         guard let payload = try prepareSave(doc) else { return }
         try TextFileIO.writeData(payload.data, to: payload.url)
         commitSave(doc, payload: payload)
@@ -704,6 +828,95 @@ final class DocumentStore {
     /// exists in the panel's initial directory, so the user never has to
     /// manually resolve a conflict.
     @discardableResult
+    /// A file or folder was renamed or moved on disk **outside** the save path.
+    ///
+    /// The sidebar's rename used to just assign `document.url`, which is the one
+    /// thing that is not enough:
+    ///
+    /// - the security-scoped bookmark is keyed by path, so the old path's
+    ///   bookmark was still the only one stored and the next launch could not
+    ///   reopen the file at all (sandbox);
+    /// - `accessibleURL` still pointed at the old path, so the 4-second
+    ///   external-change poll stat-ed a file that no longer existed;
+    /// - `diskModificationDate` / `diskFileSize` still described the old file,
+    ///   so the first poll after a rename could fire a spurious "changed on
+    ///   disk" alert;
+    /// - the recents list and the restore-session list still held the old path.
+    ///
+    /// Renaming a FOLDER moves every document inside it, so open URLs are
+    /// matched by path prefix as well as by identity.
+    func documentDidMove(from oldURL: URL, to newURL: URL) {
+        let oldCanonical = oldURL.canonicalFileURL
+        let newCanonical = newURL.canonicalFileURL
+        guard oldCanonical != newCanonical else { return }
+
+        // Path components, not a string prefix: "/proj-secrets" starts with
+        // "/proj" and is a different directory. Same rule as FSBridge's scope check.
+        let oldComponents = oldCanonical.pathComponents
+        func movedURL(for url: URL) -> URL? {
+            let canonical = url.canonicalFileURL
+            if canonical == oldCanonical { return newURL }
+            let components = canonical.pathComponents
+            guard components.count > oldComponents.count,
+                  Array(components.prefix(oldComponents.count)) == oldComponents
+            else { return nil }
+            return components
+                .dropFirst(oldComponents.count)
+                .reduce(newURL) { $0.appendingPathComponent($1) }
+        }
+
+        var didMoveAnyDocument = false
+        for doc in documents {
+            guard let url = doc.url, let moved = movedURL(for: url) else { continue }
+
+            // Re-remember the bookmark under the NEW path before anything reads
+            // it back: `prepare` stores it keyed by the path it resolves.
+            let accessible = SecurityScopedResourceAccess.prepare(
+                moved,
+                bookmarkKey: SecurityScopedResourceAccess.fileBookmarksKey,
+                shouldRemember: true
+            )
+
+            doc.url = accessible
+            doc.accessibleURL = accessible
+            // The file did not change, only its name — but the stats were taken
+            // through the old path, and a rename touches the parent directory's
+            // mtime on some filesystems. Re-read them so the poll starts level.
+            captureDiskState(of: accessible, into: doc)
+            doc.externalChangeWarningDate = nil
+            // Same rule Save As uses: the extension only picks the language when
+            // the user has left extension-based detection on.
+            if AppPreferences.current?.detectsSyntaxByFileExtension ?? true {
+                doc.language = LanguageDetector.detect(for: accessible)
+            }
+            didMoveAnyDocument = true
+        }
+
+        // Recents are a plain path list; rewrite any entry under the old path.
+        var rewroteRecents = false
+        var updatedRecents: [URL] = []
+        for url in recentFiles {
+            if let moved = movedURL(for: url) {
+                rewroteRecents = true
+                updatedRecents.append(moved)
+            } else {
+                updatedRecents.append(url)
+            }
+        }
+        if rewroteRecents {
+            // Keep it de-duplicated: the destination name may already be listed.
+            var seen = Set<URL>()
+            recentFiles = updatedRecents.filter { seen.insert($0.canonicalFileURL).inserted }
+            persistRecentFiles()
+        }
+
+        if didMoveAnyDocument {
+            // documents/activeDocumentID did not change identity, so neither
+            // didSet fired — persist the new paths explicitly.
+            persistSession()
+        }
+    }
+
     private func promptSaveAs(_ doc: Document) -> Bool {
         let panel = NSSavePanel()
         panel.canCreateDirectories = true
@@ -714,36 +927,31 @@ final class DocumentStore {
         panel.nameFieldStringValue = uniqueFileName(for: defaultSaveName(for: doc), in: initialDir)
         guard panel.runModal() == .OK, let selectedURL = panel.url else { return false }
         let url = urlByAddingDefaultTextExtensionIfNeeded(selectedURL)
+        // Routed through prepareSave/commitSave rather than keeping a second,
+        // drifting copy of the save logic. doc.url has to move first (that is
+        // what prepareSave encodes for) and is put back if the write fails, so
+        // a cancelled/failed Save As leaves the document exactly as it was.
+        let previousURL = doc.url
+        doc.url = url
         do {
-            if doc.autoTrimTrailingWhitespace {
-                doc.text = TextContentTransforms.trimTrailingWhitespace(
-                    in: doc.text,
-                    lineEnding: doc.lineEnding
-                )
+            applyManualSaveTransforms(doc)
+            guard let payload = try prepareSave(doc) else {
+                doc.url = previousURL
+                return false
             }
-            try TextFileIO.write(text: doc.text, to: url, encoding: doc.encoding, writeBOM: doc.hasBOM)
-            SecurityScopedResourceAccess.remember(
-                url,
-                bookmarkKey: SecurityScopedResourceAccess.fileBookmarksKey
-            )
-            doc.url = url
-            doc.language = LanguageDetector.detect(for: url)
-            doc.isDirty = false
-            doc.wasRecoveredFromDraft = false
-            doc.savedText = doc.text
-            doc.refreshLargeFileMetrics(byteCount: fileSize(for: url))
-            NotificationCenter.default.post(
-                name: .documentDidSave,
-                object: nil,
-                userInfo: ["documentID": doc.id]
-            )
-            doc.diskModificationDate = modificationDate(for: url)
-            doc.externalChangeWarningDate = nil
-            addRecent(url)
-            deleteDraft(for: doc)
+            try TextFileIO.writeData(payload.data, to: payload.url)
+            // Only when the preference says the extension picks the language.
+            // This used to re-detect unconditionally, so Save As threw away an
+            // explicit language choice — and did it even for users who had
+            // turned extension-based detection off.
+            if AppPreferences.current?.detectsSyntaxByFileExtension ?? true {
+                doc.language = LanguageDetector.detect(for: payload.url)
+            }
+            commitSave(doc, payload: payload)
             persistSession()
             return true
         } catch {
+            doc.url = previousURL
             NSAlert.show(message: "Save failed: \(error.localizedDescription)", style: .critical)
             return false
         }
@@ -957,6 +1165,13 @@ final class DocumentStore {
     }
 
     private func performAutoSave(for id: Document.ID) {
+        // The pref can be switched off while this task is already sleeping, and
+        // nothing cancels it — so it is re-read here rather than trusted from
+        // when the task was scheduled.
+        guard AppPreferences.current?.autoSaveEnabled ?? false else {
+            autoSaveTasks[id] = nil
+            return
+        }
         guard let doc = documents.first(where: { $0.id == id }),
               doc.isDirty,
               doc.url != nil
@@ -967,7 +1182,7 @@ final class DocumentStore {
 
         let payload: SavePayload?
         do {
-            payload = try prepareSave(doc)
+            payload = try prepareSave(doc, rememberBookmark: false)
         } catch {
             autoSaveTasks[id] = nil
             Logger.app.error("Auto save failed for \(doc.displayName): \(error.localizedDescription)")
@@ -983,6 +1198,7 @@ final class DocumentStore {
         // main actor, so it runs off it. Auto save fires on a timer while the
         // user is typing; it used to write the whole file inline.
         autoSaveTasks[id] = Task { [weak self] in
+            guard !Task.isCancelled else { return }
             do {
                 try await Task.detached(priority: .utility) {
                     try TextFileIO.writeData(payload.data, to: payload.url)
@@ -993,13 +1209,31 @@ final class DocumentStore {
                 return
             }
 
-            guard let self else { return }
+            guard let self, !Task.isCancelled else { return }
             self.autoSaveTasks[id] = nil
             guard let doc = self.documents.first(where: { $0.id == id }) else { return }
-            // A newer edit landed while the bytes were in flight. Leave the
-            // document dirty; the next scheduleAutoSave writes the new text.
-            guard doc.text == payload.text else { return }
-            self.commitSave(doc, payload: payload)
+
+            // The bytes are on disk at payload.url. Whether they are still THIS
+            // document's bytes is two questions:
+            //   - is payload.url still the document's file? A Save As that ran
+            //     while the write was in flight moved it, and commitSave would
+            //     have set doc.url back to the old path.
+            //   - is the text still the text we encoded? `revision` is bumped by
+            //     `text.didSet`, so this catches an edit-and-edit-back too,
+            //     which a string comparison does not.
+            let isSameFile = doc.url?.canonicalFileURL == payload.url.canonicalFileURL
+            guard isSameFile, doc.revision == payload.revision else {
+                // Leave the document dirty; the next scheduleAutoSave writes the
+                // new text. But the file's mtime moved because *we* wrote it —
+                // without adopting it, the 4 s disk poll reports the app's own
+                // auto save as an external change and offers to reload, which
+                // discards the user's edits.
+                if isSameFile {
+                    self.captureDiskState(of: payload.url, into: doc)
+                }
+                return
+            }
+            self.commitSave(doc, payload: payload, isAutoSave: true)
             doc.lastAutoSavedAt = Date()
         }
     }
@@ -1059,6 +1293,8 @@ final class DocumentStore {
             encoding: doc.encoding.rawValue,
             hasBOM: doc.hasBOM,
             language: doc.language,
+            networkVendor: doc.networkVendor.rawValue,
+            networkVendorIsManual: doc.networkVendorIsManual,
             indentation: doc.indentation.rawValue,
             lineEnding: doc.lineEnding.rawValue,
             showsInvisibleCharacters: doc.showsInvisibleCharacters,
@@ -1092,6 +1328,7 @@ final class DocumentStore {
         }
 
         guard draftSaveRevisions[documentID] == revisionID else { return }
+        lastWrittenDraftRevisions[draftID] = revisionID
         doc.lastDraftSavedAt = Date()
         draftSaveTasks[documentID] = nil
         draftSaveRevisions[documentID] = nil
@@ -1133,7 +1370,19 @@ final class DocumentStore {
         deleteDraftFiles(for: doc.draftID)
     }
 
+    /// Every save — including every auto save, so every few seconds while the
+    /// user types — ends in here. When this process wrote the draft we know both
+    /// of its filenames, so it is two `unlink`s instead of enumerating the whole
+    /// drafts directory. Drafts left by a previous launch have no remembered
+    /// revision and still take the scan.
     private func deleteDraftFiles(for draftID: UUID) {
+        if let revisionID = lastWrittenDraftRevisions.removeValue(forKey: draftID) {
+            let urls = draftURLs(for: draftID, revisionID: revisionID)
+            try? FileManager.default.removeItem(at: urls.metadata)
+            try? FileManager.default.removeItem(at: urls.text)
+            return
+        }
+
         let prefix = draftID.uuidString
         guard let urls = try? FileManager.default.contentsOfDirectory(
             at: draftsDirectory,
@@ -1195,36 +1444,107 @@ final class DocumentStore {
         return String(text.prefix(8_000)) + "\n..."
     }
 
+    /// One `stat` per open document, on a background thread.
+    ///
+    /// This runs every four seconds from a timer in `MainWindowView`. It used to
+    /// do all of it on the main actor, and the expensive part was not the stat:
+    /// it called `SecurityScopedResourceAccess.prepare` per document, which
+    /// copied the whole bookmark dictionary out of UserDefaults and resolved a
+    /// bookmark — four seconds later, again, forever. The accessible URL is
+    /// captured once when the document is opened, reloaded or saved
+    /// (`Document.accessibleURL`), so the poll is now just the stats, and only
+    /// documents whose file actually moved come back to the main actor.
     func checkForExternalChanges() {
-        guard !isCheckingExternalChanges else { return }
+        guard !isCheckingExternalChanges, !documents.isEmpty else { return }
+
+        let probes: [DiskProbe] = documents.compactMap { doc in
+            guard let url = doc.accessibleURL ?? doc.url else { return nil }
+            return DiskProbe(id: doc.id, url: url)
+        }
+        guard !probes.isEmpty else { return }
+
         isCheckingExternalChanges = true
-        defer { isCheckingExternalChanges = false }
+        Task { [weak self] in
+            let states = await Task.detached(priority: .utility) {
+                probes.map { probe in
+                    let values = try? probe.url.resourceValues(
+                        forKeys: [.contentModificationDateKey, .fileSizeKey]
+                    )
+                    return DiskState(
+                        id: probe.id,
+                        url: probe.url,
+                        modificationDate: values?.contentModificationDate,
+                        fileSize: values?.fileSize
+                    )
+                }
+            }.value
 
-        for doc in documents {
-            guard let url = doc.url else { continue }
-            let accessibleURL = SecurityScopedResourceAccess.prepare(
-                url,
-                bookmarkKey: SecurityScopedResourceAccess.fileBookmarksKey,
-                shouldRemember: false
-            )
+            guard let self else { return }
+            defer { self.isCheckingExternalChanges = false }
+            self.applyDiskStates(states)
+        }
+    }
 
-            guard let currentModificationDate = modificationDate(for: accessibleURL) else { continue }
+    private func applyDiskStates(_ states: [DiskState]) {
+        for state in states {
+            guard let doc = documents.first(where: { $0.id == state.id }),
+                  let currentModificationDate = state.modificationDate
+            else { continue }
+
             guard let knownModificationDate = doc.diskModificationDate else {
                 doc.diskModificationDate = currentModificationDate
+                doc.diskFileSize = state.fileSize
                 continue
             }
 
-            guard currentModificationDate.timeIntervalSince(knownModificationDate) > 0.25 else { continue }
+            // `!=`, not "moved forward by more than a quarter second". A
+            // `git checkout`, `cp -p` or `rsync -t` restores the *old* mtime, so
+            // the file changed under the editor and the poll said nothing. The
+            // size is checked too, for a same-second rewrite of a different
+            // length.
+            let changed = currentModificationDate != knownModificationDate
+                || (state.fileSize != nil && state.fileSize != doc.diskFileSize)
+            guard changed else { continue }
 
             if doc.isDirty {
-                handleDirtyDocumentChangedOnDisk(doc, url: accessibleURL, modificationDate: currentModificationDate)
+                handleDirtyDocumentChangedOnDisk(
+                    doc,
+                    url: state.url,
+                    modificationDate: currentModificationDate,
+                    fileSize: state.fileSize
+                )
             } else {
-                reloadDocumentFromDisk(doc, url: accessibleURL, modificationDate: currentModificationDate)
+                reloadDocumentFromDisk(doc, url: state.url, modificationDate: currentModificationDate)
             }
         }
     }
 
-    private func handleDirtyDocumentChangedOnDisk(_ doc: Document, url: URL, modificationDate: Date) {
+    private nonisolated struct DiskProbe: Sendable {
+        let id: Document.ID
+        let url: URL
+    }
+
+    private nonisolated struct DiskState: Sendable {
+        let id: Document.ID
+        let url: URL
+        let modificationDate: Date?
+        let fileSize: Int?
+    }
+
+    /// One stat for both values, recorded together — the external-change poll
+    /// compares them as a pair.
+    private func captureDiskState(of url: URL, into doc: Document) {
+        let values = try? url.resourceValues(forKeys: [.contentModificationDateKey, .fileSizeKey])
+        doc.diskModificationDate = values?.contentModificationDate
+        doc.diskFileSize = values?.fileSize
+    }
+
+    private func handleDirtyDocumentChangedOnDisk(
+        _ doc: Document,
+        url: URL,
+        modificationDate: Date,
+        fileSize: Int?
+    ) {
         if doc.externalChangeWarningDate == modificationDate { return }
         doc.externalChangeWarningDate = modificationDate
 
@@ -1240,6 +1560,7 @@ final class DocumentStore {
             reloadDocumentFromDisk(doc, url: url, modificationDate: modificationDate)
         default:
             doc.diskModificationDate = modificationDate
+            doc.diskFileSize = fileSize
         }
     }
 
@@ -1254,10 +1575,14 @@ final class DocumentStore {
         doc.indentation = TextIndentation.detect(in: decoded.text)
         doc.refreshLargeFileMetrics(byteCount: decoded.byteCount)
         doc.url = url
+        doc.accessibleURL = url
         doc.language = LanguageDetector.detect(for: url)
+        // `language` may not have changed, so its didSet may not have fired —
+        // but the TEXT did, and the vendor is read off the text.
+        doc.refreshDetectedNetworkVendor()
         doc.isDirty = false
         doc.wasRecoveredFromDraft = false
-        doc.diskModificationDate = modificationDate
+        captureDiskState(of: url, into: doc)
         doc.externalChangeWarningDate = nil
         deleteDraft(for: doc)
 
@@ -1298,14 +1623,35 @@ final class DocumentStore {
         return alert.runModal() == .alertFirstButtonReturn
     }
 
-    private func modificationDate(for url: URL) -> Date? {
-        try? url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate
-    }
-
+    /// Re-open last session's tabs and recover any drafts.
+    ///
+    /// **Contract (this is what makes launch-with-a-file work).** Launch order
+    /// is: `restoreSessionTabs()` first, `openExternalFileURLs(_:)` second, even
+    /// when the app was launched by double-clicking a file in Finder. So this
+    /// must be safe to call with documents already open and must not clobber the
+    /// stored session:
+    ///
+    ///   - It restores only tabs that are not already open. `open(url:)` dedupes
+    ///     by `canonicalFileURL`, so a launch file that is also in the session
+    ///     ends up as one tab either way.
+    ///   - It does not persist while restoring. `documents.didSet` and
+    ///     `activeDocumentID.didSet` both call `persistSession`, which is
+    ///     suppressed by `isRestoringSession`; it persists once at the end. That
+    ///     is why the guard is on "already restored", not on "no documents":
+    ///     opening a launch file first used to overwrite the whole remembered
+    ///     session with that one path before this ever ran.
+    ///   - It never steals focus from a tab the caller has already made active,
+    ///     unless it recovered a draft that was active when the app quit.
+    ///
+    /// Calling it twice is a no-op.
     func restoreSessionTabs() {
-        guard documents.isEmpty else { return }
+        guard !hasRestoredSession else { return }
+        hasRestoredSession = true
+
         let defaults = UserDefaults.standard
         let paths = defaults.stringArray(forKey: sessionOpenFilesKey) ?? []
+        let alreadyOpen = Set(documents.compactMap { $0.url?.canonicalFileURL })
+        let preexistingActiveID = activeDocumentID
 
         var seen = Set<String>()
         let urls = paths.compactMap { path -> URL? in
@@ -1316,6 +1662,7 @@ final class DocumentStore {
                 path: path,
                 bookmarkKey: SecurityScopedResourceAccess.fileBookmarksKey
             )
+            guard !alreadyOpen.contains(url.canonicalFileURL) else { return nil }
             var isDirectory: ObjCBool = false
             guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory),
                   !isDirectory.boolValue
@@ -1332,6 +1679,10 @@ final class DocumentStore {
 
         if let recoveredActiveID {
             activeDocumentID = recoveredActiveID
+        } else if let preexistingActiveID, containsDocument(preexistingActiveID) {
+            // A launch file (or anything else the caller opened first) keeps the
+            // focus it was given; the session's tabs come back behind it.
+            activeDocumentID = preexistingActiveID
         } else if let activePath = defaults.string(forKey: sessionActiveFileKey),
            let active = documents.first(where: { $0.url?.path == activePath }) {
             activeDocumentID = active.id
@@ -1420,7 +1771,7 @@ final class DocumentStore {
             doc = existing
             isNewDocument = false
         } else if let restoredURL,
-                  let existing = documents.first(where: { $0.url?.standardizedFileURL == restoredURL.standardizedFileURL }) {
+                  let existing = documents.first(where: { $0.url?.canonicalFileURL == restoredURL.canonicalFileURL }) {
             doc = existing
             doc.url = restoredURL
             isNewDocument = false
@@ -1452,6 +1803,16 @@ final class DocumentStore {
         doc.encoding = encoding
         doc.hasBOM = snapshot.hasBOM
         doc.language = snapshot.language
+        // Order matters: `language`'s didSet re-detects, so the remembered pick
+        // is applied after it.
+        if let manual = snapshot.networkVendorIsManual, manual,
+           let raw = snapshot.networkVendor, let vendor = Vendor(rawValue: raw) {
+            doc.networkVendorIsManual = true
+            doc.networkVendor = vendor
+        } else {
+            doc.networkVendorIsManual = false
+            doc.refreshDetectedNetworkVendor()
+        }
         doc.indentation = indentation
         doc.lineEnding = lineEnding
         doc.showsInvisibleCharacters = snapshot.showsInvisibleCharacters
@@ -1462,57 +1823,17 @@ final class DocumentStore {
         doc.lastDraftSavedAt = snapshot.savedAt
         doc.lastAutoSavedAt = nil
         doc.refreshLargeFileMetrics(byteCount: nil)
-        doc.diskModificationDate = doc.url.flatMap { modificationDate(for: $0) }
+        doc.accessibleURL = doc.url
+        if let url = doc.url { captureDiskState(of: url, into: doc) } else { doc.diskModificationDate = nil }
         doc.externalChangeWarningDate = nil
         return doc
     }
 
+    /// Kept as the name the UI calls; it is `close` now. See `close` for why
+    /// the second copy of the close logic that used to live here is gone.
     @discardableResult
     func requestCloseTabFromUI(_ id: Document.ID) -> Bool {
-        guard let doc = documents.first(where: { $0.id == id }) else { return true }
-
-        if doc.isDirty {
-            let choice = presentUnsavedChangesAlert(for: doc)
-            switch choice {
-            case .save:
-                if doc.url == nil {
-                    guard promptSaveAs(doc) else { return false }
-                } else {
-                    do {
-                        try saveNow(doc)
-                    } catch {
-                        NSAlert.show(message: "Save failed: \(error.localizedDescription)", style: .critical)
-                        return false
-                    }
-                }
-            case .discard:
-                break
-            case .cancel:
-                return false
-            }
-        }
-
-        let wasActive = activeDocumentID == id
-        let nextActiveID = wasActive
-            ? documents.last(where: { $0.id != id })?.id
-            : activeDocumentID
-
-        if compareLeftDocumentID == id { compareLeftDocumentID = nil }
-        if compareRightDocumentID == id { compareRightDocumentID = nil }
-
-        deleteDraft(for: doc)
-        // Fold state is kept in a process-wide table so it survives the editor
-        // view being rebuilt on a tab switch; nothing else ever removes it.
-        FoldingManager.discardSavedFolds(for: doc.id.uuidString)
-        // Same story for the incremental-parse session, which pins the full
-        // text, a syntax tree copy and the last attributed string.
-        SyntaxEngine.shared.discardSession(for: doc.id)
-        documents.removeAll { $0.id == id }
-        if wasActive {
-            activeDocumentID = nextActiveID
-        }
-        normalizeCompareState()
-        return true
+        close(id)
     }
 }
 
@@ -1555,6 +1876,11 @@ private struct DraftSnapshot: Codable, Sendable {
     let encoding: String
     let hasBOM: Bool
     let language: String
+    /// Both optional so a draft written before the `network_config` merge still
+    /// decodes — the synthesized decoder throws on a MISSING key, and a draft is
+    /// the one thing here that outlives a version bump.
+    let networkVendor: String?
+    let networkVendorIsManual: Bool?
     let indentation: String
     let lineEnding: String
     let showsInvisibleCharacters: Bool
@@ -1605,30 +1931,47 @@ nonisolated enum TextLineEnding: String, CaseIterable, Identifiable, Sendable {
         }
     }
 
+    /// How many line breaks are enough to call it. Past this the counts cannot
+    /// change the answer in any real file, and this runs on open, on reload and
+    /// on every indentation change — over the whole document.
+    private static let lineEndingVoteLimit = 4096
+
+    /// Byte state machine over the UTF-8 view.
+    ///
+    /// It used to call `NSString.character(at:)` in a loop, which is an
+    /// objc_msgSend per UTF-16 unit across the whole file: 43 ms on 10 MB
+    /// against 11.8 ms for the byte scan. `\r` and `\n` are single bytes that
+    /// cannot appear inside a multi-byte UTF-8 sequence, so scanning bytes gives
+    /// exactly the same counts.
     static func detect(in text: String) -> TextLineEnding {
         var lf = 0
         var crlf = 0
         var cr = 0
+        var sawCR = false
+        var breaks = 0
 
-        let ns = text as NSString
-        var index = 0
-        while index < ns.length {
-            let character = ns.character(at: index)
-            if character == 13 {
-                if index + 1 < ns.length, ns.character(at: index + 1) == 10 {
+        for byte in text.utf8 {
+            if sawCR {
+                sawCR = false
+                if byte == 0x0A {
                     crlf += 1
-                    index += 2
-                } else {
-                    cr += 1
-                    index += 1
+                    breaks += 1
+                    if breaks >= Self.lineEndingVoteLimit { break }
+                    continue
                 }
-            } else if character == 10 {
+                cr += 1
+                breaks += 1
+                if breaks >= Self.lineEndingVoteLimit { break }
+            }
+            if byte == 0x0D {
+                sawCR = true
+            } else if byte == 0x0A {
                 lf += 1
-                index += 1
-            } else {
-                index += 1
+                breaks += 1
+                if breaks >= Self.lineEndingVoteLimit { break }
             }
         }
+        if sawCR { cr += 1 }
 
         if crlf >= lf, crlf >= cr, crlf > 0 { return .crlf }
         if cr > lf, cr > 0 { return .cr }
@@ -1673,30 +2016,31 @@ nonisolated enum TextIndentation: String, CaseIterable, Identifiable, Sendable {
         }
     }
 
+    /// Lines sampled before deciding. Unchanged — only how they are reached is.
+    private static let indentationSampleLines = 400
+
     static func detect(in text: String, allowSpaces2: Bool = false) -> TextIndentation {
         var tabLines = 0
         var space2Lines = 0
         var space4Lines = 0
         var space8Lines = 0
 
-        // components(separatedBy:) splits on the scalar; split(separator: "\n")
-        // compares Characters and so never splits CRLF text at all.
-        for line in text.components(separatedBy: "\n").prefix(400) {
-            var spaces = 0
-            var sawTab = false
+        // Only the first 400 lines are ever looked at, but this used to reach
+        // them with `text.components(separatedBy: "\n").prefix(400)` — which
+        // splits the ENTIRE file into an array of Strings first, then throws all
+        // but 400 of them away. 80.9 ms on a 10 MB file, on the main actor,
+        // inside `Document.init`, i.e. on every open.
+        //
+        // Forward scan over the UTF-8 view instead, stopping at line 400. `\n`,
+        // `\r`, space and tab are all single bytes that cannot occur inside a
+        // multi-byte sequence, and only the leading whitespace of each line is
+        // inspected, so the counts are identical to the old ones.
+        var lines = 0
+        var spaces = 0
+        var sawTab = false
+        var inLeadingWhitespace = true
 
-            for character in line {
-                if character == "\t" {
-                    sawTab = true
-                    break
-                }
-                if character == " " {
-                    spaces += 1
-                    continue
-                }
-                break
-            }
-
+        func finishLine() {
             if sawTab {
                 tabLines += 1
             } else if spaces >= 8, spaces % 8 == 0 {
@@ -1706,7 +2050,34 @@ nonisolated enum TextIndentation: String, CaseIterable, Identifiable, Sendable {
             } else if spaces >= 2, spaces % 2 == 0 {
                 space2Lines += 1
             }
+            lines += 1
+            spaces = 0
+            sawTab = false
+            inLeadingWhitespace = true
         }
+
+        for byte in text.utf8 {
+            if byte == 0x0A {   // end of line
+                finishLine()
+                if lines >= Self.indentationSampleLines { break }
+                continue
+            }
+            guard inLeadingWhitespace else { continue }
+            switch byte {
+            case 0x09:                       // tab
+                sawTab = true
+                inLeadingWhitespace = false
+            case 0x20:                       // space
+                spaces += 1
+            default:
+                // Includes the \r of a CRLF pair, which is not indentation and
+                // ends the leading run exactly as the old Character loop did.
+                inLeadingWhitespace = false
+            }
+        }
+        // `components(separatedBy:)` yields a final (possibly empty) element
+        // after the last newline; count it the same way.
+        if lines < Self.indentationSampleLines { finishLine() }
 
         let spaceLines = space2Lines + space4Lines + space8Lines
         if tabLines > spaceLines { return .tabs }
@@ -1903,8 +2274,31 @@ final class Document: Identifiable {
     var draftID: UUID
     var url: URL?
     var text: String {
-        didSet { textUTF16Count = text.utf16.count }
+        didSet {
+            // `(text as NSString).length`, NOT `text.utf16.count`.
+            //
+            // The editor assigns a freshly bridged NSString here on every
+            // keystroke (`fullText` → `textStorage.string`), and a bridged
+            // string has no breadcrumb index yet — so `utf16.count` transcoded
+            // the whole document to count it. Measured on Thai text (where the
+            // UTF-16 and UTF-8 lengths differ, so there is no shortcut): 1.07 ms
+            // per keystroke at 800 KB, 5.9 ms at 4 MB. The NSString length is a
+            // stored field on the bridged object: 0.0001 ms. `init` was already
+            // doing it this way.
+            textUTF16Count = (text as NSString).length
+            revision &+= 1
+        }
     }
+
+    /// Bumped on every assignment to `text`. Auto save encodes on the main actor
+    /// and writes off it; the continuation compares this against the value it
+    /// captured to know whether the document it finds is still the one it
+    /// encoded. A string comparison cannot see an edit-and-edit-back, and on a
+    /// large document it is not free either.
+    ///
+    /// @ObservationIgnored for the same reason as `textUTF16Count`: it changes
+    /// on every keystroke and nothing renders it.
+    @ObservationIgnored private(set) var revision: Int = 0
 
     /// UTF-16 length of `text`, refreshed once per assignment.
     ///
@@ -1926,7 +2320,19 @@ final class Document: Identifiable {
     var wasRecoveredFromDraft: Bool = false
     var lastDraftSavedAt: Date?
     var lastAutoSavedAt: Date?
-    var language: String
+    var language: String {
+        didSet {
+            guard language != oldValue else { return }
+            refreshDetectedNetworkVendor()
+        }
+    }
+    /// The device family `network_config` highlights this document as.
+    ///
+    /// Detection is a 64 KB byte scan of the head of the file, run wherever the
+    /// language is decided. `networkVendorIsManual` is what makes the user's own
+    /// pick stick: nothing re-detects over it until they ask for Auto again.
+    var networkVendor: Vendor = .auto
+    var networkVendorIsManual: Bool = false
     var encoding: TextEncoding
     var indentation: TextIndentation
     var lineEnding: TextLineEnding
@@ -1937,6 +2343,15 @@ final class Document: Identifiable {
     var wordWrap: Bool = true
     var autoTrimTrailingWhitespace: Bool = false
     var diskModificationDate: Date?
+    /// Size on disk as of `diskModificationDate`. The external-change poll
+    /// compares both: an mtime-preserving rewrite (git checkout, cp -p, rsync -t)
+    /// changes only this one.
+    var diskFileSize: Int?
+    /// The URL instance that holds this document's security scope, captured when
+    /// it was opened, reloaded or saved. The 4-second disk poll stats through
+    /// this instead of resolving a bookmark per document per tick.
+    /// @ObservationIgnored: nothing renders it, and it moves with `url`.
+    @ObservationIgnored var accessibleURL: URL?
     var externalChangeWarningDate: Date?
     var precomputedSyntaxHighlight: PrecomputedSyntaxHighlight?
     /// Whether the file had a BOM when read; preserved on save. For UTF-8
@@ -1966,6 +2381,32 @@ final class Document: Identifiable {
         self.estimatedLineCount = metrics.lineCount
         self.exceedsLargeLineThreshold = metrics.exceedsLineThreshold
         self.savedText = url != nil ? initialText : nil
+        refreshDetectedNetworkVendor()
+    }
+
+    /// Re-run the vendor fingerprint. No-op once the user has picked a vendor
+    /// by hand, and for any document that is not a network config.
+    ///
+    /// Called from `init`, from `language`'s `didSet` and from the reload path —
+    /// never from `text`'s `didSet`, which fires on every keystroke.
+    func refreshDetectedNetworkVendor() {
+        guard !networkVendorIsManual else { return }
+        guard NetworkConfigLanguage.isNetworkConfig(language) else {
+            networkVendor = .auto
+            return
+        }
+        if let fixed = NetworkConfigLanguage.aliasVendor(for: language) {
+            networkVendor = fixed
+            return
+        }
+        networkVendor = NetworkConfigLanguage.detectVendor(in: text)
+            ?? LanguageDetector.fallbackNetworkVendor(for: url)
+    }
+
+    /// The id the syntax engine is asked for: the language plus, for a network
+    /// config, the vendor.
+    var syntaxLanguage: String {
+        NetworkConfigLanguage.engineLanguage(for: language, vendor: networkVendor)
     }
 
     var displayName: String {
@@ -2000,10 +2441,9 @@ final class Document: Identifiable {
 
 struct PrecomputedSyntaxHighlight {
     let language: String
-    let isDark: Bool
     let utf16Length: Int
     let textHash: Int
-    let result: NSAttributedString
+    let runs: [HighlightRun]
 }
 
 // MARK: - Language detection (unchanged from before)
@@ -2037,9 +2477,47 @@ enum LanguageDetector {
         HighlightLanguage(id: "sql", displayName: "SQL"),
         HighlightLanguage(id: "diff", displayName: "Diff"),
         HighlightLanguage(id: "dockerfile", displayName: "Dockerfile"),
-        HighlightLanguage(id: "cisco_ios", displayName: "Cisco IOS"),
-        HighlightLanguage(id: "aruba_cx", displayName: "Aruba CX")
+        // One entry for every device family. `cisco_ios` and `aruba_cx` are
+        // still accepted as ids (they are vendor aliases) but they are not
+        // separate languages any more: the vendor badge next to this menu is
+        // where a family is chosen.
+        HighlightLanguage(id: NetworkConfigLanguage.id,
+                          displayName: NetworkConfigLanguage.displayName)
     ]
+
+    /// The order the status bar lists device families in — the language menu's
+    /// network section and the vendor badge both read it. Aruba CX first
+    /// because that is the family this user works in most; the rest follow
+    /// SheepTerm's `Vendor.allCases` order. `.auto` is not in here: the menus
+    /// spell it "Auto-detect" and place it themselves.
+    static let networkVendorMenuOrder: [Vendor] = [
+        .arubaCX, .cisco, .arubaOS, .huawei, .comware,
+        .juniper, .panos, .fortios, .gaia, .linux
+    ]
+
+    /// Languages other than `network_config`, for the lower half of the menu.
+    static var nonNetworkLanguages: [HighlightLanguage] {
+        supportedLanguages.filter { $0.id != NetworkConfigLanguage.id }
+    }
+
+    /// The vendor a network config falls back to when the fingerprint finds no
+    /// signature. `.cfg`, `.ios` and `.cisco` meant `cisco_ios` in every release
+    /// up to 1.3.6, and the package's signatures are deliberately long,
+    /// unambiguous strings (`boot-start-marker`, `current configuration :`) — a
+    /// saved fragment of interface blocks carries none of them. Without this a
+    /// 15 000-line `.cfg` of `switchport` lines opened on `.auto`, lost the
+    /// `vlan 306s` / `spanning-tree mode rpvsts` validators, and was a
+    /// regression for exactly the files this language existed for. `.conf` and
+    /// `.txt` stay on `.auto`: they never implied a vendor.
+    ///
+    /// This is still a DETECTED vendor: a Huawei banner in a `.cfg` wins, and the
+    /// badge can change it.
+    static func fallbackNetworkVendor(for url: URL?) -> Vendor {
+        switch url?.pathExtension.lowercased() {
+        case "cfg", "ios", "cisco": return .cisco
+        default: return .auto
+        }
+    }
 
     static func detect(for url: URL?) -> String {
         let filename = url?.lastPathComponent.lowercased() ?? ""
@@ -2049,10 +2527,12 @@ enum LanguageDetector {
 
         guard let ext = url?.pathExtension.lowercased() else { return "plaintext" }
         switch ext {
-        case "txt":                      return "plaintext"
-        case "log", "cof", "conf", "config": return "log"
+        case "log", "cof", "config":     return "log"
         case "swift":                    return "swift"
-        case "js", "mjs", "cjs":         return "javascript"
+        case "js", "mjs", "cjs", "jsx":  return "javascript"
+        // "tsx" stays on the TypeScript grammar deliberately: a .tsx file is
+        // TypeScript, and the tsx-specific grammar is not vendored. The JSX in
+        // it highlights imperfectly, which is better than plain text.
         case "ts", "tsx":                return "typescript"
         case "py":                       return "python"
         case "go":                       return "go"
@@ -2076,7 +2556,15 @@ enum LanguageDetector {
         case "dockerfile":               return "dockerfile"
         case "yml", "yaml":              return "yaml"
         case "sh", "bash", "zsh":        return "bash"
-        case "cfg", "ios", "cisco":      return "cisco_ios"
+        // `.txt` and `.conf` are here because that is what a saved `show run`
+        // or `display current-configuration` actually gets called. With no
+        // vendor signature the document stays on `.auto`, which colours only
+        // literal values — addresses, masks, MACs, VLAN ids, state words — so a
+        // plain text file still reads as plain text.
+        case _ where NetworkConfigLanguage.fileExtensions.contains(ext):
+            return NetworkConfigLanguage.id
+        // Unambiguous vendor extensions keep their alias: the family is in the
+        // filename, so there is nothing to fingerprint.
         case "cx", "aoscx", "aruba", "arubacx": return "aruba_cx"
         default:                         return "plaintext"
         }
@@ -2084,6 +2572,11 @@ enum LanguageDetector {
 
     static func displayName(for language: String) -> String {
         let normalized = normalizedLanguage(language)
+        // The aliases are not in `supportedLanguages`, and `capitalized` would
+        // render one as "Cisco_ios".
+        if NetworkConfigLanguage.isNetworkConfig(normalized) {
+            return NetworkConfigLanguage.displayName
+        }
         return supportedLanguages.first(where: { $0.id == normalized })?.displayName
             ?? normalized.capitalized
     }

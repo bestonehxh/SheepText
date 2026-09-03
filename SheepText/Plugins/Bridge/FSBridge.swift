@@ -5,8 +5,11 @@
 //    - The currently open workspace root (if any)
 //
 //  Any path escaping these roots throws a PermissionError on the JS side.
-//  To request a broader scope, a plugin must declare it in manifest
-//  `permissions` and the user will be prompted on first use.
+//  There is no way to widen that: the manifest used to carry a `permissions`
+//  array, but nothing ever read it, so a plugin could declare anything it liked
+//  and it changed nothing. It has been removed rather than left standing as a
+//  security control that does not exist. If a broader scope is ever wanted, it
+//  needs a real user prompt behind it, not a field in a file the plugin writes.
 //
 
 import Foundation
@@ -59,23 +62,49 @@ import JavaScriptCore
     // MARK: - Helpers
 
     private func resolve(_ path: String) -> URL? {
+        let url: URL
         if path.hasPrefix("/") {
-            return URL(fileURLWithPath: path).standardizedFileURL
+            url = URL(fileURLWithPath: path)
         } else if path.hasPrefix("~") {
-            return URL(fileURLWithPath: NSString(string: path).expandingTildeInPath).standardizedFileURL
+            url = URL(fileURLWithPath: NSString(string: path).expandingTildeInPath)
         } else {
             // Relative paths resolve against the workspace root, falling back
             // to the plugin folder if there's no workspace open.
             let base = workspaceRoot ?? pluginFolder
-            return base.appendingPathComponent(path).standardizedFileURL
+            url = base.appendingPathComponent(path)
         }
+        return Self.canonical(url)
+    }
+
+    /// Fully resolved form used for every scope comparison: symlinks followed,
+    /// then `..` / `.` removed.
+    ///
+    /// Order matters. `standardizedFileURL` alone collapses `..` textually,
+    /// which is exactly wrong across a symlink, and `resolvingSymlinksInPath`
+    /// alone leaves `..` in place on a path whose parents do not exist.
+    private static func canonical(_ url: URL) -> URL {
+        url.resolvingSymlinksInPath().standardizedFileURL
     }
 
     private func isAllowed(_ url: URL) -> Bool {
-        // Allow if inside plugin folder
-        if url.path.hasPrefix(pluginFolder.standardizedFileURL.path) { return true }
-        // Allow if inside workspace root
-        if let root = workspaceRoot?.standardizedFileURL, url.path.hasPrefix(root.path) { return true }
+        if Self.isInside(url, root: Self.canonical(pluginFolder)) { return true }
+        if let root = workspaceRoot.map(Self.canonical), Self.isInside(url, root: root) { return true }
         return false
+    }
+
+    /// Containment by path COMPONENTS, not by string prefix.
+    ///
+    /// The old check was `url.path.hasPrefix(root.path)`, which is a string
+    /// test: for a workspace root of `/proj`, the paths `/proj-secrets/keys`
+    /// and `/project/anything` both start with "/proj" and were both allowed.
+    /// It also compared unresolved paths, so a symlink planted inside the
+    /// workspace pointing at `~/.ssh` read straight through the check.
+    ///
+    /// Both arguments must already be `canonical`.
+    private static func isInside(_ url: URL, root: URL) -> Bool {
+        let rootComponents = root.pathComponents
+        let urlComponents = url.pathComponents
+        guard urlComponents.count >= rootComponents.count else { return false }
+        return Array(urlComponents.prefix(rootComponents.count)) == rootComponents
     }
 }

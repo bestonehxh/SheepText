@@ -25,8 +25,24 @@ struct PreferencesView: View {
                 .tabItem { Label("Syntax",     systemImage: "curlybraces") }
             KeybindingsSettingsPane()
                 .tabItem { Label("Keys",       systemImage: "keyboard") }
+            // The plugin subsystem's only entry point. PluginsView existed but
+            // nothing ever showed it, so a user had no way to see what had
+            // loaded, install one, or reload after editing.
+            PluginsView()
+                .tabItem { Label("Plugins",    systemImage: "puzzlepiece.extension") }
         }
+        // Height matters as much as width here: with only a width set, the
+        // window sized itself so the Appearance pane was cut off just below
+        // Chrome — and a macOS Form gives no visible hint that it scrolls, so
+        // everything past the fold read as simply not existing. 540 is what it
+        // takes for Appearance, the tallest pane that can fit, to show whole.
+        //
+        // General cannot be made to fit and is not meant to: it carries five
+        // sections. That is exactly why "Show sidebar on launch" belongs at the
+        // TOP of it rather than below the fold of another pane — no window size
+        // fixes a control nobody scrolls to.
         .frame(width: 520)
+        .frame(minHeight: 540)
         .background(Color(nsColor: .bestTextPanelBackground))
     }
 }
@@ -47,6 +63,10 @@ private struct GeneralSettingsPane: View {
                 }
                 .pickerStyle(.radioGroup)
                 .labelsHidden()
+                // Lived under Appearance → Layout, which is where nobody looked:
+                // this IS launch behaviour, and it sat below the fold of a pane
+                // that gave no sign it scrolled.
+                Toggle("Show sidebar on launch", isOn: $preferences.showSidebarByDefault)
             }
 
             Section("New Document") {
@@ -158,16 +178,16 @@ private struct AppearanceSettingsPane: View {
                     .foregroundStyle(.secondary)
             }
 
-            Section("Sidebar") {
-                Picker("Sidebar style", selection: $preferences.sidebarStyle) {
-                    ForEach(SidebarStyle.allCases) { s in
-                        Text(s.displayName).tag(s)
+            Section("Chrome") {
+                Picker("Style", selection: $preferences.chromeStyle) {
+                    ForEach(ChromeStyle.allCases) { style in
+                        Text(style.displayName).tag(style)
                     }
                 }
-            }
-
-            Section("Layout") {
-                Toggle("Show sidebar on launch", isOn: $preferences.showSidebarByDefault)
+                .pickerStyle(.segmented)
+                Text("How the tab bar and sidebar are painted. Liquid Glass picks up the desktop behind the window; Solid Color keeps the flat chrome tile. The layout is the same either way — the editor itself is never translucent.")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
             }
 
             Section("Editor Text Color") {
@@ -191,28 +211,46 @@ private struct AppearanceSettingsPane: View {
 // MARK: - Theme mode cards
 
 /// Fixed colours for the mini-window previews. These deliberately mirror the
-/// "Native Clean" palette in AppColors.swift but cannot use it directly: the
-/// preview must always show its own mode, not follow the window's appearance.
-private struct ThemePreviewPalette {
+/// Graphite & Signal palette in AppColors.swift but cannot use it directly:
+/// the preview must always show its own mode, not follow the window's
+/// appearance — and that includes the accent. It used to read
+/// `controlAccentColor`, which made the card preview a colour the app never
+/// paints: a user with a purple system accent saw purple cards and a blue
+/// app. These are the same two values as `bestTextAccent` in AppColors.swift
+/// and must be changed together with it.
+/// `internal`, not `private`: AppColorsTests asserts these accent values
+/// against `NSColor.bestTextAccent` so the two cannot drift apart again.
+struct ThemePreviewPalette {
     let chrome: Color
     let sidebar: Color
     let editor: Color
     let line: Color
     let accent: Color
 
+    /// Raw hex, kept as constants so a test can compare them with the app's
+    /// own colours instead of re-typing the literals a third time.
+    static let lightAccentHex: UInt32 = 0x0A72D6
+    static let darkAccentHex:  UInt32 = 0x4FA3F7
+    static let lightChromeHex: UInt32 = 0xEEEEEF
+    static let lightSidebarHex: UInt32 = 0xE9E9EB
+    static let lightEditorHex: UInt32 = 0xFCFCFD
+    static let darkChromeHex:  UInt32 = 0x1A1B1D
+    static let darkSidebarHex: UInt32 = 0x161719
+    static let darkEditorHex:  UInt32 = 0x1A1B1E
+
     static let light = ThemePreviewPalette(
-        chrome:  Color(hexRGB: 0xD9E0E8),
-        sidebar: Color(hexRGB: 0xE9EEF4),
-        editor:  Color(hexRGB: 0xFBFCFE),
-        line:    Color(hexRGB: 0xC5CFDA),
-        accent:  Color(hexRGB: 0x2874C6)
+        chrome:  Color(hexRGB: lightChromeHex),
+        sidebar: Color(hexRGB: lightSidebarHex),
+        editor:  Color(hexRGB: lightEditorHex),
+        line:    Color(hexRGB: 0xD7D7DA),
+        accent:  Color(hexRGB: lightAccentHex)
     )
     static let dark = ThemePreviewPalette(
-        chrome:  Color(hexRGB: 0x21252B),
-        sidebar: Color(hexRGB: 0x252A31),
-        editor:  Color(hexRGB: 0x282C34),
-        line:    Color(hexRGB: 0x4A5160),
-        accent:  Color(hexRGB: 0x61AFEF)
+        chrome:  Color(hexRGB: darkChromeHex),
+        sidebar: Color(hexRGB: darkSidebarHex),
+        editor:  Color(hexRGB: darkEditorHex),
+        line:    Color(hexRGB: 0x2E2F33),
+        accent:  Color(hexRGB: darkAccentHex)
     )
 }
 

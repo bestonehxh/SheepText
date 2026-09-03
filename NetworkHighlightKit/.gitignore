@@ -1,0 +1,5 @@
+# `swift build` / `swift test` output. The root .gitignore has `build/` but not
+# `.build/`, and an un-ignored SPM build directory adds thousands of files to a
+# commit.
+.build/
+.swiftpm/

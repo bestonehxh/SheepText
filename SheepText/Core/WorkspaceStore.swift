@@ -218,7 +218,11 @@ final class WorkspaceStore {
 
 /// Node in the sidebar tree.
 struct FileNode: Identifiable, Hashable, Sendable {
-    let id = UUID()
+    /// The URL **is** the identity. It used to be a fresh `UUID()` per node, so
+    /// every `refreshTree()` produced a tree that SwiftUI considered entirely
+    /// new: the whole outline was rebuilt and every expanded folder collapsed —
+    /// after creating a file, renaming one, or trashing one.
+    var id: URL { url }
     let url: URL
     let isDirectory: Bool
     var children: [FileNode]?
@@ -227,11 +231,18 @@ struct FileNode: Identifiable, Hashable, Sendable {
 
     /// Recursively scan a directory. Skips hidden files and common junk.
     nonisolated static func scan(at url: URL, depth: Int = 0) -> FileNode {
-        let fm = FileManager.default
-        var isDir: ObjCBool = false
-        _ = fm.fileExists(atPath: url.path, isDirectory: &isDir)
+        scan(at: url, isDirectory: isDirectory(at: url), depth: depth)
+    }
 
-        if !isDir.boolValue {
+    private nonisolated static func isDirectory(at url: URL) -> Bool {
+        (try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) ?? false
+    }
+
+    /// `isDirectory` is passed in because the caller already asked for it while
+    /// sorting the parent's contents — the recursion used to re-`stat` every
+    /// single node on the way in, i.e. twice per file per scan.
+    private nonisolated static func scan(at url: URL, isDirectory: Bool, depth: Int) -> FileNode {
+        if !isDirectory {
             return FileNode(url: url, isDirectory: false, children: nil)
         }
         guard depth < 12 else { // pathological safety
@@ -239,7 +250,7 @@ struct FileNode: Identifiable, Hashable, Sendable {
         }
 
         let skip: Set<String> = [".git", "node_modules", ".build", ".DS_Store", "DerivedData"]
-        let contents = (try? fm.contentsOfDirectory(
+        let contents = (try? FileManager.default.contentsOfDirectory(
             at: url,
             includingPropertiesForKeys: [.isDirectoryKey],
             options: [.skipsHiddenFiles]
@@ -247,13 +258,12 @@ struct FileNode: Identifiable, Hashable, Sendable {
 
         let children = contents
             .filter { !skip.contains($0.lastPathComponent) }
+            .map { (url: $0, isDirectory: Self.isDirectory(at: $0)) }
             .sorted { a, b in
-                let aDir = (try? a.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) ?? false
-                let bDir = (try? b.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) ?? false
-                if aDir != bDir { return aDir } // directories first
-                return a.lastPathComponent.localizedStandardCompare(b.lastPathComponent) == .orderedAscending
+                if a.isDirectory != b.isDirectory { return a.isDirectory } // directories first
+                return a.url.lastPathComponent.localizedStandardCompare(b.url.lastPathComponent) == .orderedAscending
             }
-            .map { scan(at: $0, depth: depth + 1) }
+            .map { scan(at: $0.url, isDirectory: $0.isDirectory, depth: depth + 1) }
 
         return FileNode(url: url, isDirectory: true, children: children)
     }
