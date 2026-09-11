@@ -187,18 +187,57 @@ final class SheepTextAppDelegate: NSObject, NSApplicationDelegate {
     var willTerminateHandler: (() -> Void)?
     var reopenMainWindowHandler: (() -> Void)?
     private var pendingOpenFileURLs: [URL] = []
+    /// Window numbers of the main windows that were on screen or minimised when
+    /// the app was hidden. See `mainWindow`.
+    private var mainWindowsHiddenWithApp: Set<Int> = []
 
-    /// A main editor window (WindowGroup id "main") is on screen or minimised.
-    /// The Settings window has its own identifier, so it never counts.
-    private var hasMainWindow: Bool {
-        NSApp.windows.contains {
-            ($0.isVisible || $0.isMiniaturized)
-                && ($0.identifier?.rawValue.hasPrefix("main") ?? false)
+    /// A main editor window (WindowGroup id "main") that is on screen or
+    /// minimised — or was, when the app was hidden. The Settings window has its
+    /// own identifier, so it never counts.
+    ///
+    /// The hidden case needs its own record: while the app is hidden (⌘H) every
+    /// window reports `isVisible == false`, and `NSApp.unhide` is asynchronous,
+    /// so unhiding first does not help. Opening a file from Finder on a hidden
+    /// app used to find no window here and have `ensureMainWindowVisible()`
+    /// create a second one, every time.
+    private var mainWindow: NSWindow? {
+        NSApp.windows.first {
+            ($0.identifier?.rawValue.hasPrefix("main") ?? false)
+                && ($0.isVisible || $0.isMiniaturized
+                    || (NSApp.isHidden && mainWindowsHiddenWithApp.contains($0.windowNumber)))
         }
     }
 
+    func applicationWillHide(_ notification: Notification) {
+        mainWindowsHiddenWithApp = Set(NSApp.windows.filter {
+            ($0.identifier?.rawValue.hasPrefix("main") ?? false)
+                && ($0.isVisible || $0.isMiniaturized)
+        }.map(\.windowNumber))
+    }
+
+    func applicationDidUnhide(_ notification: Notification) {
+        mainWindowsHiddenWithApp = []
+    }
+
+    private var hasMainWindow: Bool { mainWindow != nil }
+
     func ensureMainWindowVisible() {
         if !hasMainWindow { reopenMainWindowHandler?() }
+    }
+
+    /// Bring the app and its main window forward.
+    ///
+    /// Opening a document from Finder while the app is already running does NOT
+    /// activate it on its own here: the Apple event arrives, the tab opens, and
+    /// the window stays behind whatever the user was looking at — so the file
+    /// appeared to open nowhere until they clicked the Dock icon. `unhide` is
+    /// needed as well as `activate`, because ⌘H'd apps stay hidden otherwise.
+    func bringMainWindowToFront() {
+        NSApp.unhide(nil)
+        NSApp.activate()
+        guard let window = mainWindow else { return }
+        if window.isMiniaturized { window.deminiaturize(nil) }
+        window.makeKeyAndOrderFront(nil)
     }
 
     /// Dock click / `open -a` on the running app.
@@ -305,8 +344,19 @@ final class SheepTextAppDelegate: NSObject, NSApplicationDelegate {
     private func handleOpenFileURLs(_ urls: [URL]) {
         guard !urls.isEmpty else { return }
         if let openFilesHandler {
+            // Front BEFORE opening: `openFilesHandler` can stop in `runModal()`
+            // (binary file, huge file, cannot open), and an alert raised by an
+            // app that is not active yet can come up behind the frontmost
+            // app's windows.
+            bringMainWindowToFront()
             ensureMainWindowVisible()
             openFilesHandler(urls)
+            // A window created just now by `reopenMainWindowHandler` (SwiftUI's
+            // openWindow bridge) does not exist yet on this turn of the run
+            // loop, so front it again once it does.
+            DispatchQueue.main.async { [weak self] in
+                self?.bringMainWindowToFront()
+            }
         } else {
             pendingOpenFileURLs.append(contentsOf: urls)
         }

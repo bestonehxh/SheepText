@@ -1,3 +1,6 @@
+# Release zips written by the /ship engine (release.sh)
+Builds/
+
 # Xcode build
 build/
 DerivedData/

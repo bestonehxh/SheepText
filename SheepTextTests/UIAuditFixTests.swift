@@ -370,6 +370,29 @@ final class SaveTargetResolutionTests: XCTestCase {
 @MainActor
 final class EditorAppearanceCoalescingTests: XCTestCase {
 
+    /// `AppPreferences` writes straight to `UserDefaults.standard`, and the test
+    /// host IS the app (same bundle id, same container). This class used to
+    /// leave the font-size slider at 35 pt and the line-number switch flipped in
+    /// the user's real preferences — and the release script runs the suite
+    /// right before it installs, so every release shipped with huge text.
+    /// Snapshot what we touch and put it back, whatever the outcome.
+    private var savedFontSize: Double = 0
+    private var savedShowsLineNumbers = true
+
+    override func setUp() {
+        super.setUp()
+        let live = AppPreferences()
+        savedFontSize = live.editorFontSize
+        savedShowsLineNumbers = live.showsLineNumbers
+    }
+
+    override func tearDown() {
+        let live = AppPreferences()
+        live.editorFontSize = savedFontSize
+        live.showsLineNumbers = savedShowsLineNumbers
+        super.tearDown()
+    }
+
     /// Every observer of `.editorAppearanceDidChange` clears its highlight cache
     /// and re-highlights the whole document. Dragging the font-size slider from
     /// 9 pt to 36 pt posted it 27 times — 27 full re-parses for one gesture.
