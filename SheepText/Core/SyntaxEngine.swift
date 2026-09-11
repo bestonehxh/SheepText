@@ -1115,14 +1115,11 @@ nonisolated final class SyntaxEngine: @unchecked Sendable {
         let fm = FileManager.default
         var urls: [URL] = []
 
-        if let appSupport = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask).first {
-            let runtimeURL = appSupport
-                .appendingPathComponent("SheepText", isDirectory: true)
-                .appendingPathComponent("SheepTextTreeSitterQueries", isDirectory: true)
-                .appendingPathComponent(language, isDirectory: true)
-            if fm.fileExists(atPath: runtimeURL.appendingPathComponent("highlights.scm").path) {
-                urls.append(runtimeURL)
-            }
+        let runtimeURL = AppStorageLocation.applicationSupport
+            .appendingPathComponent("SheepTextTreeSitterQueries", isDirectory: true)
+            .appendingPathComponent(language, isDirectory: true)
+        if fm.fileExists(atPath: runtimeURL.appendingPathComponent("highlights.scm").path) {
+            urls.append(runtimeURL)
         }
 
         if let resourceURL = Bundle.main.resourceURL {

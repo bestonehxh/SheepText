@@ -276,20 +276,23 @@ final class DocumentSaveBehaviourTests: XCTestCase {
         guard let doc = store.open(url: url, rememberRecent: false, showError: false) else {
             return XCTFail("could not open")
         }
+        store.autoSaveIsEnabled = { true }
         doc.autoTrimTrailingWhitespace = true
         doc.text = "trailing spaces here   \nand here\t\n"
+        doc.isDirty = true
         let before = doc.text
         let beforeRevision = doc.revision
 
         store.scheduleAutoSave(for: doc.id, isEnabled: true, delay: 0.01)
-        // Give the scheduled task a chance to run its whole cycle.
-        let deadline = Date().addingTimeInterval(2)
-        while doc.isDirty, Date() < deadline {
-            RunLoop.current.run(until: Date().addingTimeInterval(0.05))
-        }
+        // Without `isDirty` (and the enabled seam) `scheduleAutoSave` returned
+        // before scheduling anything and this test passed without saving — so
+        // it asserts the save ran before it asserts what the save left alone.
+        XCTAssertTrue(waitUntilClean(doc), "auto save did not complete")
 
         XCTAssertEqual(doc.text, before, "auto save rewrote the document text")
         XCTAssertEqual(doc.revision, beforeRevision, "auto save bumped the text revision")
+        XCTAssertEqual(try String(contentsOf: url, encoding: .utf8), before,
+                       "auto save trimmed the bytes it wrote")
     }
 
     /// The trim still has to happen on a manual save, including for a document
@@ -351,18 +354,52 @@ final class DocumentSaveBehaviourTests: XCTestCase {
         guard let doc = store.open(url: url, rememberRecent: false, showError: false) else {
             return XCTFail("could not open")
         }
+        store.autoSaveIsEnabled = { true }
         let recentsBefore = store.recentFiles
         doc.text = "x changed\n"
         doc.isDirty = true
 
         store.scheduleAutoSave(for: doc.id, isEnabled: true, delay: 0.01)
-        let deadline = Date().addingTimeInterval(2)
-        while doc.isDirty, Date() < deadline {
-            RunLoop.current.run(until: Date().addingTimeInterval(0.05))
-        }
 
-        XCTAssertFalse(doc.isDirty, "auto save did not complete")
+        XCTAssertTrue(waitUntilClean(doc), "auto save did not complete")
+        XCTAssertEqual(try String(contentsOf: url, encoding: .utf8), "x changed\n")
         XCTAssertEqual(store.recentFiles, recentsBefore)
+    }
+
+    /// The preference is re-read when the scheduled task wakes, because turning
+    /// auto save off does not cancel a task that is already sleeping. These
+    /// tests used to reach that check through the global preference, so on a
+    /// machine (or a separate test bundle id) where auto save was off every
+    /// auto-save test failed with "did not complete".
+    func testAutoSaveSwitchedOffWhileSleepingDoesNotWrite() throws {
+        let url = try makeTemporaryFile(contents: "x\n")
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        let store = DocumentStore()
+        guard let doc = store.open(url: url, rememberRecent: false, showError: false) else {
+            return XCTFail("could not open")
+        }
+        var enabled = true
+        store.autoSaveIsEnabled = { enabled }
+        doc.text = "x changed\n"
+        doc.isDirty = true
+
+        store.scheduleAutoSave(for: doc.id, isEnabled: true, delay: 0.05)
+        enabled = false
+
+        XCTAssertFalse(waitUntilClean(doc, timeout: 0.5), "auto save ran after it was switched off")
+        XCTAssertEqual(try String(contentsOf: url, encoding: .utf8), "x\n")
+    }
+
+    /// Spins the main run loop until `doc` is clean. Auto save's write runs in
+    /// a detached task and its bookkeeping hops back onto the main actor, which
+    /// `RunLoop.run(until:)` services.
+    private func waitUntilClean(_ doc: Document, timeout: TimeInterval = 2) -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while doc.isDirty, Date() < deadline {
+            RunLoop.current.run(until: Date().addingTimeInterval(0.02))
+        }
+        return !doc.isDirty
     }
 
     private func makeTemporaryFile(contents: String) throws -> URL {
@@ -448,7 +485,7 @@ final class DocumentStoreBookkeepingTests: XCTestCase {
         try "session\n".write(to: sessionFile, atomically: true, encoding: .utf8)
         try "launch\n".write(to: launchFile, atomically: true, encoding: .utf8)
 
-        let defaults = UserDefaults.standard
+        let defaults = AppStorageLocation.defaults
         let previousOpen = defaults.stringArray(forKey: "sheeptext.session.openFiles")
         let previousActive = defaults.string(forKey: "sheeptext.session.activeFile")
         defer {

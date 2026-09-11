@@ -51,12 +51,7 @@ struct PluginManifest: Codable {
 // MARK: - Paths
 
 nonisolated enum PluginPaths {
-    static var appSupport: URL {
-        guard let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else {
-            return URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Library/Application Support/SheepText", isDirectory: true)
-        }
-        return base.appendingPathComponent("SheepText", isDirectory: true)
-    }
+    static var appSupport: URL { AppStorageLocation.applicationSupport }
     static var pluginsDir: URL { appSupport.appendingPathComponent("Plugins", isDirectory: true) }
     static var logsDir:    URL { appSupport.appendingPathComponent("Logs",    isDirectory: true) }
     static var logFile:    URL { logsDir.appendingPathComponent("plugin-host.log") }

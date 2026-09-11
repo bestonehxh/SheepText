@@ -317,6 +317,9 @@ final class LineNumberRulerView: NSView {
 
         NSColor.editorBackground.setFill()
         bounds.fill()
+        // Same smoothing as the text it sits beside, or the numbers look a
+        // weight heavier than the lines they label.
+        DiffLayoutManager.applyFontSmoothing()
 
         transferArrowHitRects.removeAll()
 

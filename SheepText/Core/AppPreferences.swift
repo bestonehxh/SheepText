@@ -91,6 +91,8 @@ final class AppPreferences {
     private let themeModeKey = "sheeptext.themeMode"
     private let editorFontNameKey = "sheeptext.editor.fontName"
     private let editorFontSizeKey = "sheeptext.editor.fontSize"
+    private let editorFontWeightKey = "sheeptext.editor.fontWeight"
+    private let editorFontSmoothingKey = "sheeptext.editor.fontSmoothing"
     private let defaultIndentationKey = "sheeptext.editor.defaultIndentation"
     private let wordWrapByDefaultKey = "sheeptext.editor.wordWrapByDefault"
     private let showsLineNumbersKey = "sheeptext.editor.showsLineNumbers"
@@ -104,24 +106,24 @@ final class AppPreferences {
     private let showSidebarByDefaultKey = "sheeptext.appearance.showSidebarByDefault"
 
     var launchBehavior: LaunchBehavior {
-        didSet { UserDefaults.standard.set(launchBehavior.rawValue, forKey: launchBehaviorKey) }
+        didSet { AppStorageLocation.defaults.set(launchBehavior.rawValue, forKey: launchBehaviorKey) }
     }
 
     var defaultLanguage: String {
-        didSet { UserDefaults.standard.set(defaultLanguage, forKey: defaultLanguageKey) }
+        didSet { AppStorageLocation.defaults.set(defaultLanguage, forKey: defaultLanguageKey) }
     }
 
     var defaultEncoding: TextEncoding {
-        didSet { UserDefaults.standard.set(defaultEncoding.rawValue, forKey: defaultEncodingKey) }
+        didSet { AppStorageLocation.defaults.set(defaultEncoding.rawValue, forKey: defaultEncodingKey) }
     }
 
     var defaultLineEnding: TextLineEnding {
-        didSet { UserDefaults.standard.set(defaultLineEnding.rawValue, forKey: defaultLineEndingKey) }
+        didSet { AppStorageLocation.defaults.set(defaultLineEnding.rawValue, forKey: defaultLineEndingKey) }
     }
 
     var themeMode: AppThemeMode {
         didSet {
-            UserDefaults.standard.set(themeMode.rawValue, forKey: themeModeKey)
+            AppStorageLocation.defaults.set(themeMode.rawValue, forKey: themeModeKey)
             // Notification posted from SheepTextApp.applyTheme() *after* NSApp.appearance
             // is set, so effectiveAppearance is correct when observers re-highlight.
         }
@@ -130,7 +132,7 @@ final class AppPreferences {
     var editorFontName: String {
         didSet {
             cachedEditorFont = nil
-            UserDefaults.standard.set(editorFontName, forKey: editorFontNameKey)
+            AppStorageLocation.defaults.set(editorFontName, forKey: editorFontNameKey)
             notifyEditorAppearanceChanged()
         }
     }
@@ -138,7 +140,55 @@ final class AppPreferences {
     var editorFontSize: Double {
         didSet {
             cachedEditorFont = nil
-            UserDefaults.standard.set(editorFontSize, forKey: editorFontSizeKey)
+            AppStorageLocation.defaults.set(editorFontSize, forKey: editorFontSizeKey)
+            notifyEditorAppearanceChanged()
+        }
+    }
+
+    /// Editor text weight. Medium by default: on a display running a scaled
+    /// resolution (the 13″ Air's stock 1470 × 956) the whole screen is
+    /// resampled before it reaches the eye, and a Regular face loses more of
+    /// its edge to that than a Medium one does.
+    enum EditorFontWeight: String, CaseIterable, Identifiable {
+        case regular, medium, semibold, bold
+        var id: String { rawValue }
+        var displayName: String {
+            switch self {
+            case .regular: return "Regular"
+            case .medium: return "Medium"
+            case .semibold: return "Semibold"
+            case .bold: return "Bold"
+            }
+        }
+        var nsWeight: NSFont.Weight {
+            switch self {
+            case .regular: return .regular
+            case .medium: return .medium
+            case .semibold: return .semibold
+            case .bold: return .bold
+            }
+        }
+    }
+
+    var editorFontWeight: EditorFontWeight {
+        didSet {
+            cachedEditorFont = nil
+            AppStorageLocation.defaults.set(editorFontWeight.rawValue, forKey: editorFontWeightKey)
+            notifyEditorAppearanceChanged()
+        }
+    }
+
+    /// macOS "font smoothing" — the stroke dilation CoreText applies before
+    /// antialiasing. Off by default: on light text over a dark ground it reads
+    /// as a grey halo around every stem; without it the same face draws 2 px
+    /// stems with a clean edge at 2x (measured against SheepTerm and the
+    /// Claude app on this display). The editor's layout manager, gutter and
+    /// invisible-character painter all read `DiffLayoutManager.fontSmoothing`,
+    /// which this keeps in sync.
+    var editorFontSmoothing: Bool {
+        didSet {
+            AppStorageLocation.defaults.set(editorFontSmoothing, forKey: editorFontSmoothingKey)
+            DiffLayoutManager.fontSmoothing = editorFontSmoothing
             notifyEditorAppearanceChanged()
         }
     }
@@ -156,58 +206,58 @@ final class AppPreferences {
 
     var defaultIndentation: TextIndentation {
         didSet {
-            UserDefaults.standard.set(defaultIndentation.rawValue, forKey: defaultIndentationKey)
+            AppStorageLocation.defaults.set(defaultIndentation.rawValue, forKey: defaultIndentationKey)
             notifyEditorAppearanceChanged()
         }
     }
 
     var wordWrapByDefault: Bool {
         didSet {
-            UserDefaults.standard.set(wordWrapByDefault, forKey: wordWrapByDefaultKey)
+            AppStorageLocation.defaults.set(wordWrapByDefault, forKey: wordWrapByDefaultKey)
             notifyEditorAppearanceChanged()
         }
     }
 
     var showsLineNumbers: Bool {
         didSet {
-            UserDefaults.standard.set(showsLineNumbers, forKey: showsLineNumbersKey)
+            AppStorageLocation.defaults.set(showsLineNumbers, forKey: showsLineNumbersKey)
             notifyEditorAppearanceChanged()
         }
     }
 
     var showsInvisibleCharactersByDefault: Bool {
         didSet {
-            UserDefaults.standard.set(showsInvisibleCharactersByDefault, forKey: showsInvisibleCharactersByDefaultKey)
+            AppStorageLocation.defaults.set(showsInvisibleCharactersByDefault, forKey: showsInvisibleCharactersByDefaultKey)
             notifyEditorAppearanceChanged()
         }
     }
 
     var editorLightTextColor: NSColor {
         didSet {
-            UserDefaults.standard.set(Self.hexString(from: editorLightTextColor), forKey: editorLightTextColorKey)
+            AppStorageLocation.defaults.set(Self.hexString(from: editorLightTextColor), forKey: editorLightTextColorKey)
             notifyEditorAppearanceChanged()
         }
     }
 
     var editorDarkTextColor: NSColor {
         didSet {
-            UserDefaults.standard.set(Self.hexString(from: editorDarkTextColor), forKey: editorDarkTextColorKey)
+            AppStorageLocation.defaults.set(Self.hexString(from: editorDarkTextColor), forKey: editorDarkTextColorKey)
             notifyEditorAppearanceChanged()
         }
     }
 
     var autoSaveEnabled: Bool {
         didSet {
-            UserDefaults.standard.set(autoSaveEnabled, forKey: autoSaveEnabledKey)
+            AppStorageLocation.defaults.set(autoSaveEnabled, forKey: autoSaveEnabledKey)
         }
     }
 
     var backupDocumentsWhileEditing: Bool {
-        didSet { UserDefaults.standard.set(backupDocumentsWhileEditing, forKey: backupDocumentsWhileEditingKey) }
+        didSet { AppStorageLocation.defaults.set(backupDocumentsWhileEditing, forKey: backupDocumentsWhileEditingKey) }
     }
 
     var askBeforeClosingUnsavedDocuments: Bool {
-        didSet { UserDefaults.standard.set(askBeforeClosingUnsavedDocuments, forKey: askBeforeClosingUnsavedDocumentsKey) }
+        didSet { AppStorageLocation.defaults.set(askBeforeClosingUnsavedDocuments, forKey: askBeforeClosingUnsavedDocumentsKey) }
     }
 
     var autoSaveDelay: Double {
@@ -217,24 +267,24 @@ final class AppPreferences {
                 autoSaveDelay = clamped
                 return
             }
-            UserDefaults.standard.set(autoSaveDelay, forKey: autoSaveDelayKey)
+            AppStorageLocation.defaults.set(autoSaveDelay, forKey: autoSaveDelayKey)
         }
     }
 
     var detectsEncodingAutomatically: Bool {
-        didSet { UserDefaults.standard.set(detectsEncodingAutomatically, forKey: detectsEncodingAutomaticallyKey) }
+        didSet { AppStorageLocation.defaults.set(detectsEncodingAutomatically, forKey: detectsEncodingAutomaticallyKey) }
     }
 
     var detectsSyntaxByFileExtension: Bool {
-        didSet { UserDefaults.standard.set(detectsSyntaxByFileExtension, forKey: detectsSyntaxByFileExtensionKey) }
+        didSet { AppStorageLocation.defaults.set(detectsSyntaxByFileExtension, forKey: detectsSyntaxByFileExtensionKey) }
     }
 
     var warnsWhenOpeningLargeFiles: Bool {
-        didSet { UserDefaults.standard.set(warnsWhenOpeningLargeFiles, forKey: warnsWhenOpeningLargeFilesKey) }
+        didSet { AppStorageLocation.defaults.set(warnsWhenOpeningLargeFiles, forKey: warnsWhenOpeningLargeFilesKey) }
     }
 
     var checksForUpdatesAutomatically: Bool {
-        didSet { UserDefaults.standard.set(checksForUpdatesAutomatically, forKey: checksForUpdatesAutomaticallyKey) }
+        didSet { AppStorageLocation.defaults.set(checksForUpdatesAutomatically, forKey: checksForUpdatesAutomaticallyKey) }
     }
 
     /// When the last *automatic* update check ran. `UpdateChecker` throttles
@@ -243,9 +293,9 @@ final class AppPreferences {
     var lastAutomaticUpdateCheck: Date? {
         didSet {
             if let lastAutomaticUpdateCheck {
-                UserDefaults.standard.set(lastAutomaticUpdateCheck, forKey: lastAutomaticUpdateCheckKey)
+                AppStorageLocation.defaults.set(lastAutomaticUpdateCheck, forKey: lastAutomaticUpdateCheckKey)
             } else {
-                UserDefaults.standard.removeObject(forKey: lastAutomaticUpdateCheckKey)
+                AppStorageLocation.defaults.removeObject(forKey: lastAutomaticUpdateCheckKey)
             }
         }
     }
@@ -253,18 +303,18 @@ final class AppPreferences {
     /// Material used for the tab bar and sidebar. See `GlassChrome.swift`.
     var chromeStyle: ChromeStyle {
         didSet {
-            UserDefaults.standard.set(chromeStyle.rawValue, forKey: chromeStyleKey)
+            AppStorageLocation.defaults.set(chromeStyle.rawValue, forKey: chromeStyleKey)
             NotificationCenter.default.post(name: .editorAppearanceDidChange, object: nil)
         }
     }
 
     var showSidebarByDefault: Bool {
-        didSet { UserDefaults.standard.set(showSidebarByDefault, forKey: showSidebarByDefaultKey) }
+        didSet { AppStorageLocation.defaults.set(showSidebarByDefault, forKey: showSidebarByDefaultKey) }
     }
 
     var highlightTheme: HighlightTheme {
         didSet {
-            UserDefaults.standard.set(highlightTheme.rawValue, forKey: highlightThemeKey)
+            AppStorageLocation.defaults.set(highlightTheme.rawValue, forKey: highlightThemeKey)
             NotificationCenter.default.post(name: .syntaxHighlightSettingsDidChange, object: nil)
         }
     }
@@ -282,8 +332,10 @@ final class AppPreferences {
     }
 
     init() {
-        let defaults = UserDefaults.standard
-        Self.optOutOfProseTextSubstitutions(defaults)
+        // AppKit reads this key from the app's own domain, so it goes to
+        // `.standard` even while everything of ours goes elsewhere under XCTest.
+        Self.optOutOfProseTextSubstitutions(.standard)
+        let defaults = AppStorageLocation.defaults
         let savedLaunchBehavior = defaults.string(forKey: launchBehaviorKey)
         launchBehavior = savedLaunchBehavior.flatMap(LaunchBehavior.init(rawValue:)) ?? .reopenLastSession
 
@@ -293,7 +345,7 @@ final class AppPreferences {
         let savedLineEnding = defaults.string(forKey: defaultLineEndingKey)
         defaultLineEnding = savedLineEnding.flatMap(TextLineEnding.init(rawValue:)) ?? .lf
 
-        let savedTheme = UserDefaults.standard.string(forKey: themeModeKey)
+        let savedTheme = AppStorageLocation.defaults.string(forKey: themeModeKey)
         // Dark is the default the app ships with: the chrome is glass, and a
         // dark ground is what keeps the material reading as material rather
         // than as a washed-out grey. System Default is still one click away.
@@ -302,6 +354,11 @@ final class AppPreferences {
         editorFontName = defaults.string(forKey: editorFontNameKey) ?? Self.systemEditorFontName
         let savedSize = defaults.double(forKey: editorFontSizeKey)
         editorFontSize = savedSize > 0 ? savedSize : 13
+        editorFontWeight = defaults.string(forKey: editorFontWeightKey)
+            .flatMap(EditorFontWeight.init(rawValue:)) ?? .medium
+        let savedSmoothing = defaults.object(forKey: editorFontSmoothingKey) as? Bool ?? false
+        editorFontSmoothing = savedSmoothing
+        DiffLayoutManager.fontSmoothing = savedSmoothing
         let savedIndentation = defaults.string(forKey: defaultIndentationKey)
         defaultIndentation = savedIndentation.flatMap(TextIndentation.init(rawValue:)) ?? .spaces4
         wordWrapByDefault = defaults.object(forKey: wordWrapByDefaultKey) as? Bool ?? true
@@ -342,12 +399,23 @@ final class AppPreferences {
     func editorFont() -> NSFont {
         if let cachedEditorFont { return cachedEditorFont }
         let size = CGFloat(editorFontSize)
+        let weight = editorFontWeight.nsWeight
         let font: NSFont
         if editorFontName == Self.systemEditorFontName {
-            font = NSFont.systemFont(ofSize: size)
+            font = NSFont.systemFont(ofSize: size, weight: weight)
         } else {
-            font = NSFont(name: editorFontName, size: size)
-                ?? NSFont.systemFont(ofSize: size)
+            // Ask the family for the requested weight; a family without that
+            // face gets its closest member, and one that has vanished falls
+            // back to the system font at the same weight.
+            let descriptor = NSFontDescriptor(fontAttributes: [
+                .family: editorFontName,
+                .traits: [NSFontDescriptor.TraitKey.weight: weight.rawValue],
+            ])
+            let byDescriptor = NSFont(descriptor: descriptor, size: size)
+            let matches = byDescriptor.map { $0.familyName == editorFontName } ?? false
+            font = (matches ? byDescriptor : nil)
+                ?? NSFont(name: editorFontName, size: size)
+                ?? NSFont.systemFont(ofSize: size, weight: weight)
         }
         cachedEditorFont = font
         return font
@@ -374,6 +442,8 @@ final class AppPreferences {
     func resetEditorAppearance() {
         editorFontName = Self.systemEditorFontName
         editorFontSize = 13
+        editorFontWeight = .medium
+        editorFontSmoothing = false
         editorLightTextColor = NSColor.bestTextEditorForeground(for: NSAppearance(named: .aqua)!)
         editorDarkTextColor = NSColor.bestTextEditorForeground(for: NSAppearance(named: .darkAqua)!)
     }

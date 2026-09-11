@@ -60,6 +60,28 @@ nonisolated final class DiffLayoutManager: NSLayoutManager, NSLayoutManagerDeleg
 
     weak var ownerTextView: NSTextView?
 
+    /// Whether glyphs are drawn with macOS font smoothing (stroke dilation).
+    /// Owned by `AppPreferences.editorFontSmoothing`, which writes it on load
+    /// and on every change; read here, in the gutter and in the
+    /// invisible-character painter so all three agree. Drawing happens on the
+    /// main thread; the flag is a plain Bool set from the main actor.
+    nonisolated(unsafe) static var fontSmoothing = false
+
+    /// Applies `fontSmoothing` to the context AppKit is about to draw text
+    /// into. TextKit 1 has no per-view switch for this; the CGContext flag is
+    /// the only lever, and it must be set inside the draw call because AppKit
+    /// resets the context between passes.
+    @MainActor static func applyFontSmoothing() {
+        NSGraphicsContext.current?.cgContext.setShouldSmoothFonts(fontSmoothing)
+    }
+
+    override func drawGlyphs(forGlyphRange glyphsToShow: NSRange, at origin: NSPoint) {
+        // AppKit draws on the main thread; the class is nonisolated only so
+        // layout callbacks can run off it.
+        MainActor.assumeIsolated { Self.applyFontSmoothing() }
+        super.drawGlyphs(forGlyphRange: glyphsToShow, at: origin)
+    }
+
     /// Full-width line background tints (one per diff line paragraph range).
     var lineHighlights: [(range: NSRange, color: NSColor)] = []
 
@@ -832,6 +854,7 @@ final class EditorTextView: NSTextView {
 
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
+        DiffLayoutManager.applyFontSmoothing()
         drawInvisibleCharacters(in: dirtyRect)
     }
 

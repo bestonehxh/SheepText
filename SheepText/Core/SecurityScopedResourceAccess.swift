@@ -81,7 +81,7 @@ nonisolated enum SecurityScopedResourceAccess {
 
         var bookmarks = storedBookmarks(for: bookmarkKey)
         bookmarks[url.standardizedFileURL.path] = data
-        UserDefaults.standard.set(bookmarks, forKey: bookmarkKey)
+        AppStorageLocation.defaults.set(bookmarks, forKey: bookmarkKey)
     }
 
     /// Starts (or re-uses) the scope for this path and returns the URL instance
@@ -118,7 +118,7 @@ nonisolated enum SecurityScopedResourceAccess {
     }
 
     private static func storedBookmarks(for key: String) -> [String: Data] {
-        guard let raw = UserDefaults.standard.dictionary(forKey: key) else { return [:] }
+        guard let raw = AppStorageLocation.defaults.dictionary(forKey: key) else { return [:] }
 
         var bookmarks: [String: Data] = [:]
         for (path, value) in raw {

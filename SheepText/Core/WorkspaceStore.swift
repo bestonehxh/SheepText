@@ -21,7 +21,7 @@ final class WorkspaceStore {
     private(set) var recentWorkspaces: [URL] = []
 
     init() {
-        recentWorkspaces = UserDefaults.standard.stringArray(forKey: recentWorkspacesKey)?
+        recentWorkspaces = AppStorageLocation.defaults.stringArray(forKey: recentWorkspacesKey)?
             .map(URL.init(fileURLWithPath:))
             .filter { FileManager.default.fileExists(atPath: $0.path) } ?? []
     }
@@ -144,7 +144,7 @@ final class WorkspaceStore {
 
     func restoreLastSessionWorkspace() {
         guard rootURL == nil,
-              let path = UserDefaults.standard.string(forKey: sessionWorkspaceKey)
+              let path = AppStorageLocation.defaults.string(forKey: sessionWorkspaceKey)
         else { return }
 
         let url = SecurityScopedResourceAccess.restore(
@@ -155,7 +155,7 @@ final class WorkspaceStore {
         guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory),
               isDirectory.boolValue
         else {
-            UserDefaults.standard.removeObject(forKey: sessionWorkspaceKey)
+            AppStorageLocation.defaults.removeObject(forKey: sessionWorkspaceKey)
             return
         }
 
@@ -190,11 +190,11 @@ final class WorkspaceStore {
     }
 
     private func persistRecentWorkspaces() {
-        UserDefaults.standard.set(recentWorkspaces.map(\.path), forKey: recentWorkspacesKey)
+        AppStorageLocation.defaults.set(recentWorkspaces.map(\.path), forKey: recentWorkspacesKey)
     }
 
     private func persistSessionWorkspace(_ url: URL) {
-        UserDefaults.standard.set(url.path, forKey: sessionWorkspaceKey)
+        AppStorageLocation.defaults.set(url.path, forKey: sessionWorkspaceKey)
     }
 
     private func uniqueURL(in directory: URL, preferredName: String) -> URL {

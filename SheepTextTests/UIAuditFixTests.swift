@@ -370,8 +370,10 @@ final class SaveTargetResolutionTests: XCTestCase {
 @MainActor
 final class EditorAppearanceCoalescingTests: XCTestCase {
 
-    /// `AppPreferences` writes straight to `UserDefaults.standard`, and the test
-    /// host IS the app (same bundle id, same container). This class used to
+    /// `AppPreferences` used to write straight to `UserDefaults.standard`, and
+    /// the test host IS the app (same bundle id, same container). Under XCTest
+    /// it now writes to a per-process suite (`AppStorageLocation`), so this
+    /// restore is a second line of defence rather than the only one. This class used to
     /// leave the font-size slider at 35 pt and the line-number switch flipped in
     /// the user's real preferences — and the release script runs the suite
     /// right before it installs, so every release shipped with huge text.

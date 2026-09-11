@@ -60,6 +60,17 @@ final class DocumentStore {
     private var draftSaveTasks: [Document.ID: Task<Void, Never>] = [:]
     private var draftSaveRevisions: [Document.ID: UUID] = [:]
     private var autoSaveTasks: [Document.ID: Task<Void, Never>] = [:]
+    /// Asked again when a scheduled auto save wakes, because the preference can
+    /// be switched off while the task is sleeping and nothing cancels it.
+    ///
+    /// A seam rather than a direct read so tests can drive auto save without
+    /// flipping the preference: the test host is the real app, and
+    /// `AppPreferences.autoSaveEnabled` writes the user's own UserDefaults. Read
+    /// straight from the global, the auto-save tests passed only on a machine
+    /// whose user had auto save switched on.
+    @ObservationIgnored var autoSaveIsEnabled: @MainActor () -> Bool = {
+        AppPreferences.current?.autoSaveEnabled ?? false
+    }
     /// draftID → the revision this process last wrote to disk, so
     /// `deleteDraftFiles` can name the files instead of scanning the directory.
     /// `removeOlderDraftFiles` runs after every write, so this revision names the
@@ -1072,19 +1083,19 @@ final class DocumentStore {
     }
 
     private func loadRecentFiles() {
-        guard let paths = UserDefaults.standard.array(forKey: recentKey) as? [String] else { return }
+        guard let paths = AppStorageLocation.defaults.array(forKey: recentKey) as? [String] else { return }
         recentFiles = paths.map { URL(fileURLWithPath: $0) }
             .filter { FileManager.default.fileExists(atPath: $0.path) }
     }
 
     private func persistRecentFiles() {
         let paths = recentFiles.map(\.path)
-        UserDefaults.standard.set(paths, forKey: recentKey)
+        AppStorageLocation.defaults.set(paths, forKey: recentKey)
     }
 
     private func persistSession() {
         guard !isRestoringSession else { return }
-        let defaults = UserDefaults.standard
+        let defaults = AppStorageLocation.defaults
         let paths = documents.compactMap { $0.url?.path }
         defaults.set(paths, forKey: sessionOpenFilesKey)
 
@@ -1168,7 +1179,7 @@ final class DocumentStore {
         // The pref can be switched off while this task is already sleeping, and
         // nothing cancels it — so it is re-read here rather than trusted from
         // when the task was scheduled.
-        guard AppPreferences.current?.autoSaveEnabled ?? false else {
+        guard autoSaveIsEnabled() else {
             autoSaveTasks[id] = nil
             return
         }
@@ -1416,11 +1427,7 @@ final class DocumentStore {
     }
 
     private var draftsDirectory: URL {
-        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
-            ?? FileManager.default.homeDirectoryForCurrentUser
-        return base
-            .appendingPathComponent("SheepText", isDirectory: true)
-            .appendingPathComponent("Drafts", isDirectory: true)
+        AppStorageLocation.applicationSupport.appendingPathComponent("Drafts", isDirectory: true)
     }
 
     private nonisolated static func writeDraftPayload(_ payload: DraftPayload) {
@@ -1648,7 +1655,7 @@ final class DocumentStore {
         guard !hasRestoredSession else { return }
         hasRestoredSession = true
 
-        let defaults = UserDefaults.standard
+        let defaults = AppStorageLocation.defaults
         let paths = defaults.stringArray(forKey: sessionOpenFilesKey) ?? []
         let alreadyOpen = Set(documents.compactMap { $0.url?.canonicalFileURL })
         let preexistingActiveID = activeDocumentID

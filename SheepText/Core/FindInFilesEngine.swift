@@ -233,10 +233,7 @@ nonisolated enum FindInFilesEngine {
     }
 
     private static func makeBackupDirectory() throws -> URL {
-        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
-            ?? FileManager.default.homeDirectoryForCurrentUser
-        let parent = base
-            .appendingPathComponent("SheepText", isDirectory: true)
+        let parent = AppStorageLocation.applicationSupport
             .appendingPathComponent("Backups", isDirectory: true)
             .appendingPathComponent("ReplaceInFiles", isDirectory: true)
 

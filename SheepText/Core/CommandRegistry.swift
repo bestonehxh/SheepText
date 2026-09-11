@@ -35,7 +35,7 @@ final class CommandRegistry {
     private var recentCommandIDs: [String] = []
 
     init() {
-        recentCommandIDs = UserDefaults.standard.stringArray(forKey: recentCommandsKey) ?? []
+        recentCommandIDs = AppStorageLocation.defaults.stringArray(forKey: recentCommandsKey) ?? []
     }
 
     func register(id: String, title: String, source: Source = .builtIn, handler: @escaping ([Any]) -> Void) {
@@ -75,6 +75,6 @@ final class CommandRegistry {
         if recentCommandIDs.count > maxRecentCommands {
             recentCommandIDs = Array(recentCommandIDs.prefix(maxRecentCommands))
         }
-        UserDefaults.standard.set(recentCommandIDs, forKey: recentCommandsKey)
+        AppStorageLocation.defaults.set(recentCommandIDs, forKey: recentCommandsKey)
     }
 }

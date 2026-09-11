@@ -29,7 +29,7 @@ struct MainWindowView: View {
     /// Sidebar visibility. Default controlled by AppPreferences.showSidebarByDefault.
     @State private var sidebarShown: Bool =
         AppPreferences.current?.showSidebarByDefault == true
-    @AppStorage("sheeptext.sidebarWidth") private var sidebarWidth: Double = 240
+    @AppStorage("sheeptext.sidebarWidth", store: AppStorageLocation.defaults) private var sidebarWidth: Double = 240
     @State private var selectedPanel: SidebarView.Panel = .files
     @State private var isShowingRecoveredDrafts = false
     /// @State, not `let`. A View is a struct that SwiftUI re-initialises on

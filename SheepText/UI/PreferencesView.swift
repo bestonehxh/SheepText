@@ -138,6 +138,16 @@ private struct EditorSettingsPane: View {
                         .foregroundStyle(.secondary)
                         .frame(width: 40, alignment: .trailing)
                 }
+                Picker("Weight", selection: $preferences.editorFontWeight) {
+                    ForEach(AppPreferences.EditorFontWeight.allCases) { weight in
+                        Text(weight.displayName).tag(weight)
+                    }
+                }
+                .pickerStyle(.segmented)
+                Toggle("Font smoothing", isOn: $preferences.editorFontSmoothing)
+                Text("Font smoothing is macOS's stroke thickening. On makes text bolder with a soft grey edge; off (the default) draws thinner, cleaner stems — the same edge modern web-based apps use.")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
             }
 
             Section("Editing") {

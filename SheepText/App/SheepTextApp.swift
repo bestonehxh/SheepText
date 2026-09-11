@@ -120,7 +120,12 @@ struct SheepTextApp: App {
 
                     await plugins.loadAll(commands: commands, workspace: workspace)
 
-                    UpdateChecker.shared.checkForUpdatesOnLaunchIfDue(preferences: preferences)
+                    // Not from a test host: its defaults start empty, so the
+                    // check is always "due" and would reach GitHub — and could
+                    // raise an update alert — on every test run.
+                    if !AppStorageLocation.isHostedByXCTest {
+                        UpdateChecker.shared.checkForUpdatesOnLaunchIfDue(preferences: preferences)
+                    }
                 }
                 .onOpenURL { url in
                     documents.openExternalFileURLs([url], preferences: preferences)
