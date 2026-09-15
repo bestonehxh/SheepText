@@ -735,6 +735,12 @@ final class LineNumberRulerView: NSView {
         return found
     }
 
+    /// A pinch over the gutter zooms the editor it belongs to.
+    override func magnify(with event: NSEvent) {
+        guard let textView else { return super.magnify(with: event) }
+        textView.magnify(with: event)
+    }
+
     // MARK: - Fold click handling
 
     override func mouseDown(with event: NSEvent) {

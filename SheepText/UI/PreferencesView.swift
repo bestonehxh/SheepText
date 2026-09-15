@@ -131,7 +131,7 @@ private struct EditorSettingsPane: View {
                     }
                 }
                 LabeledContent("Size") {
-                    Slider(value: $preferences.editorFontSize, in: 9...36, step: 1)
+                    Slider(value: $preferences.editorFontSize, in: AppPreferences.editorFontSizeRange, step: 1)
                         .frame(width: 140)
                     Text("\(Int(preferences.editorFontSize)) pt")
                         .monospacedDigit()
@@ -369,7 +369,7 @@ private struct ThemeModeCard: View {
 
 /// The right-of-diagonal half of the bounds, used to composite the
 /// half-light / half-dark "System" preview.
-private struct DiagonalHalf: Shape {
+private nonisolated struct DiagonalHalf: Shape {
     func path(in rect: CGRect) -> Path {
         var path = Path()
         path.move(to: CGPoint(x: rect.maxX * 0.62, y: rect.minY))

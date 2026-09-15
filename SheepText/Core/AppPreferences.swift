@@ -137,6 +137,9 @@ final class AppPreferences {
         }
     }
 
+    /// The Settings slider's range; a trackpad pinch is clamped to the same one.
+    static let editorFontSizeRange: ClosedRange<Double> = 9...36
+
     var editorFontSize: Double {
         didSet {
             cachedEditorFont = nil
@@ -472,13 +475,17 @@ final class AppPreferences {
     /// `.eventTracking`, where a plain scheduled timer would not fire at all
     /// until the mouse came up, so the editor would freeze mid-drag rather than
     /// following it at ~7 fps.
+    ///
+    /// The window is NOT restarted by a change that lands inside it. It used to
+    /// be, which made this a debounce: a gesture sending a step faster than the
+    /// window (a trackpad pinch, a quick slider drag) got nothing after the
+    /// leading post until it stopped.
     private func notifyEditorAppearanceChanged() {
-        if appearanceCoalesceTimer == nil {
-            NotificationCenter.default.post(name: .editorAppearanceDidChange, object: nil)
-        } else {
+        guard appearanceCoalesceTimer == nil else {
             appearanceChangePending = true
-            appearanceCoalesceTimer?.invalidate()
+            return
         }
+        NotificationCenter.default.post(name: .editorAppearanceDidChange, object: nil)
 
         let timer = Timer(timeInterval: Self.editorAppearanceCoalescingWindow, repeats: false) { [weak self] _ in
             MainActor.assumeIsolated {

@@ -833,12 +833,6 @@ final class DocumentStore {
         commitSave(doc, payload: payload)
     }
 
-    /// Show an NSSavePanel and, if the user confirms, write and update the
-    /// document's URL. Returns true if the save happened.
-    /// Pre-fills the filename; appends date+counter if that name already
-    /// exists in the panel's initial directory, so the user never has to
-    /// manually resolve a conflict.
-    @discardableResult
     /// A file or folder was renamed or moved on disk **outside** the save path.
     ///
     /// The sidebar's rename used to just assign `document.url`, which is the one
@@ -928,6 +922,11 @@ final class DocumentStore {
         }
     }
 
+    /// Show an NSSavePanel and, if the user confirms, write and update the
+    /// document's URL. Returns true if the save happened.
+    /// Pre-fills the filename; appends date+counter if that name already
+    /// exists in the panel's initial directory, so the user never has to
+    /// manually resolve a conflict.
     private func promptSaveAs(_ doc: Document) -> Bool {
         let panel = NSSavePanel()
         panel.canCreateDirectories = true
@@ -937,7 +936,11 @@ final class DocumentStore {
             ?? FileManager.default.homeDirectoryForCurrentUser
         panel.nameFieldStringValue = uniqueFileName(for: defaultSaveName(for: doc), in: initialDir)
         guard panel.runModal() == .OK, let selectedURL = panel.url else { return false }
-        let url = urlByAddingDefaultTextExtensionIfNeeded(selectedURL)
+        return saveAs(doc, to: urlByAddingDefaultTextExtensionIfNeeded(selectedURL))
+    }
+
+    /// The write half of Save As, for a URL the save panel has just granted.
+    func saveAs(_ doc: Document, to url: URL) -> Bool {
         // Routed through prepareSave/commitSave rather than keeping a second,
         // drifting copy of the save logic. doc.url has to move first (that is
         // what prepareSave encodes for) and is put back if the write fails, so
@@ -946,11 +949,20 @@ final class DocumentStore {
         doc.url = url
         do {
             applyManualSaveTransforms(doc)
-            guard let payload = try prepareSave(doc) else {
+            guard let payload = try prepareSave(doc, rememberBookmark: false) else {
                 doc.url = previousURL
                 return false
             }
             try TextFileIO.writeData(payload.data, to: payload.url)
+            // Only after the write: a security-scoped bookmark cannot be made
+            // for a file that does not exist yet, so remembering it in
+            // prepareSave silently stored nothing for every new file, and the
+            // panel's grant ends with the process — Open Recent and session
+            // restore then failed with "you don't have permission to view it".
+            SecurityScopedResourceAccess.remember(
+                payload.url,
+                bookmarkKey: SecurityScopedResourceAccess.fileBookmarksKey
+            )
             // Only when the preference says the extension picks the language.
             // This used to re-detect unconditionally, so Save As threw away an
             // explicit language choice — and did it even for users who had

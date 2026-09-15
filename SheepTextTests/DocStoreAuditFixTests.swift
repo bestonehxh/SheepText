@@ -315,6 +315,31 @@ final class DocumentSaveBehaviourTests: XCTestCase {
         XCTAssertFalse(doc.isDirty)
     }
 
+    /// Save As of a brand-new file remembered its security-scoped bookmark
+    /// before writing, when the file did not exist yet — `bookmarkData` failed,
+    /// `try?` swallowed it, and after a relaunch Open Recent and session restore
+    /// could not open the file ("you don't have permission to view it").
+    func testSaveAsToANewFileRemembersItsBookmark() throws {
+        let url = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+            .appendingPathComponent("sheeptext-saveas-\(UUID().uuidString).txt")
+        defer { try? FileManager.default.removeItem(at: url) }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))
+
+        let store = DocumentStore()
+        let doc = store.newUntitled()
+        doc.text = "new file\n"
+        doc.isDirty = true
+
+        XCTAssertTrue(store.saveAs(doc, to: url))
+        XCTAssertEqual(try String(contentsOf: url, encoding: .utf8), "new file\n")
+
+        let bookmarks = AppStorageLocation.defaults.dictionary(
+            forKey: SecurityScopedResourceAccess.fileBookmarksKey
+        ) ?? [:]
+        XCTAssertNotNil(bookmarks[url.standardizedFileURL.path] as? Data,
+                        "no bookmark stored for the file Save As created")
+    }
+
     /// D4: `Document.revision` is what tells the auto-save continuation whether
     /// the document it finds is still the one it encoded. A string comparison
     /// cannot see an edit-and-edit-back.

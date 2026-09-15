@@ -1371,6 +1371,7 @@ private struct EditorRepresentable: NSViewRepresentable {
             self.cursorState   = cursor
             self.boundTextView = textView
             if let editor = textView as? EditorTextView {
+                editor.isComparePane = comparePeer != nil
                 EditorCommandTarget.register(editor)
             }
             if let diffLayoutManager = textView.layoutManager as? DiffLayoutManager {
@@ -1706,6 +1707,7 @@ private struct EditorRepresentable: NSViewRepresentable {
             }
             comparePeer = peer
             compareSide = side
+            (boundTextView as? EditorTextView)?.isComparePane = peer != nil
             lastComparePeerID = peerID
             lastCompareSide = side
             return changed

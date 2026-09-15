@@ -864,7 +864,17 @@ final class EditorTextView: NSTextView {
             insertionPointColor = editorForegroundColor
             return
         }
-        font = editorFont
+        let newFont = editorFont
+        let fontChanged = font != newFont
+        // The scroll offset is in points, so a size change that reflows every
+        // line would otherwise land the view somewhere else in the document.
+        // Not in a compare pane: the anchor scroll is broadcast to the peer as a
+        // fraction of a frame laid out only down to the anchor — about 1.0 —
+        // which sent the other pane to the end of its file.
+        let topAnchor = fontChanged && !isComparePane && font?.pointSize != newFont.pointSize
+            ? topVisibleCharacterIndex()
+            : nil
+        font = newFont
         textColor = editorForegroundColor
         insertionPointColor = editorForegroundColor
         selectedTextAttributes = [
@@ -873,7 +883,87 @@ final class EditorTextView: NSTextView {
         ]
         applyIndentationVisualSettings()
         applyWordWrapSetting()
+        // `font =` sets the font over the whole storage, so the Thai fallback
+        // the sweep put there is gone and has to be put back at the new size.
+        if fontChanged {
+            applyThaiFontFallback()
+        }
+        if let topAnchor {
+            scrollCharacterToTop(topAnchor)
+        }
         needsDisplay = true
+    }
+
+    /// Set by the coordinator while this view is one side of a compare.
+    var isComparePane = false
+
+    // MARK: - Trackpad pinch
+
+    private var pinchStartFontSize: Double?
+    private var pinchMagnification: CGFloat = 0
+
+    /// Pinch sets the editor font size — the same preference as the Settings
+    /// slider, so every open editor follows and the size is remembered.
+    override func magnify(with event: NSEvent) {
+        guard let preferences else { return super.magnify(with: event) }
+        if event.phase == .began || pinchStartFontSize == nil {
+            pinchStartFontSize = preferences.editorFontSize
+            pinchMagnification = 0
+        }
+        pinchMagnification += event.magnification
+        let size = Self.pinchedFontSize(
+            from: pinchStartFontSize ?? preferences.editorFontSize,
+            magnification: pinchMagnification
+        )
+        if size != preferences.editorFontSize {
+            preferences.editorFontSize = size
+        }
+        if event.phase == .ended || event.phase == .cancelled {
+            pinchStartFontSize = nil
+        }
+    }
+
+    /// Whole points, clamped to the Settings slider's range.
+    static func pinchedFontSize(from start: Double, magnification: CGFloat) -> Double {
+        let range = AppPreferences.editorFontSizeRange
+        let scaled = (start * Double(1 + magnification)).rounded()
+        return min(max(scaled, range.lowerBound), range.upperBound)
+    }
+
+    private func topVisibleCharacterIndex() -> Int? {
+        guard let layoutManager, let textContainer,
+              let clipView = enclosingScrollView?.contentView,
+              let length = textStorage?.length, length > 0
+        else { return nil }
+        let point = NSPoint(x: 0, y: clipView.bounds.minY - textContainerOrigin.y)
+        let glyph = layoutManager.glyphIndex(for: point, in: textContainer)
+        return layoutManager.characterIndexForGlyph(at: glyph)
+    }
+
+    private func scrollCharacterToTop(_ index: Int) {
+        guard let layoutManager, let textContainer, let scrollView = enclosingScrollView,
+              let length = textStorage?.length, index < length
+        else { return }
+        let clipView = scrollView.contentView
+        let y: CGFloat
+        if index == 0 {
+            y = 0
+        } else {
+            let glyph = layoutManager.glyphIndexForCharacter(at: index)
+            let line = layoutManager.lineFragmentRect(forGlyphAt: glyph, effectiveRange: nil)
+            // The view is only as tall as what has been laid out, and the clip
+            // view clamps to it — laid out to the anchor alone, a zoom out
+            // stopped a screenful short of it.
+            layoutManager.ensureLayout(
+                forBoundingRect: NSRect(x: 0, y: line.minY,
+                                        width: textContainer.size.width,
+                                        height: clipView.bounds.height),
+                in: textContainer
+            )
+            y = line.minY + textContainerOrigin.y
+        }
+        clipView.scroll(to: NSPoint(x: clipView.bounds.minX, y: y))
+        scrollView.reflectScrolledClipView(clipView)
     }
 
     func editorBaseAttributes() -> [NSAttributedString.Key: Any] {
