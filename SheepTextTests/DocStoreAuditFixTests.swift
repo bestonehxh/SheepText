@@ -715,3 +715,111 @@ final class SecurityScopeOwnershipTests: XCTestCase {
         )
     }
 }
+
+// MARK: - Open Recent on a file the sandbox has no grant for
+
+/// A recent entry is a plain path. When the security-scoped bookmark behind it
+/// was never stored, the read fails with NSFileReadNoPermissionError and the
+/// entry used to stay in the menu forever, unopenable. `open` now recognises
+/// that failure and offers the open panel (not driven here — it is modal), and
+/// recognises a file that is simply gone and drops it from the list.
+@MainActor
+final class RecentFileAccessRecoveryTests: XCTestCase {
+
+    private var dir: URL!
+
+    override func setUpWithError() throws {
+        dir = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+            .appendingPathComponent("sheeptext-access-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    }
+
+    override func tearDownWithError() throws {
+        if let dir {
+            try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: dir.path)
+            try? FileManager.default.removeItem(at: dir)
+        }
+    }
+
+    func testPermissionFailureIsRecognisedIncludingWrappedPOSIXErrors() {
+        let cocoa = NSError(domain: NSCocoaErrorDomain, code: NSFileReadNoPermissionError)
+        XCTAssertTrue(DocumentStore.isPermissionFailure(cocoa))
+
+        let posix = NSError(domain: NSPOSIXErrorDomain, code: Int(EACCES))
+        XCTAssertTrue(DocumentStore.isPermissionFailure(posix))
+
+        let wrapped = NSError(
+            domain: NSCocoaErrorDomain,
+            code: NSFileReadUnknownError,
+            userInfo: [NSUnderlyingErrorKey: posix]
+        )
+        XCTAssertTrue(DocumentStore.isPermissionFailure(wrapped))
+
+        XCTAssertFalse(DocumentStore.isPermissionFailure(
+            NSError(domain: NSCocoaErrorDomain, code: NSFileReadNoSuchFileError)
+        ))
+        XCTAssertFalse(DocumentStore.isPermissionFailure(
+            NSError(domain: NSCocoaErrorDomain, code: NSFileReadInapplicableStringEncodingError)
+        ))
+    }
+
+    func testMissingFileFailureIsRecognisedAndIsNotAPermissionFailure() {
+        let missing = NSError(domain: NSCocoaErrorDomain, code: NSFileReadNoSuchFileError)
+        XCTAssertTrue(DocumentStore.isMissingFileFailure(missing))
+        XCTAssertTrue(DocumentStore.isMissingFileFailure(
+            NSError(domain: NSPOSIXErrorDomain, code: Int(ENOENT))
+        ))
+        XCTAssertFalse(DocumentStore.isMissingFileFailure(
+            NSError(domain: NSCocoaErrorDomain, code: NSFileReadNoPermissionError)
+        ))
+    }
+
+    func testUnreadableFileDoesNotEnterTheRecentList() throws {
+        let url = dir.appendingPathComponent("locked.txt")
+        try "secret".write(to: url, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o000], ofItemAtPath: url.path)
+        defer { try? FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: url.path) }
+
+        // Sanity: this really is a permission failure, and it is the shape the
+        // recovery path keys on.
+        do {
+            _ = try TextFileIO.read(url: url)
+            XCTFail("expected the read to be refused")
+        } catch {
+            XCTAssertTrue(DocumentStore.isPermissionFailure(error), "got \(error)")
+        }
+
+        let store = DocumentStore()
+        // showError: false — no alert, no panel, and no retry.
+        XCTAssertNil(store.open(url: url, showError: false))
+        XCTAssertFalse(store.recentFiles.contains { $0.path == url.path })
+    }
+
+    func testRemoveRecentDropsTheEntryAndPersists() throws {
+        let url = dir.appendingPathComponent("present.txt")
+        try "hello".write(to: url, atomically: true, encoding: .utf8)
+
+        let store = DocumentStore()
+        XCTAssertNotNil(store.open(url: url))
+        XCTAssertTrue(store.recentFiles.contains { $0.canonicalFileURL == url.canonicalFileURL })
+
+        store.removeRecent(url)
+        XCTAssertFalse(store.recentFiles.contains { $0.canonicalFileURL == url.canonicalFileURL })
+
+        let persisted = AppStorageLocation.defaults.array(forKey: "sheeptext.recentFiles") as? [String] ?? []
+        XCTAssertFalse(persisted.contains(url.path))
+    }
+
+    func testOpeningADeletedRecentFileDropsItFromTheList() throws {
+        let url = dir.appendingPathComponent("vanishes.txt")
+        try "hello".write(to: url, atomically: true, encoding: .utf8)
+
+        let store = DocumentStore()
+        XCTAssertNotNil(store.open(url: url))
+        store.closeAllTabs()
+        try FileManager.default.removeItem(at: url)
+
+        XCTAssertNil(store.open(url: url, showError: false))
+        XCTAssertFalse(store.recentFiles.contains { $0.canonicalFileURL == url.canonicalFileURL })
+    }
+}

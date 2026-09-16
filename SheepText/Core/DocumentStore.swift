@@ -125,7 +125,8 @@ final class DocumentStore {
         url: URL,
         rememberRecent: Bool = true,
         showError: Bool = true,
-        preferences: AppPreferences? = nil
+        preferences: AppPreferences? = nil,
+        allowsAccessRecovery: Bool = true
     ) -> Document? {
         let preferences = preferences ?? AppPreferences.current
         let accessibleURL = SecurityScopedResourceAccess.prepare(
@@ -167,6 +168,30 @@ final class DocumentStore {
                 decoded = try TextFileIO.read(url: accessibleURL)
             }
         } catch {
+            // A sandboxed app reads a file only through a grant: the open
+            // panel, a drop, LaunchServices, or a security-scoped bookmark
+            // saved from one of those. Open Recent and the restored session
+            // keep a plain path, so an entry whose bookmark was never stored
+            // (or no longer resolves) fails here with
+            // NSFileReadNoPermissionError — and that used to be the end of it:
+            // the file kept its place in the menu, unopenable, with nothing
+            // the user could do but find it in Open… by hand. Offer the panel
+            // instead, then retry once with the grant it hands back.
+            if showError,
+               allowsAccessRecovery,
+               Self.isPermissionFailure(error),
+               let granted = promptForAccess(to: accessibleURL) {
+                return open(
+                    url: granted,
+                    rememberRecent: rememberRecent,
+                    showError: showError,
+                    preferences: preferences,
+                    allowsAccessRecovery: false
+                )
+            }
+            if Self.isMissingFileFailure(error) {
+                removeRecent(accessibleURL)
+            }
             if showError {
                 NSAlert.show(message: "Cannot open \(accessibleURL.lastPathComponent): \(error.localizedDescription)", style: .warning)
             }
@@ -1080,6 +1105,15 @@ final class DocumentStore {
         _ = open(url: recentFiles[index])
     }
 
+    /// Drop one entry — a file that is gone, so re-opening it can only fail.
+    func removeRecent(_ url: URL) {
+        let canonical = url.canonicalFileURL
+        let before = recentFiles.count
+        recentFiles.removeAll { $0.canonicalFileURL == canonical }
+        guard recentFiles.count != before else { return }
+        persistRecentFiles()
+    }
+
     func clearRecentFiles() {
         recentFiles.removeAll()
         persistRecentFiles()
@@ -1622,6 +1656,77 @@ final class DocumentStore {
     /// Returns true when the user chose to open it anyway. Defaults to Cancel:
     /// the destructive outcome here is silent and unrecoverable, so it should
     /// not be one Return keypress away.
+    // MARK: - Sandbox access recovery
+
+    /// Reads that fail because the sandbox has no grant for this path, as
+    /// opposed to a file that is genuinely unreadable. `Data(contentsOf:)`
+    /// reports it as Cocoa's `NSFileReadNoPermissionError`; a lower-level
+    /// reader reports POSIX `EACCES`/`EPERM`, sometimes wrapped.
+    nonisolated static func isPermissionFailure(_ error: Error) -> Bool {
+        let ns = error as NSError
+        if ns.domain == NSCocoaErrorDomain, ns.code == NSFileReadNoPermissionError { return true }
+        if ns.domain == NSPOSIXErrorDomain, ns.code == Int(EACCES) || ns.code == Int(EPERM) { return true }
+        if let underlying = ns.userInfo[NSUnderlyingErrorKey] as? Error {
+            return isPermissionFailure(underlying)
+        }
+        return false
+    }
+
+    /// The file is not there at all — no panel can fix that, and the entry
+    /// that pointed at it should stop being offered.
+    nonisolated static func isMissingFileFailure(_ error: Error) -> Bool {
+        let ns = error as NSError
+        if ns.domain == NSCocoaErrorDomain,
+           ns.code == NSFileReadNoSuchFileError || ns.code == NSFileNoSuchFileError { return true }
+        if ns.domain == NSPOSIXErrorDomain, ns.code == Int(ENOENT) { return true }
+        if let underlying = ns.userInfo[NSUnderlyingErrorKey] as? Error {
+            return isMissingFileFailure(underlying)
+        }
+        return false
+    }
+
+    /// Ask the user to point at the file again, which is the only way a
+    /// sandboxed app can get its access back. The grant the panel hands over
+    /// is bookmarked immediately, so this is asked once per file, not once per
+    /// launch — and the returned URL is the instance that owns the scope, so
+    /// the retry must read through it.
+    private func promptForAccess(to url: URL) -> URL? {
+        let alert = NSAlert()
+        alert.messageText = "SheepText needs permission to open \(url.lastPathComponent)."
+        alert.informativeText = "macOS only lets SheepText read files you have picked yourself. Choose this file once and SheepText will remember it."
+        alert.addButton(withTitle: "Choose File…")
+        alert.addButton(withTitle: "Cancel")
+        alert.alertStyle = .warning
+        guard alert.runModal() == .alertFirstButtonReturn else { return nil }
+
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        panel.directoryURL = url.deletingLastPathComponent()
+        panel.message = "Choose \(url.lastPathComponent) to give SheepText access to it."
+        panel.prompt = "Grant Access"
+        guard panel.runModal() == .OK, let chosen = panel.url else { return nil }
+
+        guard chosen.canonicalFileURL == url.canonicalFileURL else {
+            NSAlert.show(
+                message: "That is a different file, so SheepText still cannot open \(url.lastPathComponent).",
+                style: .warning
+            )
+            return nil
+        }
+
+        SecurityScopedResourceAccess.remember(
+            chosen,
+            bookmarkKey: SecurityScopedResourceAccess.fileBookmarksKey
+        )
+        return SecurityScopedResourceAccess.prepare(
+            chosen,
+            bookmarkKey: SecurityScopedResourceAccess.fileBookmarksKey,
+            shouldRemember: false
+        )
+    }
+
     private func presentBinaryFileAlert(for url: URL) -> Bool {
         let alert = NSAlert()
         alert.messageText = "\(url.lastPathComponent) does not look like a text file."
