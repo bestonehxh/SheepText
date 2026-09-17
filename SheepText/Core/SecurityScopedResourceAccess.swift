@@ -30,6 +30,13 @@ nonisolated enum SecurityScopedResourceAccess {
     nonisolated(unsafe) private static var activeScopes: [String: URL] = [:]
 
     static func prepare(_ url: URL, bookmarkKey: String, shouldRemember: Bool) -> URL {
+        // Outside a sandbox there is nothing to grant and nothing to remember:
+        // the app reads whatever the user can read. Skipping the table here
+        // also skips rewriting the whole bookmark dictionary — which had grown
+        // to ~380 KB — on every open, every manual save and every file Find in
+        // Files touches.
+        guard AppStorageLocation.isSandboxed else { return url }
+
         let path = url.standardizedFileURL.path
 
         // Already scoped: skip the bookmark dictionary decode entirely. That
@@ -59,6 +66,8 @@ nonisolated enum SecurityScopedResourceAccess {
     }
 
     static func restore(path: String, bookmarkKey: String) -> URL {
+        guard AppStorageLocation.isSandboxed else { return URL(fileURLWithPath: path) }
+
         if let owner = activeScope(forPath: path) { return owner }
 
         if let resolved = resolveBookmark(forPath: path, bookmarkKey: bookmarkKey) {
@@ -73,6 +82,8 @@ nonisolated enum SecurityScopedResourceAccess {
     }
 
     static func remember(_ url: URL, bookmarkKey: String) {
+        guard AppStorageLocation.isSandboxed else { return }
+
         guard let data = try? url.bookmarkData(
             options: [.withSecurityScope],
             includingResourceValuesForKeys: nil,

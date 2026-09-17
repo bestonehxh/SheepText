@@ -333,11 +333,20 @@ final class DocumentSaveBehaviourTests: XCTestCase {
         XCTAssertTrue(store.saveAs(doc, to: url))
         XCTAssertEqual(try String(contentsOf: url, encoding: .utf8), "new file\n")
 
+        // Only inside a sandbox: 3.7 left it, and outside one there is no
+        // grant to keep — the file is readable because the user can read it.
+        // Both halves of this stay asserted so a build that goes back into a
+        // sandbox is still covered.
         let bookmarks = AppStorageLocation.defaults.dictionary(
             forKey: SecurityScopedResourceAccess.fileBookmarksKey
         ) ?? [:]
-        XCTAssertNotNil(bookmarks[url.standardizedFileURL.path] as? Data,
-                        "no bookmark stored for the file Save As created")
+        let stored = bookmarks[url.standardizedFileURL.path] as? Data
+        if AppStorageLocation.isSandboxed {
+            XCTAssertNotNil(stored, "no bookmark stored for the file Save As created")
+        } else {
+            XCTAssertNil(stored, "an unsandboxed build has no reason to store a bookmark")
+            XCTAssertTrue(bookmarks.isEmpty)
+        }
     }
 
     /// D4: `Document.revision` is what tells the auto-save continuation whether

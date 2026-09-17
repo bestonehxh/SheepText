@@ -43,7 +43,12 @@ nonisolated enum AppStorageLocation {
     /// `nonisolated(unsafe)`: `UserDefaults` is documented thread-safe but not
     /// marked `Sendable`, and this is a `let` initialised once.
     nonisolated(unsafe) static let defaults: UserDefaults = {
-        guard isHostedByXCTest else { return .standard }
+        guard isHostedByXCTest else {
+            // Before the first read, never after: 3.7 left the sandbox, and
+            // everything the user had is still inside the old container.
+            _ = didMigrateFromSandboxContainer
+            return .standard
+        }
         removeStaleTestSuites()
         let name = testSuitePrefix + String(ProcessInfo.processInfo.processIdentifier)
         // Start empty: a pid can be reused, and a test must not see what an
@@ -64,10 +69,111 @@ nonisolated enum AppStorageLocation {
             try? fm.removeItem(at: dir)
             return dir
         }
+        _ = didMigrateFromSandboxContainer
         let base = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
             ?? fm.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support", isDirectory: true)
         return base.appendingPathComponent("SheepText", isDirectory: true)
     }()
+
+    // MARK: - Leaving the sandbox (3.7)
+
+    /// True while the process runs inside an App Sandbox container.
+    ///
+    /// SheepText shipped sandboxed up to 3.6. macOS only lets a sandboxed app
+    /// read files the user picked in a panel, so Open Recent depended on a
+    /// security-scoped bookmark per file and dead-ended whenever one was
+    /// missing. 3.7 drops the sandbox: every path the user can read, SheepText
+    /// can open. Nothing in the app may assume either answer — the tests run
+    /// in whatever the host was built as.
+    static let isSandboxed: Bool = {
+        ProcessInfo.processInfo.environment["APP_SANDBOX_CONTAINER_ID"] != nil
+    }()
+
+    /// Set once in the destination domain when the container has been copied
+    /// out, so a later launch does not overwrite newer settings with the old
+    /// container's copy of them.
+    static let sandboxMigrationMarkerKey = "sheeptext.migratedFromSandboxContainer"
+
+    /// The old container's Data directory, whether or not it still exists.
+    static var sandboxContainerData: URL {
+        let bundleID = Bundle.main.bundleIdentifier ?? "Bestchaan.SheepText"
+        return FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Containers/\(bundleID)/Data", isDirectory: true)
+    }
+
+    /// Forced from `defaults` and `applicationSupport`, so it runs before the
+    /// first read of either and exactly once.
+    private static let didMigrateFromSandboxContainer: Bool = {
+        guard !isHostedByXCTest, !isSandboxed else { return false }
+        return migrateFromSandboxContainer(
+            container: sandboxContainerData,
+            bundleID: Bundle.main.bundleIdentifier ?? "Bestchaan.SheepText",
+            into: .standard,
+            applicationSupport: FileManager.default
+                .urls(for: .applicationSupportDirectory, in: .userDomainMask).first?
+                .appendingPathComponent("SheepText", isDirectory: true)
+        )
+    }()
+
+    /// Copy a sandbox container's settings and Application Support tree into
+    /// the plain user-domain locations an unsandboxed app reads.
+    ///
+    /// Settings are copied key by key and overwrite what is in the destination:
+    /// the destination domain holds whatever the app wrote before it was ever
+    /// sandboxed, which is years stale, while the container is the state the
+    /// user actually has. Files are copied item by item and never overwrite —
+    /// a draft already in the new location is newer than the container's.
+    /// The container is left untouched, so this is undoable by hand.
+    @discardableResult
+    static func migrateFromSandboxContainer(
+        container: URL,
+        bundleID: String,
+        into destination: UserDefaults,
+        applicationSupport: URL?
+    ) -> Bool {
+        let fm = FileManager.default
+        guard !destination.bool(forKey: sandboxMigrationMarkerKey),
+              fm.fileExists(atPath: container.path)
+        else { return false }
+
+        let plist = container
+            .appendingPathComponent("Library/Preferences/\(bundleID).plist")
+        if let data = try? Data(contentsOf: plist),
+           let stored = try? PropertyListSerialization.propertyList(
+               from: data, options: [], format: nil
+           ) as? [String: Any] {
+            for (key, value) in stored where key != sandboxMigrationMarkerKey {
+                destination.set(value, forKey: key)
+            }
+        }
+
+        if let applicationSupport {
+            let source = container
+                .appendingPathComponent("Library/Application Support/SheepText", isDirectory: true)
+            copyContents(of: source, into: applicationSupport)
+        }
+
+        destination.set(true, forKey: sandboxMigrationMarkerKey)
+        return true
+    }
+
+    /// Recursive copy that keeps whatever is already at the destination.
+    private static func copyContents(of source: URL, into destination: URL) {
+        let fm = FileManager.default
+        guard let names = try? fm.contentsOfDirectory(atPath: source.path) else { return }
+        try? fm.createDirectory(at: destination, withIntermediateDirectories: true)
+        for name in names {
+            let from = source.appendingPathComponent(name)
+            let to = destination.appendingPathComponent(name)
+            var isDirectory: ObjCBool = false
+            guard fm.fileExists(atPath: from.path, isDirectory: &isDirectory) else { continue }
+            if isDirectory.boolValue {
+                copyContents(of: from, into: to)
+            } else if !fm.fileExists(atPath: to.path) {
+                try? fm.copyItem(at: from, to: to)
+            }
+        }
+    }
 
     /// Suites whose test process is gone. Each test process makes one, and a
     /// test host that is killed rather than quit never cleans up after itself.

@@ -101,3 +101,125 @@ final class AppStorageLocationTests: XCTestCase {
         XCTAssertEqual(PluginPaths.appSupport, AppStorageLocation.applicationSupport)
     }
 }
+
+// MARK: - Leaving the sandbox (3.7)
+
+/// 3.6 and earlier ran sandboxed, so everything the user has — settings, the
+/// remembered tabs, recents, drafts and plugins — sits inside
+/// `~/Library/Containers/Bestchaan.SheepText/Data`. An unsandboxed build reads
+/// none of that, so without this migration the app comes up looking wiped.
+final class SandboxContainerMigrationTests: XCTestCase {
+
+    private var root: URL!
+    private var container: URL!
+    private var applicationSupport: URL!
+    private var suiteName: String!
+    private var destination: UserDefaults!
+
+    override func setUpWithError() throws {
+        root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("sheeptext-migration-\(UUID().uuidString)", isDirectory: true)
+        container = root.appendingPathComponent("Container/Data", isDirectory: true)
+        applicationSupport = root.appendingPathComponent("Application Support/SheepText", isDirectory: true)
+        suiteName = "Bestchaan.SheepText.migration.\(UUID().uuidString)"
+        destination = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+    }
+
+    override func tearDownWithError() throws {
+        UserDefaults().removePersistentDomain(forName: suiteName)
+        try? FileManager.default.removeItem(at: root)
+    }
+
+    private func seedContainer(preferences: [String: Any], files: [String: String]) throws {
+        let fm = FileManager.default
+        let prefs = container.appendingPathComponent("Library/Preferences", isDirectory: true)
+        try fm.createDirectory(at: prefs, withIntermediateDirectories: true)
+        let data = try PropertyListSerialization.data(
+            fromPropertyList: preferences, format: .binary, options: 0
+        )
+        try data.write(to: prefs.appendingPathComponent("Bestchaan.SheepText.plist"))
+
+        let support = container
+            .appendingPathComponent("Library/Application Support/SheepText", isDirectory: true)
+        for (path, contents) in files {
+            let url = support.appendingPathComponent(path)
+            try fm.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try contents.write(to: url, atomically: true, encoding: .utf8)
+        }
+    }
+
+    private func migrate() -> Bool {
+        AppStorageLocation.migrateFromSandboxContainer(
+            container: container,
+            bundleID: "Bestchaan.SheepText",
+            into: destination,
+            applicationSupport: applicationSupport
+        )
+    }
+
+    func testSettingsAndFilesComeAcrossAndTheMarkerIsSet() throws {
+        try seedContainer(
+            preferences: [
+                "sheeptext.recentFiles": ["/Users/someone/Documents/a.txt"],
+                "sheeptext.appearance.chromeStyle": "glass",
+            ],
+            files: ["Drafts/draft-1.json": "{}", "Plugins/hello/plugin.json": "{}"]
+        )
+
+        XCTAssertTrue(migrate())
+
+        XCTAssertEqual(
+            destination.array(forKey: "sheeptext.recentFiles") as? [String],
+            ["/Users/someone/Documents/a.txt"]
+        )
+        XCTAssertEqual(destination.string(forKey: "sheeptext.appearance.chromeStyle"), "glass")
+        XCTAssertTrue(destination.bool(forKey: AppStorageLocation.sandboxMigrationMarkerKey))
+
+        let fm = FileManager.default
+        XCTAssertTrue(fm.fileExists(atPath: applicationSupport.appendingPathComponent("Drafts/draft-1.json").path))
+        XCTAssertTrue(fm.fileExists(atPath: applicationSupport.appendingPathComponent("Plugins/hello/plugin.json").path))
+        // The container is left exactly where it was, so this is undoable.
+        XCTAssertTrue(fm.fileExists(atPath: container.path))
+    }
+
+    func testASecondLaunchDoesNotOverwriteNewerSettings() throws {
+        try seedContainer(preferences: ["sheeptext.editor.fontSize": 13.0], files: [:])
+        XCTAssertTrue(migrate())
+
+        destination.set(18.0, forKey: "sheeptext.editor.fontSize")
+        XCTAssertFalse(migrate(), "the migration must run once, not on every launch")
+        XCTAssertEqual(destination.double(forKey: "sheeptext.editor.fontSize"), 18.0)
+    }
+
+    func testAFileAlreadyInTheNewLocationIsKept() throws {
+        try seedContainer(preferences: [:], files: ["Drafts/draft-1.json": "from the container"])
+        let existing = applicationSupport.appendingPathComponent("Drafts/draft-1.json")
+        try FileManager.default.createDirectory(
+            at: existing.deletingLastPathComponent(), withIntermediateDirectories: true
+        )
+        try "newer".write(to: existing, atomically: true, encoding: .utf8)
+
+        XCTAssertTrue(migrate())
+        XCTAssertEqual(try String(contentsOf: existing, encoding: .utf8), "newer")
+    }
+
+    func testNoContainerMeansNothingToDo() {
+        XCTAssertFalse(migrate())
+        XCTAssertFalse(destination.bool(forKey: AppStorageLocation.sandboxMigrationMarkerKey))
+    }
+
+    func testTheShippingBuildIsNotSandboxedSoNoBookmarkIsNeeded() {
+        // The bookmark table only exists to work around the sandbox; if a
+        // build ever goes back inside one, prepare() must start storing again.
+        XCTAssertFalse(AppStorageLocation.isSandboxed)
+        let url = URL(fileURLWithPath: "/Users/someone/Documents/a.txt")
+        XCTAssertEqual(
+            SecurityScopedResourceAccess.prepare(
+                url,
+                bookmarkKey: SecurityScopedResourceAccess.fileBookmarksKey,
+                shouldRemember: true
+            ),
+            url
+        )
+    }
+}
