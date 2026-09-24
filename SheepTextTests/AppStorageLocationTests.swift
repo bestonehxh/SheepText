@@ -98,14 +98,13 @@ final class AppStorageLocationTests: XCTestCase {
         let path = AppStorageLocation.applicationSupport.standardizedFileURL.path
         let temp = FileManager.default.temporaryDirectory.standardizedFileURL.path
         XCTAssertTrue(path.hasPrefix(temp), "\(path) is not under \(temp)")
-        XCTAssertEqual(PluginPaths.appSupport, AppStorageLocation.applicationSupport)
     }
 }
 
 // MARK: - Leaving the sandbox (3.7)
 
 /// 3.6 and earlier ran sandboxed, so everything the user has — settings, the
-/// remembered tabs, recents, drafts and plugins — sits inside
+/// remembered tabs, recents and drafts — sits inside
 /// `~/Library/Containers/Bestchaan.SheepText/Data`. An unsandboxed build reads
 /// none of that, so without this migration the app comes up looking wiped.
 final class SandboxContainerMigrationTests: XCTestCase {
@@ -163,7 +162,7 @@ final class SandboxContainerMigrationTests: XCTestCase {
                 "sheeptext.recentFiles": ["/Users/someone/Documents/a.txt"],
                 "sheeptext.appearance.chromeStyle": "glass",
             ],
-            files: ["Drafts/draft-1.json": "{}", "Plugins/hello/plugin.json": "{}"]
+            files: ["Drafts/draft-1.json": "{}", "Backups/a.txt.bak": "old"]
         )
 
         XCTAssertTrue(migrate())
@@ -177,7 +176,7 @@ final class SandboxContainerMigrationTests: XCTestCase {
 
         let fm = FileManager.default
         XCTAssertTrue(fm.fileExists(atPath: applicationSupport.appendingPathComponent("Drafts/draft-1.json").path))
-        XCTAssertTrue(fm.fileExists(atPath: applicationSupport.appendingPathComponent("Plugins/hello/plugin.json").path))
+        XCTAssertTrue(fm.fileExists(atPath: applicationSupport.appendingPathComponent("Backups/a.txt.bak").path))
         // The container is left exactly where it was, so this is undoable.
         XCTAssertTrue(fm.fileExists(atPath: container.path))
     }

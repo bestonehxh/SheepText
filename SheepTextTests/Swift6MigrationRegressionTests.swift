@@ -113,33 +113,6 @@ final class Swift6AppKitRegressionTests: XCTestCase {
         SyntaxEngine.shared.discardSession(for: documentID)
     }
 
-    /// Plugin JS runs on the main thread (PluginHost is @MainActor), so a bridge
-    /// that unconditionally blocks on `DispatchQueue.main.sync` deadlocks the
-    /// app. This is the exact path the bundled hello-world plugin takes from
-    /// `hello.countLines` and `hello.reverseLine`.
-    ///
-    /// If this ever regresses the test will hang rather than fail — that is the
-    /// same symptom the user gets, and it is not something an assertion can
-    /// catch after the fact.
-    func testPluginBridgesDoNotDeadlockOnTheMainThread() {
-        XCTAssertTrue(Thread.isMainThread)
-
-        let bridge = EditorBridge()
-        // No key window in a unit test, so these take the "no editor" branch —
-        // which still crosses `pluginMainSync`, the part that used to hang.
-        XCTAssertEqual(bridge.getText(), "")
-        XCTAssertEqual(bridge.getLanguage(), "plaintext")
-        XCTAssertEqual(bridge.getCurrentLine()["number"] as? Int, 0)
-        bridge.replaceSelection("ignored")
-        bridge.replaceCurrentLine("ignored")
-
-        let workspace = WorkspaceBridge(workspace: nil)
-        XCTAssertEqual(workspace.getRootPath(), "")
-        XCTAssertTrue(workspace.findFiles("*.swift").isEmpty)
-
-        XCTAssertEqual(pluginMainSync { 41 + 1 }, 42)
-    }
-
     func testDiffLayoutManagerKeepsHighlightRangesAlignedAfterReplacement() {
         let storage = NSTextStorage(string: "aa\nbb\ncc\n")
         let layoutManager = DiffLayoutManager()

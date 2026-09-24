@@ -3,7 +3,7 @@
 //  SheepText
 //
 //  App entry point. Sets up the main WindowGroup, global menu commands,
-//  and bootstraps core services + the plugin manager.
+//  and bootstraps core services.
 //
 
 import SwiftUI
@@ -28,12 +28,13 @@ struct SheepTextApp: App {
     @State private var palette   = CommandPaletteController()
     @State private var cursor    = CursorState()
     @State private var preferences = AppPreferences()
-    // The plugin subsystem was fully built but never instantiated: nothing
-    // constructed a PluginManager, so no plugin ever loaded and PluginsView —
-    // which reads it out of the environment — would have trapped had anything
-    // shown it. It is created here and handed to both scenes.
-    @State private var plugins = PluginManager()
     @State private var didRestoreSession = false
+    /// Launch-time work that must happen once per process, not once per window.
+    /// `.task` is attached to the window's content view, so closing the last
+    /// window with the red X and clicking the Dock icon runs the whole body
+    /// again — which re-registered every built-in command over whatever had
+    /// replaced it, and re-ran the update check.
+    @State private var didBootstrapServices = false
 
     var body: some Scene {
         WindowGroup("SheepText", id: "main") {
@@ -44,7 +45,6 @@ struct SheepTextApp: App {
                 .environment(palette)
                 .environment(cursor)
                 .environment(preferences)
-                .environment(plugins)
                 .preferredColorScheme(preferences.themeMode.colorScheme)
                 .tint(Color(nsColor: .bestTextAccent))
                 // No .frame here: MainWindowView sets its own minimum size
@@ -53,14 +53,20 @@ struct SheepTextApp: App {
                 .task {
                     applyTheme()
 
-                    // Register built-in commands before plugins load,
-                    // so plugins can override them if they wish.
-                    BuiltInCommands.registerAll(
-                        into: commands,
-                        workspace: workspace,
-                        documents: documents,
-                        palette: palette
-                    )
+                    // Everything under this flag is process-wide setup that a
+                    // second window must not repeat. Read once, because the
+                    // flag is set before the body reaches the update check.
+                    let isFirstWindow = !didBootstrapServices
+                    didBootstrapServices = true
+
+                    if isFirstWindow {
+                        BuiltInCommands.registerAll(
+                            into: commands,
+                            workspace: workspace,
+                            documents: documents,
+                            palette: palette
+                        )
+                    }
 
                     appDelegate.openFilesHandler = { urls in
                         documents.openExternalFileURLs(urls, preferences: preferences)
@@ -118,12 +124,10 @@ struct SheepTextApp: App {
                         }
                     }
 
-                    await plugins.loadAll(commands: commands, workspace: workspace)
-
                     // Not from a test host: its defaults start empty, so the
                     // check is always "due" and would reach GitHub — and could
                     // raise an update alert — on every test run.
-                    if !AppStorageLocation.isHostedByXCTest {
+                    if isFirstWindow, !AppStorageLocation.isHostedByXCTest {
                         UpdateChecker.shared.checkForUpdatesOnLaunchIfDue(preferences: preferences)
                     }
                 }
@@ -152,7 +156,6 @@ struct SheepTextApp: App {
         Settings {
             PreferencesView()
                 .environment(preferences)
-                .environment(plugins)
                 .preferredColorScheme(preferences.themeMode.colorScheme)
                 .tint(Color(nsColor: .bestTextAccent))
                 .onChange(of: preferences.themeMode) { _, _ in

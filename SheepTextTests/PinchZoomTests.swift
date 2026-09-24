@@ -153,6 +153,9 @@ final class PinchZoomTests: XCTestCase {
         XCTAssertEqual(topCharacter(f), line200, "zoom out moved the view")
     }
 
+    // `EditorViewAuditSeam` exists only in Debug; without this guard the whole
+    // test target fails to compile in Release and the perf harness cannot run.
+    #if DEBUG
     /// In a compare pane the anchor scroll was broadcast to the peer as a
     /// fraction of a frame laid out only down to the anchor — about 1.0 — and
     /// the other pane went to the end of its file. Compare panes keep their
@@ -183,6 +186,7 @@ final class PinchZoomTests: XCTestCase {
         probe.setComparePeer(nil)
         XCTAssertFalse(probe.textView.isComparePane)
     }
+    #endif
 
     /// `font =` replaces the font over the whole storage, and the Thai fallback
     /// was only swept onto a new storage — after any size change Thai text lost

@@ -57,9 +57,17 @@ final class DocumentStore {
     /// the guard is on this and not on `documents.isEmpty`.
     private var hasRestoredSession = false
     private var isCheckingExternalChanges = false
+    /// Session paths this launch could not reach — an unmounted volume, a File
+    /// Provider that has not come up yet. Kept so `persistSession` can write
+    /// them back instead of erasing them; see its comment.
+    private var unreachableSessionPaths: [String] = []
     private var draftSaveTasks: [Document.ID: Task<Void, Never>] = [:]
     private var draftSaveRevisions: [Document.ID: UUID] = [:]
     private var autoSaveTasks: [Document.ID: Task<Void, Never>] = [:]
+    /// The write each outstanding auto-save task handed to a background task.
+    /// Kept so a manual save, a Save As, a close or a quit can stop one that has
+    /// not begun and wait for one that has — see `cancelAutoSave`.
+    private var pendingAutoSaveWrites: [Document.ID: PendingDocumentWrite] = [:]
     /// Asked again when a scheduled auto save wakes, because the preference can
     /// be switched off while the task is sleeping and nothing cancels it.
     ///
@@ -71,11 +79,26 @@ final class DocumentStore {
     @ObservationIgnored var autoSaveIsEnabled: @MainActor () -> Bool = {
         AppPreferences.current?.autoSaveEnabled ?? false
     }
+    /// What a manual save should do when the file on disk no longer matches
+    /// what the document last recorded. A seam for the same reason
+    /// `autoSaveIsEnabled` is one: the test host is the real app, and an
+    /// `NSAlert` in a test run blocks the whole suite on a modal nobody clicks.
+    @ObservationIgnored var resolveExternalChangeAtSave: @MainActor (Document) -> ExternalChangeResolution = {
+        DocumentStore.presentExternalChangeAtSaveAlert(for: $0)
+    }
+    /// Called on the main actor the moment an auto-save write returns, before
+    /// the continuation looks at anything. Only `DocStoreAudit2FixTests` sets
+    /// it: it is the one place a test can land a cancellation inside the window
+    /// D2 is about.
+    @ObservationIgnored var autoSaveWriteDidFinish: (@MainActor () -> Void)?
     /// draftID → the revision this process last wrote to disk, so
     /// `deleteDraftFiles` can name the files instead of scanning the directory.
     /// `removeOlderDraftFiles` runs after every write, so this revision names the
     /// only files that exist for that draft.
     private var lastWrittenDraftRevisions: [UUID: UUID] = [:]
+    /// draftID → the `Document.revision` the draft on disk was written from, so
+    /// the quit-time flush can skip a draft that is already current.
+    private var lastWrittenDraftDocumentRevisions: [UUID: Int] = [:]
 
     var activeDocument: Document? {
         documents.first(where: { $0.id == activeDocumentID })
@@ -144,6 +167,17 @@ final class DocumentStore {
         }
 
         let fileByteCount = fileSize(for: accessibleURL)
+        // Before the read: `open` reads and decodes on the main actor, so a
+        // placeholder beachballs the whole app for the length of the download
+        // with no progress and no cancel — 223 MB, over the network, from a
+        // double-click in Open Recent. Asking first is the cheap half of the
+        // fix; moving the read off the main actor is the other half and is not
+        // done here.
+        if showError,
+           TextFileIO.isDataless(accessibleURL),
+           !presentDatalessFileAlert(for: accessibleURL, byteCount: fileByteCount) {
+            return nil
+        }
         if showError,
            preferences?.warnsWhenOpeningLargeFiles ?? true,
            let fileByteCount,
@@ -367,7 +401,12 @@ final class DocumentStore {
                 if doc.url == nil {
                     guard promptSaveAs(doc) else { return false }
                 } else {
-                    do { try saveNow(doc) } catch {
+                    do {
+                        // False means the user cancelled the "changed on disk"
+                        // prompt, so the close must not go ahead and discard
+                        // the edits they just declined to overwrite with.
+                        guard try saveNow(doc) else { return false }
+                    } catch {
                         NSAlert.show(message: "Save failed: \(error.localizedDescription)", style: .critical)
                         return false
                     }
@@ -570,8 +609,7 @@ final class DocumentStore {
             }
 
             do {
-                try saveNow(doc)
-                savedCount += 1
+                if try saveNow(doc) { savedCount += 1 }
             } catch {
                 failures.append("\(doc.displayName): \(error.localizedDescription)")
             }
@@ -605,6 +643,10 @@ final class DocumentStore {
         guard let doc = documents.first(where: { $0.id == id }) else { return }
         doc.encoding = encoding
         doc.hasBOM = encoding.writesBOMByDefault
+        // Picking another encoding is the fix the warning asks for, so it stops
+        // being shown before the next auto save has had a chance to try again.
+        doc.autoSaveFailureMessage = nil
+        doc.autoSaveFailureState = nil
         scheduleDraftSaveIfDirty(for: doc)
     }
 
@@ -703,8 +745,28 @@ final class DocumentStore {
             doc.encoding = .utf8WithBOM
         } else if doc.encoding == .utf8WithBOM, !hasBOM {
             doc.encoding = .utf8
+        } else if !hasBOM, let explicit = Self.endianExplicitEquivalent(of: doc.encoding) {
+            // `.utf16` / `.utf32` are the endian-agnostic entries, and
+            // Foundation's encoder writes a BOM for them unconditionally — so
+            // `encode` skips them (correctly) and `writeBOM` was a no-op in
+            // both directions. Turning the BOM off left the status bar saying
+            // "no BOM" over a file that still started FF FE. Move to the
+            // explicit-endian entry for the byte order Foundation was going to
+            // write anyway, which `encode` does honour.
+            doc.encoding = explicit
         }
         scheduleDraftSaveIfDirty(for: doc)
+    }
+
+    /// The little-endian spelling of an endian-agnostic Unicode encoding —
+    /// little because that is what Foundation's `.utf16` / `.utf32` encoders
+    /// emit, so the bytes after the BOM do not change.
+    private nonisolated static func endianExplicitEquivalent(of encoding: TextEncoding) -> TextEncoding? {
+        switch encoding {
+        case .utf16: return .utf16LE
+        case .utf32: return .utf32LE
+        default:     return nil
+        }
     }
 
     private func applyDocumentDefaults(
@@ -831,6 +893,12 @@ final class DocumentStore {
         doc.isDirty = false
         doc.wasRecoveredFromDraft = false
         doc.url = payload.url
+        // It has a file again, so the trashed name stops standing in for one.
+        doc.deletedFileName = nil
+        // The bytes went out, so whatever auto save was complaining about is
+        // no longer true.
+        doc.autoSaveFailureMessage = nil
+        doc.autoSaveFailureState = nil
         doc.savedText = payload.text
         // One stat, three consumers: large-file metrics, and the mtime/size pair
         // the external-change poll compares against.
@@ -851,11 +919,85 @@ final class DocumentStore {
         )
     }
 
-    private func saveNow(_ doc: Document) throws {
+    /// - Returns: whether the file was written. False means the user cancelled
+    ///   (or chose to reload) at the "changed on disk" prompt, or the document
+    ///   has no URL — either way the caller must NOT treat it as saved.
+    @discardableResult
+    private func saveNow(_ doc: Document) throws -> Bool {
+        // An older auto save may have this file's bytes in flight: stop it, or
+        // wait for it, before adding a second writer to the same path.
+        cancelAutoSave(for: doc.id)
+        guard resolveExternalChangeBeforeSave(doc) else { return false }
         applyManualSaveTransforms(doc)
-        guard let payload = try prepareSave(doc) else { return }
+        guard let payload = try prepareSave(doc) else { return false }
         try TextFileIO.writeData(payload.data, to: payload.url)
         commitSave(doc, payload: payload)
+        return true
+    }
+
+    /// What a save does when the file has changed since the document last
+    /// looked at it.
+    enum ExternalChangeResolution { case overwrite, reloadFromDisk, cancel }
+
+    /// True when the file at `url` is not the one the document last recorded.
+    ///
+    /// `diskModificationDate` / `diskFileSize` were maintained by
+    /// `captureDiskState` and compared only by the 4-second poll, so an
+    /// external rewrite that landed inside the poll window — a `git checkout`,
+    /// a formatter, a sync client — was overwritten by the next save with no
+    /// prompt at all. Both saves consult it now.
+    private func fileChangedSinceLastSeen(_ doc: Document, url: URL) -> Bool {
+        guard let knownModificationDate = doc.diskModificationDate else { return false }
+        let state = Self.readDiskState(of: url)
+        guard let currentModificationDate = state.modificationDate else {
+            // No stat at all: the file is gone, and writing it back is what the
+            // user asked for.
+            return false
+        }
+        if currentModificationDate != knownModificationDate { return true }
+        // Same rule as the poll: an mtime-preserving rewrite only moves this.
+        if let fileSize = state.fileSize, fileSize != doc.diskFileSize { return true }
+        return false
+    }
+
+    /// - Returns: whether the save should go ahead.
+    private func resolveExternalChangeBeforeSave(_ doc: Document) -> Bool {
+        guard let url = doc.accessibleURL ?? doc.url,
+              fileChangedSinceLastSeen(doc, url: url)
+        else { return true }
+
+        switch resolveExternalChangeAtSave(doc) {
+        case .overwrite:
+            return true
+        case .reloadFromDisk:
+            let modificationDate = (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?
+                .contentModificationDate
+            reloadDocumentFromDisk(doc, url: url, modificationDate: modificationDate ?? Date())
+            return false
+        case .cancel:
+            // Deliberately does NOT adopt the disk state: "cancel" is "not
+            // now", not "I have accepted the version on disk", so the next ⌘S
+            // asks again. Adopting is what "Keep My Changes" in the poll's own
+            // alert means, and that one is still reachable.
+            return false
+        }
+    }
+
+    /// Cancel is the first button, so Return is the non-destructive answer: both
+    /// of the others lose somebody's work.
+    private static func presentExternalChangeAtSaveAlert(for doc: Document) -> ExternalChangeResolution {
+        let alert = NSAlert()
+        alert.messageText = "\"\(doc.displayName)\" has changed on disk since you opened it."
+        alert.informativeText = "Saving replaces the version on disk with yours. Reloading discards your unsaved edits."
+        alert.addButton(withTitle: "Cancel")
+        alert.addButton(withTitle: "Overwrite")
+        alert.addButton(withTitle: "Reload from Disk")
+        alert.alertStyle = .warning
+        switch alert.runModal() {
+        case .alertSecondButtonReturn: return .overwrite
+        case .alertThirdButtonReturn:  return .reloadFromDisk
+        default:                        return .cancel
+        }
     }
 
     /// A file or folder was renamed or moved on disk **outside** the save path.
@@ -947,6 +1089,64 @@ final class DocumentStore {
         }
     }
 
+    /// A file or folder was moved to the Trash **outside** the document layer.
+    ///
+    /// The counterpart to `documentDidMove(from:to:)`, and it exists for the
+    /// same reason: the sidebar's Delete called `workspace.trash` and told the
+    /// store nothing, so the tab stayed open pointing at a path that no longer
+    /// existed — and ⌘S recreated the file there (a write to a missing path
+    /// succeeds), which is how a user who deleted a file and then reflexively
+    /// saved got it back. The four-second poll cannot cover for it either: a
+    /// missing file has no modification date, so `applyDiskStates` skips the
+    /// document entirely.
+    ///
+    /// A clean tab is closed — there is nothing to lose and nothing to show.
+    /// A dirty one stays, with `url` cleared so the next ⌘S goes through Save
+    /// As, which is the honest behaviour. Deleting a FOLDER takes everything
+    /// under it, so URLs are matched by path prefix, like the move path.
+    func documentWasDeleted(at url: URL) {
+        let deletedCanonical = url.canonicalFileURL
+        let deletedComponents = deletedCanonical.pathComponents
+        func isUnderDeletedPath(_ candidate: URL) -> Bool {
+            let canonical = candidate.canonicalFileURL
+            if canonical == deletedCanonical { return true }
+            // Components, not a string prefix: "/proj-secrets" starts with
+            // "/proj" and is a different directory. Same rule as the move path.
+            let components = canonical.pathComponents
+            guard components.count > deletedComponents.count else { return false }
+            return Array(components.prefix(deletedComponents.count)) == deletedComponents
+        }
+
+        var affectedURLs: [URL] = []
+        var cleanIDs: [Document.ID] = []
+        for doc in documents {
+            guard let docURL = doc.url, isUnderDeletedPath(docURL) else { continue }
+            affectedURLs.append(docURL)
+            guard doc.isDirty else {
+                cleanIDs.append(doc.id)
+                continue
+            }
+            doc.deletedFileName = docURL.lastPathComponent
+            doc.url = nil
+            doc.accessibleURL = nil
+            doc.diskModificationDate = nil
+            doc.diskFileSize = nil
+            doc.externalChangeWarningDate = nil
+            doc.savedText = nil
+            // The file is gone, so the draft is now the only copy of the edits.
+            scheduleDraftSaveIfDirty(for: doc)
+        }
+
+        for id in cleanIDs {
+            // Clean, so this cannot prompt.
+            close(id)
+        }
+        for affected in affectedURLs {
+            removeRecent(affected)
+        }
+        persistSession()
+    }
+
     /// Show an NSSavePanel and, if the user confirms, write and update the
     /// document's URL. Returns true if the save happened.
     /// Pre-fills the filename; appends date+counter if that name already
@@ -964,12 +1164,39 @@ final class DocumentStore {
         return saveAs(doc, to: urlByAddingDefaultTextExtensionIfNeeded(selectedURL))
     }
 
+    /// Reported when Save As is aimed at a file another tab already holds.
+    /// A seam, like the other alerts here, so a test does not block on a modal.
+    @ObservationIgnored var reportSaveAsConflict: @MainActor (Document, Document) -> Void = { target, existing in
+        NSAlert.show(
+            message: "\"\(existing.displayName)\" is already open in another tab. "
+                + "Close that tab first, or choose a different name for \"\(target.displayName)\".",
+            style: .warning
+        )
+    }
+
     /// The write half of Save As, for a URL the save panel has just granted.
     func saveAs(_ doc: Document, to url: URL) -> Bool {
+        // `open(url:)` dedupes by canonical URL — that was the fix for "two tabs
+        // onto one file, each overwriting the other's save" — but Save As had
+        // no such check, so it could create exactly that state from the other
+        // direction. NSSavePanel's own "replace?" prompt is about the file on
+        // disk, not about the app's own tabs.
+        if let existing = documents.first(where: {
+            $0.id != doc.id && $0.url?.canonicalFileURL == url.canonicalFileURL
+        }) {
+            reportSaveAsConflict(doc, existing)
+            return false
+        }
+
         // Routed through prepareSave/commitSave rather than keeping a second,
         // drifting copy of the save logic. doc.url has to move first (that is
         // what prepareSave encodes for) and is put back if the write fails, so
         // a cancelled/failed Save As leaves the document exactly as it was.
+        // Before doc.url moves: an auto save still aimed at the OLD path would
+        // otherwise land after this one, and its continuation would find the
+        // document pointing somewhere else.
+        cancelAutoSave(for: doc.id)
+
         let previousURL = doc.url
         doc.url = url
         do {
@@ -1079,7 +1306,7 @@ final class DocumentStore {
                         guard promptSaveAs(doc) else { return .terminateCancel }
                     } else {
                         do {
-                            try saveNow(doc)
+                            guard try saveNow(doc) else { return .terminateCancel }
                         } catch {
                             NSAlert.show(message: "Save failed: \(error.localizedDescription)", style: .critical)
                             return .terminateCancel
@@ -1094,8 +1321,46 @@ final class DocumentStore {
             }
         }
 
+        flushPendingAutoSaves()
         flushDirtyDraftsImmediately()
         return .terminateNow
+    }
+
+    /// Run the auto saves that would otherwise die with the process.
+    ///
+    /// A scheduled auto save is a `Task` asleep for up to the configured delay,
+    /// and `.terminateNow` neither wakes it nor waits for a write already in
+    /// flight — so ⌘Q inside that window silently dropped the edits. With
+    /// "ask before closing" off (which is exactly the preference a user who
+    /// relies on auto save turns off) nothing asked, and with backups off there
+    /// was not even a draft left.
+    ///
+    /// Deliberately not conditional on `askBeforeClosingUnsavedDocuments`: the
+    /// prompt above has already dealt with anything the user answered, and a
+    /// document they chose "Don't Save" for is no longer dirty.
+    ///
+    /// A failure here does not cancel the quit. The draft written immediately
+    /// afterwards is the fallback, and stopping ⌘Q on an alert about a file the
+    /// user was not thinking about is worse than the log line.
+    private func flushPendingAutoSaves() {
+        let isEnabled = autoSaveIsEnabled()
+        for doc in documents {
+            // Whether or not we are about to write, this waits out a write that
+            // is already in flight — nothing else does.
+            cancelAutoSave(for: doc.id)
+            guard isEnabled, doc.isDirty, let url = doc.accessibleURL ?? doc.url else { continue }
+            // Same rule as every other save: do not overwrite an external
+            // change. There is nobody to ask at quit, so the draft keeps it.
+            guard !fileChangedSinceLastSeen(doc, url: url) else { continue }
+            do {
+                guard let payload = try prepareSave(doc, rememberBookmark: false) else { continue }
+                try TextFileIO.writeData(payload.data, to: payload.url)
+                commitSave(doc, payload: payload, isAutoSave: true)
+                doc.lastAutoSavedAt = Date()
+            } catch {
+                Logger.app.error("Auto save at quit failed for \(doc.displayName): \(error.localizedDescription)")
+            }
+        }
     }
 
     // MARK: - Recent files
@@ -1108,6 +1373,13 @@ final class DocumentStore {
     /// Drop one entry — a file that is gone, so re-opening it can only fail.
     func removeRecent(_ url: URL) {
         let canonical = url.canonicalFileURL
+        // The one place that knows a file is really gone rather than merely
+        // unreachable, so it is also where a remembered session path is
+        // dropped for good.
+        let sessionPathsBefore = unreachableSessionPaths.count
+        unreachableSessionPaths.removeAll { URL(fileURLWithPath: $0).canonicalFileURL == canonical }
+        if unreachableSessionPaths.count != sessionPathsBefore { persistSession() }
+
         let before = recentFiles.count
         recentFiles.removeAll { $0.canonicalFileURL == canonical }
         guard recentFiles.count != before else { return }
@@ -1128,10 +1400,23 @@ final class DocumentStore {
         persistRecentFiles()
     }
 
+    /// **No existence filter.** It used to drop every path that failed
+    /// `fileExists` — which is also what an unmounted volume answers — and the
+    /// next `addRecent` / `removeRecent` / `documentDidMove` wrote the pruned
+    /// list back, so the entries were gone for good. This user's files live
+    /// under `~/Library/CloudStorage/OneDrive-…`, a File Provider mount the
+    /// daemon brings up asynchronously after login: launching before it is
+    /// ready emptied Open Recent permanently. Ejecting an external disk or
+    /// being off the VPN did the same.
+    ///
+    /// "Gone" has exactly one honest signal, and `open()` already acts on it:
+    /// a read that fails with `isMissingFileFailure` calls `removeRecent`.
+    /// (Dropping the filter also takes 20 `fileExists` calls off the main
+    /// actor at launch, one of which stalling is the whole window's first
+    /// frame — DP4.)
     private func loadRecentFiles() {
         guard let paths = AppStorageLocation.defaults.array(forKey: recentKey) as? [String] else { return }
         recentFiles = paths.map { URL(fileURLWithPath: $0) }
-            .filter { FileManager.default.fileExists(atPath: $0.path) }
     }
 
     private func persistRecentFiles() {
@@ -1142,7 +1427,12 @@ final class DocumentStore {
     private func persistSession() {
         guard !isRestoringSession else { return }
         let defaults = AppStorageLocation.defaults
-        let paths = documents.compactMap { $0.url?.path }
+        var paths = documents.compactMap { $0.url?.path }
+        // Same rule as the recents: a tab this launch could not reach is not a
+        // tab the user closed. Dropping it here and persisting the result is
+        // how a launch before the OneDrive mount erased the whole session.
+        let openPaths = Set(paths)
+        paths.append(contentsOf: unreachableSessionPaths.filter { !openPaths.contains($0) })
         defaults.set(paths, forKey: sessionOpenFilesKey)
 
         if let activePath = activeDocument?.url?.path {
@@ -1199,9 +1489,39 @@ final class DocumentStore {
         NSWorkspace.shared.activateFileViewerSelecting([record.metadataURL])
     }
 
-    func scheduleAutoSave(for id: Document.ID, isEnabled: Bool, delay: TimeInterval) {
+    /// Whether a scheduled or in-flight auto save is still outstanding.
+    ///
+    /// ⌘S, Save As, close and quit all have to leave this false for the
+    /// document they just wrote, or a write they superseded lands after theirs.
+    func hasOutstandingAutoSave(for id: Document.ID) -> Bool {
+        autoSaveTasks[id] != nil
+    }
+
+    /// Stop this document's auto save: a scheduled one never runs, an in-flight
+    /// write is prevented if it has not begun, and this returns only once a
+    /// write that HAS begun has finished.
+    ///
+    /// The wait is what makes it safe for a caller that is about to write the
+    /// same file itself. `Task.detached` is not a child task, so cancelling the
+    /// auto-save task never stopped its write — two `mkstemp` + `rename` pairs
+    /// raced for one path with no ordering between them, and "Don't Save" at
+    /// close still wrote the edits the user had just declined.
+    private func cancelAutoSave(for id: Document.ID) {
         autoSaveTasks[id]?.cancel()
         autoSaveTasks[id] = nil
+        pendingAutoSaveWrites.removeValue(forKey: id)?.cancel()
+    }
+
+    /// Clear the bookkeeping for a finished write — unless a newer auto save
+    /// has already replaced it, in which case it owns those slots now.
+    private func finishAutoSaveWrite(for id: Document.ID, write: PendingDocumentWrite) {
+        guard pendingAutoSaveWrites[id] === write else { return }
+        pendingAutoSaveWrites[id] = nil
+        autoSaveTasks[id] = nil
+    }
+
+    func scheduleAutoSave(for id: Document.ID, isEnabled: Bool, delay: TimeInterval) {
+        cancelAutoSave(for: id)
 
         guard isEnabled,
               delay > 0,
@@ -1237,11 +1557,23 @@ final class DocumentStore {
             return
         }
 
+        // Nothing has changed since the last diagnosis, so the encode would
+        // fail in exactly the same way. Retrying it on every keystroke is how
+        // this stayed invisible.
+        if let failure = doc.autoSaveFailureState,
+           failure.revision == doc.revision,
+           failure.encoding == doc.encoding {
+            autoSaveTasks[id] = nil
+            return
+        }
+
         let payload: SavePayload?
         do {
             payload = try prepareSave(doc, rememberBookmark: false)
         } catch {
             autoSaveTasks[id] = nil
+            doc.autoSaveFailureMessage = error.localizedDescription
+            doc.autoSaveFailureState = (doc.revision, doc.encoding)
             Logger.app.error("Auto save failed for \(doc.displayName): \(error.localizedDescription)")
             return
         }
@@ -1250,24 +1582,37 @@ final class DocumentStore {
             return
         }
 
+        // Auto save must not overwrite an external change either. The poll is
+        // the path that knows how to ask about one; this just stays out of its
+        // way and leaves the document dirty.
+        if fileChangedSinceLastSeen(doc, url: payload.url) {
+            autoSaveTasks[id] = nil
+            return
+        }
+
         let name = doc.displayName
-        // The atomic replace is the slow half and it needs nothing from the
-        // main actor, so it runs off it. Auto save fires on a timer while the
-        // user is typing; it used to write the whole file inline.
+        // The replace is the slow half and it needs nothing from the main
+        // actor, so it runs off it. Auto save fires on a timer while the user
+        // is typing; it used to write the whole file inline.
+        let write = PendingDocumentWrite()
+        pendingAutoSaveWrites[id] = write
         autoSaveTasks[id] = Task { [weak self] in
-            guard !Task.isCancelled else { return }
+            let didWrite: Bool
             do {
-                try await Task.detached(priority: .utility) {
-                    try TextFileIO.writeData(payload.data, to: payload.url)
+                didWrite = try await Task.detached(priority: .utility) {
+                    try write.run { try TextFileIO.writeData(payload.data, to: payload.url) }
                 }.value
             } catch {
-                self?.autoSaveTasks[id] = nil
+                self?.finishAutoSaveWrite(for: id, write: write)
                 Logger.app.error("Auto save failed for \(name): \(error.localizedDescription)")
                 return
             }
 
-            guard let self, !Task.isCancelled else { return }
-            self.autoSaveTasks[id] = nil
+            guard let self else { return }
+            // Before the bookkeeping, so the seam sees exactly what a keystroke
+            // landing here sees: a task that is still this document's.
+            self.autoSaveWriteDidFinish?()
+            self.finishAutoSaveWrite(for: id, write: write)
             guard let doc = self.documents.first(where: { $0.id == id }) else { return }
 
             // The bytes are on disk at payload.url. Whether they are still THIS
@@ -1279,17 +1624,23 @@ final class DocumentStore {
             //     `text.didSet`, so this catches an edit-and-edit-back too,
             //     which a string comparison does not.
             let isSameFile = doc.url?.canonicalFileURL == payload.url.canonicalFileURL
-            guard isSameFile, doc.revision == payload.revision else {
-                // Leave the document dirty; the next scheduleAutoSave writes the
-                // new text. But the file's mtime moved because *we* wrote it —
-                // without adopting it, the 4 s disk poll reports the app's own
-                // auto save as an external change and offers to reload, which
-                // discards the user's edits.
-                if isSameFile {
-                    self.captureDiskState(of: payload.url, into: doc)
-                }
-                return
+
+            // Adopting the file's new state comes FIRST, before any early
+            // return, because the mtime moved because *we* wrote it. Without
+            // that, the 4 s disk poll reports the app's own auto save as an
+            // external change and offers to reload, which discards the user's
+            // edits and their draft. The cancellation guard below used to sit
+            // above this and return on exactly the common case: a keystroke
+            // landing while the bytes were in flight cancels the task, and
+            // cancelling never stopped the write.
+            if didWrite, isSameFile {
+                self.captureDiskState(of: payload.url, into: doc)
             }
+
+            guard didWrite, !Task.isCancelled else { return }
+            // Leave the document dirty when it moved on; the next
+            // scheduleAutoSave writes the new text.
+            guard isSameFile, doc.revision == payload.revision else { return }
             self.commitSave(doc, payload: payload, isAutoSave: true)
             doc.lastAutoSavedAt = Date()
         }
@@ -1333,7 +1684,8 @@ final class DocumentStore {
             self.cleanupDraftAfterWrite(
                 documentID: id,
                 draftID: payload.draftID,
-                revisionID: payload.revisionID
+                revisionID: payload.revisionID,
+                documentRevision: payload.documentRevision
             )
         }
     }
@@ -1367,6 +1719,7 @@ final class DocumentStore {
         return DraftPayload(
             draftID: draftID,
             revisionID: revisionID,
+            documentRevision: doc.revision,
             snapshotData: snapshotData,
             text: doc.text,
             draftsDirectory: draftsDirectory,
@@ -1375,7 +1728,12 @@ final class DocumentStore {
         )
     }
 
-    private func cleanupDraftAfterWrite(documentID: Document.ID, draftID: UUID, revisionID: UUID) {
+    private func cleanupDraftAfterWrite(
+        documentID: Document.ID,
+        draftID: UUID,
+        revisionID: UUID,
+        documentRevision: Int
+    ) {
         guard let doc = documents.first(where: { $0.id == documentID }),
               doc.draftID == draftID,
               doc.isDirty
@@ -1385,16 +1743,39 @@ final class DocumentStore {
         }
 
         guard draftSaveRevisions[documentID] == revisionID else { return }
-        lastWrittenDraftRevisions[draftID] = revisionID
+        let previousRevisionID = lastWrittenDraftRevisions.updateValue(revisionID, forKey: draftID)
+        lastWrittenDraftDocumentRevisions[draftID] = documentRevision
         doc.lastDraftSavedAt = Date()
         draftSaveTasks[documentID] = nil
         draftSaveRevisions[documentID] = nil
-        removeOlderDraftFiles(for: draftID, keeping: revisionID)
+
+        // A draft write happens 1.5 s after the user stops typing, per
+        // document, and this used to enumerate the whole Drafts directory and
+        // prefix-match every entry each time — O(accumulated drafts) per pause
+        // in typing. When this process wrote the previous revision we know both
+        // of its filenames, so it is two unlinks.
+        if let previousRevisionID, previousRevisionID != revisionID {
+            let urls = draftURLs(for: draftID, revisionID: previousRevisionID)
+            try? FileManager.default.removeItem(at: urls.metadata)
+            try? FileManager.default.removeItem(at: urls.text)
+        } else if previousRevisionID == nil {
+            // First write for this draft in this process: a previous launch may
+            // have left files under revisions we cannot name, so take the scan
+            // once.
+            removeOlderDraftFiles(for: draftID, keeping: revisionID)
+        }
     }
 
     func flushDirtyDraftsImmediately() {
         guard AppPreferences.current?.backupDocumentsWhileEditing ?? true else { return }
         for doc in documents where doc.isDirty {
+            // Skip a draft that already holds exactly this text. Each write is
+            // a full-text write plus a JSON write, inline on the main actor
+            // between ⌘Q and the app disappearing, so ten untouched multi-
+            // megabyte tabs were ten pointless rewrites. `revision` is the test
+            // rather than a timestamp: it is bumped by `text.didSet`, so it
+            // catches an edit-and-edit-back that a comparison of dates cannot.
+            guard lastWrittenDraftDocumentRevisions[doc.draftID] != doc.revision else { continue }
             writeDraftImmediately(for: doc)
         }
     }
@@ -1414,7 +1795,8 @@ final class DocumentStore {
         cleanupDraftAfterWrite(
             documentID: doc.id,
             draftID: payload.draftID,
-            revisionID: payload.revisionID
+            revisionID: payload.revisionID,
+            documentRevision: payload.documentRevision
         )
     }
 
@@ -1422,8 +1804,13 @@ final class DocumentStore {
         draftSaveTasks[doc.id]?.cancel()
         draftSaveTasks[doc.id] = nil
         draftSaveRevisions[doc.id] = nil
-        autoSaveTasks[doc.id]?.cancel()
-        autoSaveTasks[doc.id] = nil
+        // Not just the task: a write already handed to a background task has to
+        // be stopped (or waited for) too. This is the path "Don't Save" takes,
+        // and it used to leave the declined edits going to disk anyway. If the
+        // write had already landed the file keeps them — auto save is what the
+        // user asked for, and un-writing is not on the table — but nothing is
+        // left in flight to land after the close.
+        cancelAutoSave(for: doc.id)
         deleteDraftFiles(for: doc.draftID)
     }
 
@@ -1433,6 +1820,7 @@ final class DocumentStore {
     /// drafts directory. Drafts left by a previous launch have no remembered
     /// revision and still take the scan.
     private func deleteDraftFiles(for draftID: UUID) {
+        lastWrittenDraftDocumentRevisions[draftID] = nil
         if let revisionID = lastWrittenDraftRevisions.removeValue(forKey: draftID) {
             let urls = draftURLs(for: draftID, revisionID: revisionID)
             try? FileManager.default.removeItem(at: urls.metadata)
@@ -1520,14 +1908,12 @@ final class DocumentStore {
         Task { [weak self] in
             let states = await Task.detached(priority: .utility) {
                 probes.map { probe in
-                    let values = try? probe.url.resourceValues(
-                        forKeys: [.contentModificationDateKey, .fileSizeKey]
-                    )
+                    let state = DocumentStore.readDiskState(of: probe.url)
                     return DiskState(
                         id: probe.id,
                         url: probe.url,
-                        modificationDate: values?.contentModificationDate,
-                        fileSize: values?.fileSize
+                        modificationDate: state.modificationDate,
+                        fileSize: state.fileSize
                     )
                 }
             }.value
@@ -1584,12 +1970,27 @@ final class DocumentStore {
         let fileSize: Int?
     }
 
-    /// One stat for both values, recorded together — the external-change poll
-    /// compares them as a pair.
-    private func captureDiskState(of url: URL, into doc: Document) {
+    /// One stat for both values — the external-change poll compares them as a
+    /// pair, and so does every save.
+    ///
+    /// **`URL` caches resource values on the value, and every copy of a URL
+    /// shares that cache.** `doc.accessibleURL` is the same value this recorded
+    /// through when the document was opened, so asking it again hands back the
+    /// open-time answer: measured, a file that was 6 bytes at open and 20 bytes
+    /// on disk still reported 6, forever. That is the same URL the four-second
+    /// poll stats through, so nothing it looked at could ever appear to change.
+    /// Clearing the cache first is the documented way to force the read.
+    private nonisolated static func readDiskState(of url: URL) -> (modificationDate: Date?, fileSize: Int?) {
+        var url = url
+        url.removeAllCachedResourceValues()
         let values = try? url.resourceValues(forKeys: [.contentModificationDateKey, .fileSizeKey])
-        doc.diskModificationDate = values?.contentModificationDate
-        doc.diskFileSize = values?.fileSize
+        return (values?.contentModificationDate, values?.fileSize)
+    }
+
+    private func captureDiskState(of url: URL, into doc: Document) {
+        let state = Self.readDiskState(of: url)
+        doc.diskModificationDate = state.modificationDate
+        doc.diskFileSize = state.fileSize
     }
 
     private func handleDirtyDocumentChangedOnDisk(
@@ -1737,6 +2138,20 @@ final class DocumentStore {
         return alert.runModal() == .alertSecondButtonReturn
     }
 
+    /// Returns true when the user chose to download it. Defaults to Download —
+    /// unlike the binary-file and huge-file alerts this one is not about losing
+    /// anything, only about waiting, and they did ask for the file.
+    private func presentDatalessFileAlert(for url: URL, byteCount: Int?) -> Bool {
+        let size = byteCount.map { " (\(LargeFilePolicy.byteCountLabel($0)))" } ?? ""
+        let alert = NSAlert()
+        alert.messageText = "\(url.lastPathComponent) is not downloaded to this Mac."
+        alert.informativeText = "It is stored in the cloud\(size). SheepText will be unresponsive until the download finishes."
+        alert.addButton(withTitle: "Download and Open")
+        alert.addButton(withTitle: "Cancel")
+        alert.alertStyle = .informational
+        return alert.runModal() == .alertFirstButtonReturn
+    }
+
     private func presentHugeFileAlert(for url: URL, byteCount: Int) -> Bool {
         let alert = NSAlert()
         alert.messageText = "Open large file?"
@@ -1778,6 +2193,7 @@ final class DocumentStore {
         let preexistingActiveID = activeDocumentID
 
         var seen = Set<String>()
+        var unreachable: [String] = []
         let urls = paths.compactMap { path -> URL? in
             guard !seen.contains(path) else { return nil }
             seen.insert(path)
@@ -1788,11 +2204,18 @@ final class DocumentStore {
             )
             guard !alreadyOpen.contains(url.canonicalFileURL) else { return nil }
             var isDirectory: ObjCBool = false
-            guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory),
-                  !isDirectory.boolValue
-            else { return nil }
+            guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory) else {
+                // Not reachable is not gone. Remembered so `persistSession`
+                // writes it back — the volume may be a File Provider mount that
+                // simply has not come up yet.
+                unreachable.append(path)
+                return nil
+            }
+            // A directory genuinely cannot be a tab, whatever it used to be.
+            guard !isDirectory.boolValue else { return nil }
             return url
         }
+        unreachableSessionPaths = unreachable
 
         isRestoringSession = true
         for url in urls {
@@ -2015,9 +2438,48 @@ private struct DraftSnapshot: Codable, Sendable {
     let textFileName: String
 }
 
+/// Bytes handed to a background task, which the main actor can still call off.
+///
+/// `Task.detached` is not a child task: cancelling the auto-save task never
+/// stopped its write, so the bytes went to disk regardless — which is how ⌘S
+/// could be overtaken by an older auto save, and how "Don't Save" at close
+/// still wrote the edits the user had just declined.
+///
+/// `cancel()` either prevents the write or blocks until it has finished, so a
+/// caller that is about to write the same file is always the last writer.
+/// (`FileWriteSerializer` covers the case where the two writes overlap anyway:
+/// this is about which one happens at all.)
+///
+/// `@unchecked Sendable`: both members are only touched under `lock`.
+nonisolated final class PendingDocumentWrite: @unchecked Sendable {
+    private let lock = NSLock()
+    private var isCancelled = false
+
+    /// Runs `body` unless `cancel()` got here first.
+    /// - Returns: whether it ran.
+    @discardableResult
+    func run(_ body: () throws -> Void) rethrows -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !isCancelled else { return false }
+        try body()
+        return true
+    }
+
+    /// Returns once the write has either been prevented or finished.
+    func cancel() {
+        lock.lock()
+        isCancelled = true
+        lock.unlock()
+    }
+}
+
 private struct DraftPayload: Sendable {
     let draftID: UUID
     let revisionID: UUID
+    /// `Document.revision` the text was taken from, so the quit-time flush can
+    /// tell a draft that is already current from one that is not.
+    let documentRevision: Int
     let snapshotData: Data
     let text: String
     let draftsDirectory: URL
@@ -2444,6 +2906,20 @@ final class Document: Identifiable {
     var wasRecoveredFromDraft: Bool = false
     var lastDraftSavedAt: Date?
     var lastAutoSavedAt: Date?
+    /// Why auto save stopped writing this document, for a status-bar readout.
+    ///
+    /// Auto save used to fail into `Logger.app.error` and nowhere else: a
+    /// document whose encoding cannot store a character the user has just
+    /// pasted keeps its dirty dot, and the user — who turned auto save on
+    /// precisely so they would not have to think about saving — has no signal
+    /// at all. Every keystroke rescheduled and failed again; nothing escalated.
+    /// Cleared by a successful save and by choosing another encoding.
+    var autoSaveFailureMessage: String?
+    /// The (revision, encoding) pair the failure was diagnosed for, so auto
+    /// save stops retrying a document nothing about has changed.
+    /// @ObservationIgnored: it moves with `autoSaveFailureMessage`, which is
+    /// what a view reads.
+    @ObservationIgnored var autoSaveFailureState: (revision: Int, encoding: TextEncoding)?
     var language: String {
         didSet {
             guard language != oldValue else { return }
@@ -2533,8 +3009,16 @@ final class Document: Identifiable {
         NetworkConfigLanguage.engineLanguage(for: language, vendor: networkVendor)
     }
 
+    /// The name the file had when it was deleted out from under the tab.
+    ///
+    /// `url` has to go to nil so ⌘S becomes Save As rather than silently
+    /// recreating a file the user just trashed — but a tab that suddenly reads
+    /// "Untitled" tells them nothing. This keeps the label, and pre-fills the
+    /// save panel with it.
+    var deletedFileName: String?
+
     var displayName: String {
-        url?.lastPathComponent ?? "Untitled"
+        url?.lastPathComponent ?? deletedFileName ?? "Untitled"
     }
 
     var isLargeFileModeActive: Bool {

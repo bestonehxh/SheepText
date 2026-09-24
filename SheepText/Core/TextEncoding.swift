@@ -300,9 +300,76 @@ nonisolated struct DecodedFile: Sendable {
     }
 }
 
+/// The first character an encoding cannot store, and the line it is on.
+/// Found only on the failure path, so its cost never lands on a good save.
+nonisolated struct UnrepresentableCharacter: Sendable, Hashable {
+    let character: String
+    /// 1-based, counted over the newline SCALAR — a CRLF pair is one Swift
+    /// Character and would not compare equal to "\n".
+    let line: Int
+}
+
 nonisolated enum EncodingError: Error {
     case cannotDecode
-    case cannotEncode(TextEncoding)
+    case cannotEncode(TextEncoding, offender: UnrepresentableCharacter?)
+}
+
+/// Without this, the one alert that matters read "The operation couldn't be
+/// completed. (SheepText.EncodingError error 2.)" — naming neither the
+/// encoding nor the character, and leaving the user with no way to guess that
+/// switching the status-bar encoding to UTF-8 fixes it. `FindInFilesError`
+/// twenty lines above has always conformed.
+extension EncodingError: LocalizedError {
+    var errorDescription: String? {
+        switch self {
+        case .cannotDecode:
+            return "The file could not be read as text."
+        case .cannotEncode(let encoding, let offender):
+            var message = "This text contains characters \(encoding.displayName) cannot store."
+            if let offender {
+                message += " The first is \u{201C}\(offender.character)\u{201D} on line \(offender.line)."
+            }
+            // In errorDescription, not recoverySuggestion: every call site
+            // shows `error.localizedDescription`, which is only this half.
+            message += " Choose a different encoding in the status bar — UTF-8 stores everything."
+            return message
+        }
+    }
+}
+
+/// One writer at a time per path.
+///
+/// Auto save writes off the main actor while ⌘S writes on it, and two replaces
+/// aimed at one path have no ordering between them — the write that *started*
+/// first can be the one that lands last, leaving the file holding the older
+/// bytes while the document reads clean and `savedText` says otherwise. Holding
+/// the path for the duration of the write makes "last to start" mean "last to
+/// land", which is what every caller already assumed.
+///
+/// A set of busy paths rather than a lock per path: the set is empty between
+/// writes, so nothing accumulates for a long-running process.
+///
+/// `@unchecked Sendable`: the mutable state is only ever touched while
+/// `condition` is held.
+nonisolated final class FileWriteSerializer: @unchecked Sendable {
+    static let shared = FileWriteSerializer()
+
+    private let condition = NSCondition()
+    private var busyPaths: Set<String> = []
+
+    func withExclusiveAccess<T>(toPath path: String, _ body: () throws -> T) rethrows -> T {
+        condition.lock()
+        while busyPaths.contains(path) { condition.wait() }
+        busyPaths.insert(path)
+        condition.unlock()
+        defer {
+            condition.lock()
+            busyPaths.remove(path)
+            condition.broadcast()
+            condition.unlock()
+        }
+        return try body()
+    }
 }
 
 nonisolated enum TextFileIO {
@@ -411,6 +478,24 @@ nonisolated enum TextFileIO {
         }
     }
 
+    /// A file whose bytes are not on this machine: an iCloud or File Provider
+    /// (OneDrive, Dropbox, Google Drive) placeholder. It reports its **logical**
+    /// size and `stat`s like an ordinary file; only *opening* it materialises
+    /// it, and that blocks for however long the download takes.
+    ///
+    /// `SF_DATALESS` in `st_flags` is what actually identifies one — verified
+    /// against this user's OneDrive, where it agrees with
+    /// `.ubiquitousItemDownloadingStatus == .notDownloaded` on every file and
+    /// costs one `lstat` instead of a resource-value fetch. Do **not** use
+    /// `st_blocks == 0` on its own: a decmpfs-compressed file (much of /System)
+    /// looks identical that way and is perfectly readable.
+    static func isDataless(_ url: URL) -> Bool {
+        let datalessFlag: UInt32 = 0x4000_0000    // SF_DATALESS
+        var info = stat()
+        guard lstat(url.path, &info) == 0 else { return false }
+        return (info.st_flags & datalessFlag) != 0
+    }
+
     /// A NUL byte near the start is the standard cheap test for "not text".
     /// Shared with Find in Files, which skips such files outright.
     static func looksBinary(_ data: Data) -> Bool {
@@ -479,7 +564,10 @@ nonisolated enum TextFileIO {
     /// when requested.
     static func encode(text: String, as encoding: TextEncoding, writeBOM: Bool) throws -> Data {
         guard var data = text.data(using: encoding.foundationEncoding, allowLossyConversion: false) else {
-            throw EncodingError.cannotEncode(encoding)
+            throw EncodingError.cannotEncode(
+                encoding,
+                offender: firstUnrepresentableCharacter(in: text, as: encoding)
+            )
         }
         if writeBOM {
             switch encoding {
@@ -495,16 +583,115 @@ nonisolated enum TextFileIO {
         return data
     }
 
+    /// One pass over the scalars, on the failure path only. Scalar by scalar
+    /// rather than Character by Character so a combining sequence reports the
+    /// piece the encoder actually refused; the line count is over the newline
+    /// SCALAR, since a CRLF pair is a single Swift Character.
+    static func firstUnrepresentableCharacter(
+        in text: String,
+        as encoding: TextEncoding
+    ) -> UnrepresentableCharacter? {
+        let foundation = encoding.foundationEncoding
+        var line = 1
+        for scalar in text.unicodeScalars {
+            if scalar.value == 0x0A {
+                line += 1
+                continue
+            }
+            if String(scalar).data(using: foundation, allowLossyConversion: false) == nil {
+                return UnrepresentableCharacter(character: String(scalar), line: line)
+            }
+        }
+        return nil
+    }
+
     /// Write a file atomically with the given encoding.
     static func write(text: String, to url: URL, encoding: TextEncoding, writeBOM: Bool) throws {
         try writeData(encode(text: text, as: encoding, writeBOM: writeBOM), to: url)
     }
 
     /// The I/O half of `write`, split out so auto save can encode on the main
-    /// actor (cheap, and it has to read the document anyway) and do the atomic
-    /// replace off it.
+    /// actor (cheap, and it has to read the document anyway) and do the replace
+    /// off it. **Every document write in the app goes through here.**
+    ///
+    /// `data.write(to:options:.atomic)` is mkstemp + rename, and a rename does
+    /// not write the file the user opened — it replaces whatever is at that
+    /// path. Three consequences, each measured:
+    ///
+    /// - **A symlink is replaced by a regular file.** Open `~/.zshrc` (a link
+    ///   into a dotfiles repo), type, ⌘S: the link is gone, the repo still
+    ///   holds the old text, and every later edit through either path diverges.
+    ///   So the write goes to `resolvingSymlinksInPath()`. The *document* keeps
+    ///   the URL the user opened — only the write destination is resolved.
+    /// - **Extended attributes are lost.** POSIX mode survives (Foundation
+    ///   copies it) but Finder tags and comments, `com.apple.TextEncoding`,
+    ///   quarantine and anything a backup or DLP tool attached do not.
+    ///   `FileManager.replaceItemAt` preserves all of it by contract, and does
+    ///   here in practice; it is the atomic path now.
+    /// - **A hard link is split.** Any rename detaches the pair: the file the
+    ///   user edited gets the new bytes and its twin silently keeps the old
+    ///   ones. When the target has more than one link we write in place, which
+    ///   holds the pair together. The trade is that an in-place write is not
+    ///   atomic, so a crash or a full disk mid-write can truncate the file —
+    ///   but silently detaching the file the user asked to edit is the worse
+    ///   failure, and it is the one they cannot see.
+    ///
+    /// The in-place write is also the fallback for a writable file inside a
+    /// directory the user cannot write: staging fails at `mktemp` with
+    /// NSFileWriteNoPermissionError, which is about the directory rather than
+    /// the file, so the save failed outright with a misleading message.
+    /// **Only** a permission failure falls back — on a full disk the staged
+    /// replace fails with the original still intact, and a plain write there
+    /// would truncate it.
     static func writeData(_ data: Data, to url: URL) throws {
-        try data.write(to: url, options: .atomic)
+        let target = url.resolvingSymlinksInPath()
+        try FileWriteSerializer.shared.withExclusiveAccess(toPath: target.path) {
+            var info = stat()
+            guard lstat(target.path, &info) == 0 else {
+                // Nothing to preserve and nothing to split: Save As, and every
+                // Replace in Files backup, land here.
+                try data.write(to: target, options: .atomic)
+                return
+            }
+            guard info.st_nlink <= 1 else {
+                try data.write(to: target, options: [])
+                return
+            }
+            do {
+                try replaceContents(of: target, with: data)
+            } catch {
+                guard isPermissionFailure(error) else { throw error }
+                try data.write(to: target, options: [])
+            }
+        }
+    }
+
+    /// Stage the bytes on the target's own volume and swap them in, so the
+    /// write is atomic *and* the original's metadata comes across.
+    private static func replaceContents(of target: URL, with data: Data) throws {
+        let fm = FileManager.default
+        let staging = try fm.url(
+            for: .itemReplacementDirectory,
+            in: .userDomainMask,
+            appropriateFor: target,
+            create: true
+        )
+        defer { try? fm.removeItem(at: staging) }
+        let staged = staging.appendingPathComponent(target.lastPathComponent)
+        try data.write(to: staged, options: [])
+        _ = try fm.replaceItemAt(target, withItemAt: staged)
+    }
+
+    /// The directory, not the file, is what refused. `mktemp` reports it as
+    /// Cocoa's `NSFileWriteNoPermissionError`; a lower level reports EACCES.
+    private static func isPermissionFailure(_ error: Error) -> Bool {
+        let ns = error as NSError
+        if ns.domain == NSCocoaErrorDomain, ns.code == NSFileWriteNoPermissionError { return true }
+        if ns.domain == NSPOSIXErrorDomain, ns.code == Int(EACCES) || ns.code == Int(EPERM) { return true }
+        if let underlying = ns.userInfo[NSUnderlyingErrorKey] as? Error {
+            return isPermissionFailure(underlying)
+        }
+        return false
     }
 
     // MARK: - Private

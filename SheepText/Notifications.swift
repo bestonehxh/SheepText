@@ -32,5 +32,4 @@ extension Notification.Name {
     static let findInFilesShow = Notification.Name("sheeptext.findInFiles.show")
     static let recoveredDraftsShow = Notification.Name("sheeptext.recoveredDrafts.show")
     static let showDraftsFolder = Notification.Name("sheeptext.drafts.showFolder")
-    static let reloadPlugins = Notification.Name("sheeptext.developer.reloadPlugins")
 }

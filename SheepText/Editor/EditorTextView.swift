@@ -211,14 +211,33 @@ nonisolated final class DiffLayoutManager: NSLayoutManager, NSLayoutManagerDeleg
         if delta != 0, editMask.contains(.editedCharacters), !lineHighlights.isEmpty {
             let editStart = newCharRange.location
             let oldEditEnd = editStart + (newCharRange.length - delta)
-            lineHighlights = lineHighlights.compactMap { item in
+
+            // The array is sorted by location and nothing here reorders it, so
+            // every entry that ends at or before the edit is untouched: binary
+            // search to the first one that is not and rewrite in place from
+            // there. Rebuilding the whole array with `compactMap` cost 0.29 ms
+            // per keystroke on a 20 000-row diff (about 3 ms at 200 000), nearly
+            // all of it copying colours that had not moved.
+            var lo = 0, hi = lineHighlights.count
+            while lo < hi {
+                let mid = (lo + hi) / 2
+                if NSMaxRange(lineHighlights[mid].range) <= editStart { lo = mid + 1 } else { hi = mid }
+            }
+
+            var write = lo
+            var read = lo
+            while read < lineHighlights.count {
+                let item = lineHighlights[read]
+                read += 1
                 let start = item.range.location
                 let end = NSMaxRange(item.range)
                 var loc = start
                 var len = item.range.length
                 if end <= editStart {
                     // Entirely before the edit — unchanged.
-                    return item
+                    lineHighlights[write] = item
+                    write += 1
+                    continue
                 } else if start >= oldEditEnd {
                     // Entirely after the replaced span — shift by delta.
                     loc += delta
@@ -235,11 +254,13 @@ nonisolated final class DiffLayoutManager: NSLayoutManager, NSLayoutManagerDeleg
                     len = end - oldEditEnd
                 } else {
                     // Entirely inside the replaced span — the highlighted text is gone.
-                    return nil
+                    continue
                 }
-                guard loc >= 0, len > 0 else { return nil }
-                return (range: NSRange(location: loc, length: len), color: item.color)
+                guard loc >= 0, len > 0 else { continue }
+                lineHighlights[write] = (range: NSRange(location: loc, length: len), color: item.color)
+                write += 1
             }
+            if write < lineHighlights.count { lineHighlights.removeSubrange(write...) }
         }
         super.processEditing(for: textStorage, edited: editMask, range: newCharRange,
                              changeInLength: delta,
@@ -247,8 +268,22 @@ nonisolated final class DiffLayoutManager: NSLayoutManager, NSLayoutManagerDeleg
 
         // After super, so AppKit has already shifted its own temporary
         // attributes: the coordinator's painted window has to move the same way.
-        if editMask.contains(.editedCharacters), let onCharactersEdited {
-            MainActor.assumeIsolated { onCharactersEdited(newCharRange, delta) }
+        if editMask.contains(.editedCharacters) {
+            let owner = ownerTextView
+            let notify = onCharactersEdited
+            MainActor.assumeIsolated {
+                // The text view's line memo is stamped on `didChangeText`, which
+                // only fires for edits that went through the view. A tab switch
+                // does `textView.string = document.text` — same NSTextStorage
+                // object, and possibly the same length — so the stamp did not
+                // move and the status bar's Line/Column and the gutter's current
+                // row were computed against the PREVIOUS document's newlines
+                // until the first keystroke. The gutter's own copy of the memo
+                // is safe because it observes the storage; this gives the text
+                // view the same guarantee without a second observer.
+                (owner as? EditorTextView)?.noteStorageCharactersEdited()
+                notify?(newCharRange, delta)
+            }
         }
     }
 
@@ -647,16 +682,21 @@ final class EditorTextView: NSTextView {
         let length = ns.length
         guard length > 0 else { return "" }
 
-        var keptRuns: [NSRange] = []
+        let result = NSMutableString(capacity: length)
         var runStart = -1          // start of the run of kept lines being accumulated
         var runEnd = 0
+        var needsSeparator = false
 
         func closeRun() {
             guard runStart >= 0 else { return }
             var end = runEnd
             // Strip the run's trailing newline; runs are rejoined below.
             if end > runStart && ns.character(at: end - 1) == 10 { end -= 1 }
-            keptRuns.append(NSRange(location: runStart, length: end - runStart))
+            if needsSeparator { result.append("\n") }
+            if end > runStart {
+                result.append(ns.substring(with: NSRange(location: runStart, length: end - runStart)))
+            }
+            needsSeparator = true
             runStart = -1
         }
 
@@ -670,7 +710,7 @@ final class EditorTextView: NSTextView {
             return true
         }
         closeRun()
-        return keptRuns.map { ns.substring(with: $0) }.joined(separator: "\n")
+        return result as String
     }
 
     // MARK: - Current line highlight
@@ -843,6 +883,13 @@ final class EditorTextView: NSTextView {
     /// would otherwise look like "nothing changed".
     private var lineIndexStorage: ObjectIdentifier?
 
+    /// Invalidate the line memo for a storage edit that did not come through
+    /// this view. Driven by `DiffLayoutManager.processEditing`, which sees every
+    /// one of them; see the comment there.
+    func noteStorageCharactersEdited() {
+        textChangeCounter &+= 1
+    }
+
     private func lineIndexStamp(totalCount: Int) -> Int {
         let identifier = textStorage.map(ObjectIdentifier.init)
         if identifier != lineIndexStorage {
@@ -866,12 +913,24 @@ final class EditorTextView: NSTextView {
         }
         let newFont = editorFont
         let fontChanged = font != newFont
+        let previousFont = font
         // The scroll offset is in points, so a size change that reflows every
         // line would otherwise land the view somewhere else in the document.
         // Not in a compare pane: the anchor scroll is broadcast to the peer as a
         // fraction of a frame laid out only down to the anchor — about 1.0 —
         // which sent the other pane to the end of its file.
-        let topAnchor = fontChanged && !isComparePane && font?.pointSize != newFont.pointSize
+        //
+        // And not on every tick of a pinch. Resolving the anchor asks the layout
+        // manager for its line fragment, and the font change has just
+        // invalidated layout over the whole document, so TextKit lays out
+        // everything ABOVE the anchor before it can answer: 490–550 ms on a
+        // 900 KB file scrolled 90 % down, every 0.15 s for the length of the
+        // gesture, which saturates the main thread for the whole gesture and for
+        // several hundred ms after it. A pinch anchors ONCE, when the fingers
+        // come off (`finishPinch`); the ticks in between keep whatever offset
+        // they land on, which drifts a little and is corrected immediately.
+        let topAnchor = fontChanged && !isComparePane && !isPinching
+            && previousFont?.pointSize != newFont.pointSize
             ? topVisibleCharacterIndex()
             : nil
         font = newFont
@@ -883,11 +942,17 @@ final class EditorTextView: NSTextView {
         ]
         applyIndentationVisualSettings()
         applyWordWrapSetting()
-        // `font =` sets the font over the whole storage, so the Thai fallback
-        // the sweep put there is gone and has to be put back at the new size.
-        if fontChanged {
-            applyThaiFontFallback()
-        }
+        // `font =` sets the font over the whole storage — whether or not the
+        // value differs — so the Thai fallback the sweep put there is gone and
+        // has to be put back every time, not only when the size moved. It used
+        // to be guarded by `fontChanged`, and an appearance, theme or language
+        // change re-assigns the SAME font: Thai text lost its fallback (and with
+        // it the `.kern` removal and `.ligature: 1` that stop the marks being
+        // mangled) permanently, because the other callers are only saved by the
+        // storage-replacement sweep, which this path does not do. A single
+        // CFStringFindCharacterFromSet rejects a non-Thai document, so it is
+        // free for everyone else.
+        applyThaiFontFallback()
         if let topAnchor {
             scrollCharacterToTop(topAnchor)
         }
@@ -901,6 +966,12 @@ final class EditorTextView: NSTextView {
 
     private var pinchStartFontSize: Double?
     private var pinchMagnification: CGFloat = 0
+    /// Set for the duration of a pinch; see `applyDocumentVisualSettings`.
+    private(set) var isPinching = false
+    /// The character that was at the top of the viewport when the pinch began.
+    /// Character indices do not move with the font, so it stays valid all the
+    /// way to `.ended`, where it is resolved exactly — once.
+    private var pinchTopAnchor: Int?
 
     /// Pinch sets the editor font size — the same preference as the Settings
     /// slider, so every open editor follows and the size is remembered.
@@ -909,6 +980,8 @@ final class EditorTextView: NSTextView {
         if event.phase == .began || pinchStartFontSize == nil {
             pinchStartFontSize = preferences.editorFontSize
             pinchMagnification = 0
+            isPinching = true
+            pinchTopAnchor = isComparePane ? nil : topVisibleCharacterIndex()
         }
         pinchMagnification += event.magnification
         let size = Self.pinchedFontSize(
@@ -920,7 +993,41 @@ final class EditorTextView: NSTextView {
         }
         if event.phase == .ended || event.phase == .cancelled {
             pinchStartFontSize = nil
+            // The last size change is still inside the appearance coalescing
+            // window, so the final `applyDocumentVisualSettings` has not run
+            // yet — re-seat the anchor after it has.
+            finishPinch(after: AppPreferences.editorAppearanceCoalescingWindow * 1.5)
         }
+    }
+
+    /// End the gesture and put the line the pinch started on back at the top.
+    ///
+    /// This is the ONE layout-forcing anchor resolution a pinch pays, instead of
+    /// one per 0.15 s tick.
+    private func finishPinch(after delay: TimeInterval) {
+        isPinching = false
+        guard let anchor = pinchTopAnchor else { return }
+        pinchTopAnchor = nil
+        guard delay > 0 else {
+            scrollCharacterToTop(anchor)
+            return
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+            self?.scrollCharacterToTop(anchor)
+        }
+    }
+
+    /// A magnify `NSEvent` has no public initializer, so the pinch state cannot
+    /// be driven by a real gesture from a test. Internal rather than private so
+    /// the mid-gesture path can be asserted and measured; nothing in the app
+    /// calls these. (Not `#if DEBUG`: the Release test build has to compile.)
+    func beginPinchForTesting() {
+        isPinching = true
+        pinchTopAnchor = isComparePane ? nil : topVisibleCharacterIndex()
+    }
+
+    func endPinchForTesting() {
+        finishPinch(after: 0)
     }
 
     /// Whole points, clamped to the Settings slider's range.
@@ -1187,8 +1294,36 @@ final class EditorTextView: NSTextView {
         applyWordWrapSetting()
     }
 
+    /// Expand every fold before a transform that rewrites whole lines.
+    ///
+    /// These transforms read `storage.string`, which is DISPLAY text: with a
+    /// fold collapsed it carries a U+FFFC where the block used to be. The
+    /// transform leaves that character alone (it is not whitespace, not a line
+    /// ending, not indentation) and the result is then written back over the
+    /// WHOLE storage — so the placeholder survived into `document.text` and the
+    /// folded block did not. Trim-on-save made it a silent data loss on ⌘S.
+    ///
+    /// Unfolding first is the only shape that is right for all of them: the
+    /// transform then sees the file the user thinks it is transforming. The
+    /// folds do not come back — they describe text the transform may have
+    /// rewritten — which is the same trade `discardUndoHistory` already makes
+    /// for every fold mutation.
+    private func expandFoldsBeforeWholeLineTransform() {
+        guard let storage = textStorage,
+              let foldingManager, !foldingManager.regions.isEmpty
+        else { return }
+        foldingManager.unfoldAll(in: storage, baseAttributes: editorBaseAttributes())
+        applyThaiFontFallback()
+        discardUndoHistory()
+        // See `FoldingManager.armFoldMutationFlag`: this emits a change
+        // notification, and by itself it is a fold mutation, not an edit.
+        foldingManager.armFoldMutationFlag()
+        didChangeText()
+    }
+
     func convertLineEndings(to lineEnding: TextLineEnding) {
         guard let storage = textStorage else { return }
+        expandFoldsBeforeWholeLineTransform()
         let converted = TextContentTransforms.convertLineEndings(in: storage.string, to: lineEnding)
         replaceAllText(with: converted)
         document?.lineEnding = lineEnding
@@ -1196,6 +1331,7 @@ final class EditorTextView: NSTextView {
 
     func trimTrailingWhitespace(markDirty: Bool = true) {
         guard let storage = textStorage else { return }
+        expandFoldsBeforeWholeLineTransform()
         let lineEnding = document?.lineEnding ?? TextLineEnding.detect(in: storage.string)
         let trimmed = TextContentTransforms.trimTrailingWhitespace(in: storage.string, lineEnding: lineEnding)
         guard trimmed != storage.string else { return }
@@ -1204,6 +1340,7 @@ final class EditorTextView: NSTextView {
 
     func convertIndentation(to indentation: TextIndentation) {
         guard let storage = textStorage else { return }
+        expandFoldsBeforeWholeLineTransform()
         let converted = TextContentTransforms.convertIndentation(in: storage.string, to: indentation)
         guard converted != storage.string else {
             document?.indentation = indentation
@@ -1286,7 +1423,13 @@ final class EditorTextView: NSTextView {
             guard NSMaxRange(lineRange) <= ns.length,
                   seenLineStarts.insert(lineRange.location).inserted
             else { continue }
-            let lineText = ns.substring(with: lineRange)
+            // Fold-aware, so ⇧⌘D on a collapsed chip duplicates the BLOCK. The
+            // raw substring is a bare U+FFFC with no attachment and no identity
+            // behind it, which `fullText` can only pass straight through into
+            // the file.
+            let lineText = foldingManager?.regions.isEmpty == false
+                ? foldAndFillerAwareText(of: lineRange, in: storage)
+                : ns.substring(with: lineRange)
             // The last line of a file has no trailing newline; the copy needs one
             // in front of it or the two lines run together.
             //
@@ -1403,27 +1546,20 @@ final class EditorTextView: NSTextView {
         didChangeText()
     }
 
+    /// ⌘L, the status bar's line readout and a Find-in-Files click all land here.
+    ///
+    /// This used to walk `rangeOfCharacter(from: .newlines)`, which returns ONE
+    /// UTF-16 unit at a time — it does not fold a CRLF pair into one match — so
+    /// on a Windows file every line counted twice and "go to line 500" landed
+    /// around 250. `CharacterSet.newlines` also contains U+000B and U+000C,
+    /// which nothing else in this editor treats as a break. `TextLineIndex` is
+    /// the one line definition the gutter, the status bar and
+    /// `FindInFilesEngine` already share; going through it is what makes the
+    /// caret land on the row the gutter is pointing at.
     func goToLine(_ lineNumber: Int) {
         guard lineNumber > 0 else { return }
         let ns = (textStorage?.string ?? string) as NSString
-        var currentLine = 1
-        var location = 0
-
-        while currentLine < lineNumber, location < ns.length {
-            let range = ns.rangeOfCharacter(
-                from: CharacterSet.newlines,
-                options: [],
-                range: NSRange(location: location, length: ns.length - location)
-            )
-            guard range.location != NSNotFound else {
-                location = ns.length
-                break
-            }
-            location = range.location + range.length
-            currentLine += 1
-        }
-
-        let caret = min(location, ns.length)
+        let caret = min(TextLineIndex.lineStart(of: lineNumber, in: ns), ns.length)
         setSelectedRange(NSRange(location: caret, length: 0))
         scrollRangeToVisible(NSRange(location: caret, length: 0))
         window?.makeFirstResponder(self)
@@ -1595,6 +1731,11 @@ final class EditorTextView: NSTextView {
     }
 
     private func replaceAllText(with replacement: String, markDirty: Bool = true) {
+        // Every caller unfolds first (see `expandFoldsBeforeWholeLineTransform`),
+        // because they read the display string before getting here. This is the
+        // backstop for a future one that does not: replacing the whole storage
+        // with a fold still collapsed deletes the folded blocks outright.
+        expandFoldsBeforeWholeLineTransform()
         let fullRange = NSRange(location: 0, length: textStorage?.length ?? 0)
         replaceText(in: fullRange, with: replacement, markDirty: markDirty)
         setSelectedRange(NSRange(location: min(selectedRange().location, (replacement as NSString).length), length: 0))
@@ -1633,6 +1774,10 @@ final class EditorTextView: NSTextView {
         transform: (String, TextLineEnding) -> String
     ) {
         guard let storage = textStorage else { return }
+        // Sort / de-duplicate rewrite whole lines from the display string, so a
+        // placeholder inside the transformed range is the same data loss as the
+        // whole-document transforms above.
+        expandFoldsBeforeWholeLineTransform()
         let range = selectedLineRange(useWholeDocumentWhenSelectionEmpty: useWholeDocumentWhenSelectionEmpty)
         guard range.location != NSNotFound, NSMaxRange(range) <= storage.length else { return }
         let source = (storage.string as NSString).substring(with: range)
@@ -2028,6 +2173,30 @@ final class EditorTextView: NSTextView {
         NSPasteboard.general.setString(text, forType: .string)
     }
 
+    /// Dragging a selection out of the view does NOT go through `copy(_:)` —
+    /// AppKit writes the pasteboard itself, i.e. the raw display text with a
+    /// literal U+FFFC where a chip is. Dropping that anywhere (including back
+    /// into this document) inserts an inert attachment character that no fold
+    /// explains. Same expansion as `copy`, same reason.
+    override func writeSelection(to pboard: NSPasteboard,
+                                 types: [NSPasteboard.PasteboardType]) -> Bool {
+        guard types.contains(.string),
+              let storage = textStorage,
+              foldingManager?.regions.isEmpty == false
+        else { return super.writeSelection(to: pboard, types: types) }
+
+        let ranges = ((selectedRanges as? [NSRange]) ?? [selectedRange()])
+            .filter { $0.length > 0 && $0.location != NSNotFound }
+            .sorted { $0.location < $1.location }
+        guard !ranges.isEmpty else { return super.writeSelection(to: pboard, types: types) }
+
+        let text = ranges
+            .map { foldAndFillerAwareText(of: $0, in: storage) }
+            .joined(separator: "\n")
+        pboard.declareTypes([.string], owner: nil)
+        return pboard.setString(text, forType: .string)
+    }
+
     /// One selection's real text: filler paragraphs skipped, fold placeholders
     /// expanded back to what they stand for.
     private func foldAndFillerAwareText(of range: NSRange, in storage: NSTextStorage) -> String {
@@ -2116,7 +2285,13 @@ final class EditorTextView: NSTextView {
                 let charIdx = lm.characterIndexForGlyph(at: glyphIdx)
                 if charIdx < storage.length,
                    storage.attribute(.attachment, at: charIdx, effectiveRange: nil) is FoldPlaceholder {
-                    fm.unfold(at: charIdx, in: storage)
+                    // Current base attributes, not the ones captured at fold
+                    // time: font and paragraph style live in the storage, which
+                    // does not contain folded text, so a size change while the
+                    // block was collapsed never reached it.
+                    let restored = fm.unfold(at: charIdx, in: storage,
+                                             baseAttributes: editorBaseAttributes())
+                    if let restored { applyThaiFontFallback(in: restored) }
                     discardUndoHistory()
                     // See `FoldingManager.armFoldMutationFlag` — only the paths
                     // that emit a change notification arm the handshake.

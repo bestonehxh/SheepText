@@ -20,6 +20,14 @@ import Foundation
 /// fixed priority order with the most specific families first, so a Linux jump
 /// host that merely prints a vendor's name somewhere cannot outrank that
 /// vendor's own banner.
+///
+/// **The two modes do not share a table.** They are asked different questions.
+/// A stream is a device's own output, so a banner word in it is evidence; a
+/// file is any text a person saved, and SheepText fingerprints EVERY `.txt` it
+/// opens, so a banner word in one is just a word in a sentence. `signatures` is
+/// the stream table; `fileSignatures` is composed separately from
+/// `configFileSignatures` plus the few stream entries that cannot occur in
+/// prose. See `fileSafeStreamSignatures`.
 public struct VendorFingerprint: Sendable {
     /// Locked once a signature has matched (holds the vendor) OR the byte
     /// budget ran out with no match. Either way `consider` becomes a no-op.
@@ -161,13 +169,56 @@ public struct VendorFingerprint: Sendable {
         ]
     }()
 
-    /// The stream table followed, per vendor, by the file table — the order of
-    /// vendors is the stream table's, so file mode inherits exactly the same
-    /// precedence. Built once.
+    /// Stream signatures that file mode may ALSO use.
+    ///
+    /// File mode used to be "the stream table plus the config table", and that
+    /// concatenation broke the rule the whole file is written to. A terminal
+    /// session is a stream of a device's own output, so a banner word in it
+    /// means the device said it. A saved `.txt` is any text a person kept, and
+    /// SheepText fingerprints every one of them — so `ubuntu `, `centos`,
+    /// `junos `, `execute ping`, `fortigate`, `pan-os` and `nx-os` stopped being
+    /// evidence and became words that turn up in a sentence. Measured: a meeting
+    /// note saying "move the build box to Ubuntu 24.04" locked `.linux`, whose
+    /// rules then painted every line's first word keyword-purple. The config
+    /// table had refused those strings on purpose; the merge put them back.
+    ///
+    /// The rule this list is filtered by: **a stream signature survives into
+    /// file mode only when it cannot occur in English prose at all** — a CLI
+    /// statement, a prompt, or a product token that is not a word
+    /// (`aos-cx`, `vrp (r)`, `[mynode]`). Anything built out of words is
+    /// dropped, including line-anchored, because a sentence that mentions a
+    /// product very often BEGINS with the product's name.
+    ///
+    /// What each family loses is covered by its config-file row below, except
+    /// `.linux`, which has no file row at all — deliberately, and now really.
+    private static let fileSafeStreamSignatures: [Vendor: [[UInt8]]] = [
+        // A config header reads `!Version ArubaOS-CX FL.10.13.1000`; neither
+        // spelling is a word.
+        .arubaCX: bytes(["arubaos-cx", "aos-cx"]),
+        // `display version` prints `VRP (R) software, Version 8.180`. The
+        // parenthesised (R) is what makes it unmistakable; `huawei
+        // technologies` is a company name and is gone.
+        .huawei: bytes(["vrp (r)"]),
+        // `[mynode]` is the Mobility Master node path in every prompt;
+        // `arubaos (` only ever appears as `ArubaOS (MODEL: 7210)`.
+        .arubaOS: bytes(["[mynode]", "arubaos ("]),
+        // FortiOS CLI block openers. `fortigate` / `fortios ` / `execute ping`
+        // are gone: a runbook line can be exactly `execute ping 8.8.8.8`, and a
+        // quote can begin `Fortigate and Palo Alto…`.
+        .fortios: bytes(["config system global", "config firewall policy"]),
+        // Gaia clish statements. `check point gaia` / `gaia r8` /
+        // `enter expert password` are words and are gone.
+        .gaia: bytes(["set installer policy", "set clienv"])
+    ]
+
+    /// The signatures file mode actually uses: the file-safe stream entries
+    /// followed, per vendor, by the config-file entries. The vendor ORDER is the
+    /// stream table's, so precedence between families is unchanged — only the
+    /// contents of each row are narrower.
     public static let fileSignatures: [(Vendor, [[UInt8]])] = {
         let extra = Dictionary(uniqueKeysWithValues: configFileSignatures.map { ($0.0, $0.1) })
-        return signatures.map { vendor, patterns in
-            (vendor, patterns + (extra[vendor] ?? []))
+        return signatures.map { vendor, _ in
+            (vendor, (fileSafeStreamSignatures[vendor] ?? []) + (extra[vendor] ?? []))
         }
     }()
 
@@ -212,8 +263,9 @@ public struct VendorFingerprint: Sendable {
     // MARK: - File mode
 
     /// One-shot fingerprint of a saved configuration. Scans the first `budget`
-    /// UTF-8 bytes of `text` against the stream table PLUS the config-file
-    /// table, in the same vendor priority order, and returns the first hit.
+    /// UTF-8 bytes of `text` against `fileSignatures` — the config-file table
+    /// plus the prose-proof stream entries — in the stream table's vendor
+    /// priority order, and returns the first hit.
     ///
     /// `nil` means "no strong signal" — the caller keeps `.auto`, which never
     /// misleads, rather than guessing.

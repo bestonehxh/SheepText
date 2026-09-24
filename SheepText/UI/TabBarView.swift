@@ -120,12 +120,23 @@ struct TabBarView: View {
 
             ScrollViewReader { proxy in
                 ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(spacing: 0) {
+                    // Lazy: a plain HStack built and measured all 100 chips of a
+                    // 100-tab window on every pass, each with its own
+                    // GeometryReader preference and its own observation
+                    // dependency on AppPreferences. Same fix, and same reason,
+                    // as FileTreeView's LazyVStack in the sidebar.
+                    LazyHStack(spacing: 0) {
                         ForEach(documents.documents) { doc in
                             TabChip(
                                 document: doc,
                                 isActive: doc.id == documents.activeDocumentID,
                                 isDragging: doc.id == draggingID,
+                                isInCompare: doc.id == documents.compareLeftDocumentID
+                                    || doc.id == documents.compareRightDocumentID,
+                                // Read once here rather than per chip: 100 chips
+                                // meant 100 observation dependencies on
+                                // AppPreferences for one value.
+                                chromeStyle: preferences.chromeStyle,
                                 dragOffset: dragOffset(for: doc.id),
                                 onSelect: { documents.activeDocumentID = doc.id },
                                 onClose:  { _ = documents.requestCloseTabFromUI(doc.id) },
@@ -266,28 +277,12 @@ struct TabBarView: View {
     }
 
     private func updateDragTarget(for id: Document.ID) {
-        guard let sourceFrame = dragStartFrames[id],
-              dragStartOrder.contains(id)
-        else { return }
-
-        let draggedMinX = sourceFrame.minX + dragTranslation
-        let draggedMaxX = sourceFrame.maxX + dragTranslation
-        var targetIndex = 0
-
-        for otherID in dragStartOrder where otherID != id {
-            guard let frame = dragStartFrames[otherID] else { continue }
-
-            let passedHalfway: Bool
-            if frame.midX > sourceFrame.midX {
-                passedHalfway = draggedMaxX >= frame.midX
-            } else {
-                passedHalfway = draggedMinX > frame.midX
-            }
-
-            if passedHalfway {
-                targetIndex += 1
-            }
-        }
+        guard let targetIndex = TabDragGeometry.targetIndex(
+            order: dragStartOrder,
+            frames: dragStartFrames,
+            dragged: id,
+            translation: dragTranslation
+        ) else { return }
 
         if targetIndex != dragTargetIndex {
             withAnimation(.snappy(duration: 0.14)) {
@@ -297,30 +292,80 @@ struct TabBarView: View {
     }
 }
 
+// MARK: - Drag geometry
+
+/// Where a dragged tab would land, given the frames the bar measured when the
+/// drag began.
+///
+/// Its own type because the tab strip is a `LazyHStack`: a tab that has never
+/// been on screen has never published a frame, and the old loop simply skipped
+/// any tab it had no frame for. Skipping is right for a tab off the right edge
+/// (the drag has not reached it) and wrong for one off the left edge, which the
+/// dragged tab is already past — dropping those made the target index too small
+/// and moved the tab to the wrong place in any window with more tabs than fit.
+///
+/// Tabs are laid out in order, so an unmeasured tab is off screen on the side
+/// its index says it is on. That is the whole rule, and it is why this is
+/// testable without a window.
+nonisolated enum TabDragGeometry {
+
+    static func targetIndex(
+        order: [Document.ID],
+        frames: [Document.ID: CGRect],
+        dragged: Document.ID,
+        translation: CGFloat
+    ) -> Int? {
+        guard let sourceFrame = frames[dragged],
+              order.contains(dragged)
+        else { return nil }
+
+        let draggedMinX = sourceFrame.minX + translation
+        let draggedMaxX = sourceFrame.maxX + translation
+        let firstMeasured = order.firstIndex { frames[$0] != nil } ?? 0
+        var targetIndex = 0
+
+        for (index, otherID) in order.enumerated() where otherID != dragged {
+            let passedHalfway: Bool
+            if let frame = frames[otherID] {
+                if frame.midX > sourceFrame.midX {
+                    passedHalfway = draggedMaxX >= frame.midX
+                } else {
+                    passedHalfway = draggedMinX > frame.midX
+                }
+            } else {
+                // Never built, so off screen: to the left of everything that
+                // was measured, or to the right of all of it.
+                passedHalfway = index < firstMeasured
+            }
+
+            if passedHalfway {
+                targetIndex += 1
+            }
+        }
+
+        return targetIndex
+    }
+}
+
 // MARK: - TabChip
 
 private struct TabChip: View {
     let document: Document
     let isActive: Bool
     let isDragging: Bool
+    let isInCompare: Bool
+    let chromeStyle: ChromeStyle
     let dragOffset: CGFloat
     let onSelect: () -> Void
     let onClose: () -> Void
     let onDragChanged: (DragGesture.Value) -> Void
     let onDragEnded: () -> Void
 
-    @Environment(DocumentStore.self) private var documents
-    @Environment(AppPreferences.self) private var preferences
     @State private var isHovering = false
     @State private var isHoveringClose = false
 
     private var accentColor: Color {
         Color(nsColor: .bestTextAccent)
-    }
-
-    private var isInCompare: Bool {
-        documents.compareLeftDocumentID == document.id ||
-        documents.compareRightDocumentID == document.id
     }
 
     var body: some View {
@@ -415,7 +460,7 @@ private struct TabChip: View {
     }
 
     private var tabBackground: Color {
-        let style = preferences.chromeStyle
+        let style = chromeStyle
         if isDragging { return style.selectionFill }
         // The active tab keeps the editor's own ground: it has to read as the
         // same sheet of paper as the document under it. It is the one place in

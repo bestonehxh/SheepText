@@ -19,12 +19,14 @@ nonisolated enum CompareBlockSplice {
     /// Replace `replaceCount` lines starting at `replaceStart` (0-based) with
     /// `replacementLines`, which must be line-ending neutral.
     ///
-    /// Lines are counted by splitting on the document's own separator: the newline
-    /// scalar for `.lf` and `.crlf` (a CRLF document's lines then still carry the
-    /// trailing `\r`, which is what the compare pipeline's line numbers assume), and
-    /// the carriage-return scalar for `.cr`. Splitting a CR-only document on `\n`
-    /// used to make the whole file one element, so every `replaceStart` but 0 was
-    /// rejected and the one that was accepted rewrote the entire document.
+    /// Lines are counted by splitting on the newline scalar for `.lf` and `.crlf`,
+    /// which is the boundary `LineHashing.splitLines` uses and therefore the array
+    /// the pipeline's `realLineNumber` indexes (a CRLF document's elements then
+    /// still carry the trailing `\r`). `.cr` splits on the carriage return instead
+    /// and is correct as a function, but **the app never reaches it**: the pipeline
+    /// sees a CR-only document as a single row, so the two halves disagree about
+    /// what line 1 is, and `Coordinator.compareTransfersAreSupported` withholds the
+    /// arrows for such a document rather than transfer the whole file.
     ///
     /// Returns nil when the range does not address the text, or when the edit would be
     /// a no-op (replacing nothing with nothing).
@@ -51,10 +53,29 @@ nonisolated enum CompareBlockSplice {
         }
         docLines.replaceSubrange(replaceStart ..< (replaceStart + replaceCount), with: incoming)
 
-        if lineEnding == .crlf, let last = docLines.last, last.hasSuffix("\r") {
-            // Nothing follows the final line, so it carries no terminator. (A file that
-            // does end with a newline has "" as its last element, which never matches.)
-            docLines[docLines.count - 1] = String(last.dropLast())
+        if lineEnding == .crlf {
+            // A CRLF document's LF-split elements all carry a trailing "\r" except the
+            // LAST one, which has no terminator at all — that is the whole reason the
+            // join below can be a bare "\n". Splicing can change WHICH element is last,
+            // so both ends of that invariant have to be restored:
+            //
+            // * the element the block was inserted AFTER used to be last (no "\r") and
+            //   is now interior. That is the append-at-the-end case, which is exactly
+            //   what `CompareTransferGeometry.replaceRange` returns for an all-filler
+            //   block at the bottom of the file — the common "the other pane has extra
+            //   lines down here" transfer — and it wrote a bare LF into the document;
+            // * the element that ENDS UP last must shed the "\r" the incoming lines
+            //   were given (or the one it carried while it was interior).
+            //
+            // Only those two positions are touched. A stray LF anywhere else in the
+            // document is content the user put there, not ours to rewrite.
+            if replaceStart > 0, replaceStart - 1 < docLines.count - 1,
+               !docLines[replaceStart - 1].hasSuffix("\r") {
+                docLines[replaceStart - 1] += "\r"
+            }
+            if let last = docLines.last, last.hasSuffix("\r") {
+                docLines[docLines.count - 1] = String(last.dropLast())
+            }
         }
 
         var result = docLines.joined(separator: separator)

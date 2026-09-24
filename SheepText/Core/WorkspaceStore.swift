@@ -20,10 +20,16 @@ final class WorkspaceStore {
     var activeFileURL: URL?
     private(set) var recentWorkspaces: [URL] = []
 
+    /// **No existence filter** — same reasoning as `DocumentStore`'s recents:
+    /// the prune was in memory, but the next `rememberWorkspace` wrote the
+    /// pruned list back, so a launch before the OneDrive File Provider mount
+    /// came up erased every remembered workspace for good. `fileExists` cannot
+    /// tell "deleted" from "not mounted yet", and only the first is a reason to
+    /// forget. (It also takes 12 stats off the main actor at launch, any one of
+    /// which can block for a mount timeout with no window on screen — DP4.)
     init() {
         recentWorkspaces = AppStorageLocation.defaults.stringArray(forKey: recentWorkspacesKey)?
-            .map(URL.init(fileURLWithPath:))
-            .filter { FileManager.default.fileExists(atPath: $0.path) } ?? []
+            .map(URL.init(fileURLWithPath:)) ?? []
     }
 
     /// Open a native folder picker. On success, loads the file tree.
@@ -172,7 +178,7 @@ final class WorkspaceStore {
         persistRecentWorkspaces()
     }
 
-    /// Search files in the workspace by glob. Used by the palette and plugins.
+    /// Search files in the workspace by glob. Used by the command palette.
     func findFiles(matching glob: String) -> [URL] {
         guard let root = rootURL else { return [] }
         return FileNode.flatten(tree).filter { node in

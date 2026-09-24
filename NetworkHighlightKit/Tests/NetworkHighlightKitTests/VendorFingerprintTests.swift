@@ -233,15 +233,59 @@ final class VendorFingerprintTests: XCTestCase {
         XCTAssertEqual(VendorFingerprint.detect(in: text), .arubaCX)
     }
 
+    /// Ordinary prose that names a vendor, an OS or a CLI verb. SheepText
+    /// fingerprints every `.txt` it opens, so this is the input the file table
+    /// sees most often — and the one it used to get wrong, because
+    /// `fileSignatures` was built as the stream table plus the config table and
+    /// so inherited `ubuntu `, `centos`, `junos `, `execute ping` and the rest.
+    func testFileModeIgnoresProseThatMerelyMentionsAVendor() {
+        for text in [
+            "Meeting notes\nWe agreed to move the build box to Ubuntu 24.04 next month.\n",
+            "The centos of the plate should hold the sauce.\n",
+            "To check the link, execute ping against the gateway first.\n",
+            "execute traceroute is the next step if ping fails.\n",
+            "The junos team shipped the release yesterday.\n",
+            "We run Debian GNU/Linux on the jump host and Red Hat Enterprise on the build farm.\n",
+            "Fortigate and Palo Alto Networks were both quoted; pan-os won on price.\n",
+            "Juniper Networks called about the nx-os migration and the Cisco IOS Software refresh.\n",
+            "Linux version 5.15 is what the wiki says, but check first.\n",
+            "HPE Comware Software was on the shortlist too.\n",
+            "Huawei Technologies sent the quote for the ios-xe boxes.\n",
+            "Check Point Gaia R81 is the version in the contract.\n",
+            "Enter expert password when the runbook says to.\n",
+            "This is an Aruba Operating System question, not a Cisco Nexus one.\n"
+        ] {
+            XCTAssertNil(VendorFingerprint.detect(in: text),
+                         "\(text.prefix(48).debugDescription) must not lock")
+        }
+    }
+
+    /// A captured terminal session is still a stream, and the stream table is
+    /// untouched — SheepTerm's behaviour does not move.
+    func testStreamModeStillLocksOnTheWordsFileModeDropped() {
+        for (text, vendor) in [("Welcome to Ubuntu 24.04.1 LTS", Vendor.linux),
+                               ("JUNOS 21.4R3-S4", .juniper),
+                               ("FortiGate-100F v7.2.5", .fortios),
+                               ("PAN-OS 10.2.3", .panos)] {
+            var fp = VendorFingerprint()
+            XCTAssertEqual(fp.consider(Array(text.utf8)), vendor, text)
+        }
+    }
+
     func testEveryConfigFileSignatureBelongsToAKnownVendor() {
         let fileVendors = Set(VendorFingerprint.configFileSignatures.map(\.0))
         XCTAssertTrue(fileVendors.isSubset(of: Set(Vendor.allCases)))
-        // Merging must not drop or duplicate a vendor.
+        // Composition must preserve the stream table's vendor ORDER, because
+        // that order is the precedence between families.
         XCTAssertEqual(VendorFingerprint.fileSignatures.map(\.0),
                        VendorFingerprint.signatures.map(\.0))
-        for (i, entry) in VendorFingerprint.fileSignatures.enumerated() {
-            XCTAssertGreaterThanOrEqual(entry.1.count, VendorFingerprint.signatures[i].1.count)
-        }
+        // A saved Linux "config" is any text file on the box; there is nothing
+        // short enough to be common that is not also common in prose, so file
+        // mode carries nothing for it at all.
+        XCTAssertEqual(
+            VendorFingerprint.fileSignatures.first { $0.0 == .linux }?.1.count, 0,
+            ".linux must have no file-mode signature"
+        )
         // Every signature is lowercase ASCII — the matcher lowercases only
         // A-Z, so an uppercase byte in the table could never match.
         for (_, patterns) in VendorFingerprint.fileSignatures {

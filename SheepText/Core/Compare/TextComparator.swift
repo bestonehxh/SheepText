@@ -36,8 +36,19 @@ nonisolated enum TextComparator {
     /// lines. They must use `LineHashing.splitLines`, or the line numbers in the
     /// result will index a differently-shaped array.
     static func compare(rawLinesA: [String], rawLinesB: [String], options: CompareOptions) -> CompareResult {
-        let linesA = LineHashing.hashLines(rawLinesA, options: options)
-        let linesB = LineHashing.hashLines(rawLinesB, options: options)
+        compare(hashedA: LineHashing.hashLines(rawLinesA, options: options),
+                hashedB: LineHashing.hashLines(rawLinesB, options: options),
+                options: options)
+    }
+
+    /// Same comparison again, for callers that keep the hashed lines across
+    /// rebuilds. A keystroke changes ONE side, and hashing is an FNV pass over
+    /// every byte of both documents — 124 ms per settled keystroke at 200 000
+    /// lines, half of it re-deriving an array that did not move. `CompareEngine`
+    /// memoises one array per side and calls this.
+    static func compare(hashedA: [HashedLine], hashedB: [HashedLine], options: CompareOptions) -> CompareResult {
+        let linesA = hashedA
+        let linesB = hashedB
 
         let ops = DiffCalc.diff(linesA, linesB) { l, r in
             l.hash == r.hash && l.normalized == r.normalized

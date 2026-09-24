@@ -3,8 +3,15 @@
 //  Bottom bar showing cursor position, selection count, document size,
 //  language, indentation, and encoding — Sublime Text-style.
 //
-//  Reads from the shared CursorState which the editor keeps up-to-date
-//  on every selection change.
+//  Split in two on purpose (UP1). `Coordinator.push(from:)` writes the four
+//  `CursorState` properties on every keystroke and every caret move, and the
+//  one body that read them also built six `Menu`s — the language menu alone is
+//  ~30 `Toggle`s, each with a freshly allocated `Binding`. `CursorReadout`
+//  reads the cursor and nothing else; `DocumentBadges` takes the `Document`
+//  and reads nothing that moves with the caret, so SwiftUI re-evaluates the
+//  readout per keystroke and the badges only when a badge actually changes.
+//  Keep it that way: a `cursor.` read in either of the other two puts the
+//  menus back on the keystroke path.
 //
 
 import SwiftUI
@@ -14,100 +21,103 @@ import NetworkHighlightKit
 struct StatusBarView: View {
 
     @Environment(DocumentStore.self) private var documents
-    @Environment(CursorState.self) private var cursor
-    @Environment(AppPreferences.self) private var preferences
-
-    /// Transient message posted by a plugin through `ui.showStatusMessage`.
-    /// Sits on the left, where nothing else lives, so it never shifts the
-    /// readouts on the right while it comes and goes.
-    @State private var pluginMessage: String?
-    @State private var pluginMessageTask: Task<Void, Never>?
-
-    /// How long a plugin's status message stays up.
-    private static let pluginMessageDuration: Duration = .seconds(4)
 
     var body: some View {
         HStack(spacing: 0) {
-            if let pluginMessage {
-                StatusItem(label: pluginMessage, color: Color(nsColor: .bestTextAccent))
-                    .lineLimit(1)
-                    .transition(.opacity)
-            }
             Spacer()
-
-            // Cursor position — primary info, always shown.
-            StatusItem(label: "Ln \(cursor.line),  Col \(cursor.column)")
-
-            // Selection count — accent-colored when active.
-            if cursor.selectedCount > 0 {
-                StatusDivider()
-                StatusItem(
-                    label: "\(cursor.selectedCount) selected",
-                    color: Color(nsColor: .bestTextAccent)
-                )
-            }
-
-            // Total character count.
-            StatusDivider()
-            StatusItem(label: "\(cursor.totalCount) chars", secondary: true)
-
+            CursorReadout()
             if let doc = documents.activeDocument {
-                StatusDivider()
-                StatusItem(
-                    label: doc.isDirty ? "Unsaved" : "Saved",
-                    color: Color(nsColor: doc.isDirty ? .bestTextDanger : .bestTextSuccess)
-                )
-                if preferences.autoSaveEnabled, doc.url != nil {
-                    StatusDivider()
-                    StatusItem(label: "Auto Save On", color: Color(nsColor: .bestTextAccent))
-                }
-                if doc.isDirty, let savedAt = doc.lastDraftSavedAt {
-                    StatusDivider()
-                    StatusItem(label: "Draft Saved \(timeLabel(savedAt))", secondary: true)
-                } else if let savedAt = doc.lastAutoSavedAt {
-                    StatusDivider()
-                    StatusItem(label: "Auto Saved \(timeLabel(savedAt))", secondary: true)
-                }
-                if doc.isLargeFileModeActive {
-                    StatusDivider()
-                    StatusItem(label: "Large File Mode", color: Color(nsColor: .editorModifiedAmber))
-                        .help(doc.largeFileModeDetail.map { "Large File Mode is active: \($0)" } ?? "Large File Mode is active.")
-                }
-                StatusDivider()
-                lineEndingMenu(for: doc)
-                StatusDivider()
-                languageMenu(for: doc)
-                if NetworkConfigLanguage.isNetworkConfig(doc.language) {
-                    StatusDivider()
-                    vendorMenu(for: doc)
-                }
-                StatusDivider()
-                indentationMenu(for: doc)
-                StatusDivider()
-                encodingMenu(for: doc)
+                DocumentBadges(document: doc)
             }
         }
         .font(.system(size: 11, design: .monospaced))
         .frame(height: 22)
         .background { ChromeBackground(zone: .statusBar) }
         .overlay(alignment: .top) { Divider() }
-        // U13: `ui.showStatusMessage` has been posting `.statusMessage` with
-        // nobody listening — the bundled hello-world plugin calls it and nothing
-        // appeared. This is that observer. The message inherits the bar's own
-        // 11 pt monospace; the only thing it adds is the accent ink.
-        .onReceive(NotificationCenter.default.publisher(for: .statusMessage)) { note in
-            guard let message = note.userInfo?[UIBridge.statusMessageKey] as? String,
-                  !message.isEmpty
-            else { return }
-            pluginMessageTask?.cancel()
-            pluginMessage = message
-            pluginMessageTask = Task {
-                try? await Task.sleep(for: Self.pluginMessageDuration)
-                guard !Task.isCancelled else { return }
-                pluginMessage = nil
-            }
+    }
+}
+
+// MARK: - The volatile half
+
+/// Line, column, selection size and document size: the four values that move
+/// on every keystroke and every arrow key. Nothing else lives here.
+private struct CursorReadout: View {
+
+    @Environment(CursorState.self) private var cursor
+
+    var body: some View {
+        // Cursor position — primary info, always shown.
+        StatusItem(label: "Ln \(cursor.line),  Col \(cursor.column)")
+
+        // Selection count — accent-colored when active.
+        if cursor.selectedCount > 0 {
+            StatusDivider()
+            StatusItem(
+                label: "\(cursor.selectedCount) selected",
+                color: Color(nsColor: .bestTextAccent)
+            )
         }
-        .onDisappear { pluginMessageTask?.cancel() }
+
+        // Total character count.
+        StatusDivider()
+        StatusItem(label: "\(cursor.totalCount) chars", secondary: true)
+    }
+}
+
+// MARK: - The document half
+
+/// Everything that describes the active document rather than the caret in it.
+/// `document` is a reference that only changes when the active tab does, so at
+/// rest this body is evaluated when one of the properties it reads changes —
+/// not when the user types.
+private struct DocumentBadges: View {
+
+    let document: Document
+
+    @Environment(DocumentStore.self) private var documents
+    @Environment(CursorState.self) private var cursor
+    @Environment(AppPreferences.self) private var preferences
+
+    var body: some View {
+        let doc = document
+        StatusDivider()
+        StatusItem(
+            label: doc.isDirty ? "Unsaved" : "Saved",
+            color: Color(nsColor: doc.isDirty ? .bestTextDanger : .bestTextSuccess)
+        )
+        if preferences.autoSaveEnabled, doc.url != nil {
+            StatusDivider()
+            StatusItem(label: "Auto Save On", color: Color(nsColor: .bestTextAccent))
+        }
+        if let failure = doc.autoSaveFailureMessage {
+            StatusDivider()
+            StatusItem(label: "Auto Save Failed", color: Color(nsColor: .bestTextDanger))
+                .help(failure)
+        }
+        if doc.isDirty, let savedAt = doc.lastDraftSavedAt {
+            StatusDivider()
+            StatusItem(label: "Draft Saved \(timeLabel(savedAt))", secondary: true)
+        } else if let savedAt = doc.lastAutoSavedAt {
+            StatusDivider()
+            StatusItem(label: "Auto Saved \(timeLabel(savedAt))", secondary: true)
+        }
+        if doc.isLargeFileModeActive {
+            StatusDivider()
+            StatusItem(label: "Large File Mode", color: Color(nsColor: .editorModifiedAmber))
+                .help(doc.largeFileModeDetail.map { "Large File Mode is active: \($0)" } ?? "Large File Mode is active.")
+        }
+        StatusDivider()
+        lineEndingMenu(for: doc)
+        StatusDivider()
+        languageMenu(for: doc)
+        if NetworkConfigLanguage.isNetworkConfig(doc.language) {
+            StatusDivider()
+            vendorMenu(for: doc)
+        }
+        StatusDivider()
+        indentationMenu(for: doc)
+        StatusDivider()
+        encodingMenu(for: doc)
     }
 
     private func languageMenu(for document: Document) -> some View {

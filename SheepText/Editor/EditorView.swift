@@ -320,6 +320,10 @@ nonisolated private struct CompareLayoutSnapshot: Sendable {
     let lineInfos: [CompareLineInfo]
     let rowRanges: [NSRange]
     let wordHighlightRanges: [NSRange]
+    /// The filler rows merged into runs — the shape `enumerateAttribute` hands
+    /// back, so the storage's `.isFillerLine` can be diffed against it directly.
+    /// Computed off the main thread with the rest of the snapshot.
+    let fillerRuns: [NSRange]
 }
 
 /// Line boundaries of a compare display, split on LF (0x0A) **only** — exactly
@@ -338,8 +342,24 @@ nonisolated enum CompareApplyGuard {
     /// rewrites the storage without the characters they just typed — silently,
     /// because `isApplyingCompare` suppresses `textDidChange` and the apply then
     /// calls `discardUndoHistory()`.
-    static func shouldApply(builtFrom snapshot: String, documentText current: String) -> Bool {
-        snapshot == current
+    ///
+    /// **Both** texts have to match, not just this pane's own. A display is a
+    /// function of the pair, and the two panes render the SAME row array — "row
+    /// N is aligned across panes" is the invariant every block transfer is built
+    /// on. Checking only the own side let a rebuild for (L1, R2) be applied to
+    /// the left pane while the right pane, whose own text had moved on to R3,
+    /// correctly refused its copy and kept rendering (L1, R1). The panes then
+    /// showed different row arrays — possibly different row COUNTS — with the
+    /// transfer arrows live throughout.
+    ///
+    /// A nil `peerText` means the peer is gone, which is also a refusal.
+    static func shouldApply(
+        builtFrom snapshot: String,
+        peerSnapshot: String,
+        documentText current: String,
+        peerText currentPeer: String?
+    ) -> Bool {
+        snapshot == current && peerSnapshot == currentPeer
     }
 }
 
@@ -465,13 +485,55 @@ nonisolated private enum CompareEngine {
     nonisolated(unsafe) private static var cache: (left: String, right: String, rows: [CompareRow])?
     nonisolated(unsafe) private static var displayCache: (left: String, right: String, panes: (left: CompareDisplay, right: CompareDisplay))?
 
+    /// One side's split + hashed lines, memoised per side.
+    ///
+    /// A keystroke changes ONE document, but `computeRows` split and FNV-hashed
+    /// BOTH from scratch on every settled keystroke: 124 ms per rebuild at
+    /// 200 000 lines, half of it re-deriving an array that did not move. Keyed
+    /// per side rather than by a small LRU because that is the access pattern —
+    /// with a shared two-entry list the unchanged side is evicted by the second
+    /// keystroke in a row — and because one entry per side is also the bound
+    /// that keeps the retained text to the two documents already in compare.
+    nonisolated(unsafe) private static var leftHashCache: HashedSide?
+    nonisolated(unsafe) private static var rightHashCache: HashedSide?
+
+    private struct HashedSide {
+        let text: String
+        let options: CompareOptions
+        let rawLines: [String]
+        let hashed: [HashedLine]
+    }
+
     /// Called when a pane leaves compare mode so two whole documents are not
     /// held alive by the cache.
     static func clearCache() {
         cacheLock.lock()
         cache = nil
         displayCache = nil
+        leftHashCache = nil
+        rightHashCache = nil
         cacheLock.unlock()
+    }
+
+    private static func hashedSide(
+        for text: String, options: CompareOptions, isLeft: Bool
+    ) -> HashedSide {
+        cacheLock.lock()
+        let hit = isLeft ? leftHashCache : rightHashCache
+        cacheLock.unlock()
+        if let hit, hit.text == text, hit.options == options { return hit }
+
+        let rawLines = LineHashing.splitLines(text)
+        let entry = HashedSide(
+            text: text,
+            options: options,
+            rawLines: rawLines,
+            hashed: LineHashing.hashLines(rawLines, options: options)
+        )
+        cacheLock.lock()
+        if isLeft { leftHashCache = entry } else { rightHashCache = entry }
+        cacheLock.unlock()
+        return entry
     }
 
     static func buildRows(leftText: String, rightText: String) -> [CompareRow] {
@@ -517,10 +579,13 @@ nonisolated private enum CompareEngine {
 
         // Must use the same splitter as LineHashing.extractLines, or the line
         // numbers coming back from TextComparator index a different array.
-        let linesA = LineHashing.splitLines(leftText)
-        let linesB = LineHashing.splitLines(rightText)
+        // Memoised per side: only one of the two changed (CP5).
+        let sideA = hashedSide(for: leftText, options: opts, isLeft: true)
+        let sideB = hashedSide(for: rightText, options: opts, isLeft: false)
+        let linesA = sideA.rawLines
+        let linesB = sideB.rawLines
 
-        switch TextComparator.compare(rawLinesA: linesA, rawLinesB: linesB, options: opts) {
+        switch TextComparator.compare(hashedA: sideA.hashed, hashedB: sideB.hashed, options: opts) {
         case .match:
             return zip(linesA.indices, linesB.indices).map { ai, bi in
                 CompareRow(
@@ -1148,6 +1213,16 @@ private struct EditorRepresentable: NSViewRepresentable {
         private var scrollSyncObserver: NSObjectProtocol?
         var isApplyingCompare = false
         private var currentLineInfos: [CompareLineInfo] = []
+        /// The `document.revision` of this pane's document and of its peer at the
+        /// moment `currentLineInfos` was applied. A block transfer indexes
+        /// `document.text` by the real line numbers in that array, so it is only
+        /// meaningful while both documents still read the way they did then.
+        private var compareInfoRevisions: (own: Int, peer: Int)?
+        #if DEBUG
+        /// Counts finished compare applies, so `CompareCoordinatorAuditSeam` can
+        /// wait for a rebuild that is dispatched off the main thread and back.
+        static var compareApplyCount = 0
+        #endif
         private var lastComparePeerID: Document.ID?
         private var lastCompareSide: ComparePaneSide?
         private var lastCompareLeftText: String?
@@ -1155,6 +1230,15 @@ private struct EditorRepresentable: NSViewRepresentable {
         private var lastAppliedCompareSide: ComparePaneSide?
         /// Sendable cancellation/generation state shared with background diff jobs.
         private let compareApplyGeneration = CompareApplyGeneration()
+        /// Lines the user personally typed on this session, as REAL line numbers.
+        ///
+        /// The gutter draws its `*` against display rows, and display rows move
+        /// whenever the diff inserts or removes a filler above them — which is
+        /// most rebuilds — so keying the set by display row put the markers beside
+        /// lines the user never touched after any peer edit. Real line numbers are
+        /// stable across rebuilds by construction, and are also what the user
+        /// means by "a line I edited"; `editedDisplayLines(for:)` maps them onto
+        /// whatever rows the current rebuild gave them.
         private var editedLines: Set<Int> = []
 
         // MARK: Line-number memo (U23 / T7)
@@ -1170,6 +1254,10 @@ private struct EditorRepresentable: NSViewRepresentable {
         // edits (typing over a selection), the length covers any storage
         // mutation that skipped `textDidChange` — the two together, never one.
         private var lineCursor = TextLineIndex.Cursor()
+        /// Compare display rows split on LF only. They deliberately do not use
+        /// `lineCursor`: TextKit treats CR, NEL and Unicode separators as line
+        /// breaks, while `CompareLineInfo` and transfer geometry do not.
+        private var compareLineCursor = TextLineIndex.LineFeedCursor()
         private var editGeneration = 0
 
         private func lineCursorStamp(_ length: Int) -> Int {
@@ -1185,6 +1273,7 @@ private struct EditorRepresentable: NSViewRepresentable {
         func noteStorageReplaced(syncedRevision: Int?) {
             editGeneration &+= 1
             lineCursor.invalidate()
+            compareLineCursor.invalidate()
             lastSyncedRevision = syncedRevision
             // The runs described the text that was there a moment ago. Painting
             // them over the new text would put the previous document's colours
@@ -1193,8 +1282,16 @@ private struct EditorRepresentable: NSViewRepresentable {
             highlightRuns = []
             runsGeneration &+= 1
             paintedDisplayRange = nil
+            unpaintedHoles = []
+            runsAreStale = false
             paintedRunsGeneration = -1
             storageNeedsThaiSweep = true
+            // A pass may be in flight against the text that was here a moment
+            // ago. One text view serves every tab, so `boundTextView ===
+            // textView` in its completion guard is always true and says
+            // nothing; this is the one place that knows the storage stopped
+            // being what the request was made against (H2).
+            highlightGeneration &+= 1
         }
 
         /// The storage was found to already hold `document.text` (the slow
@@ -1236,6 +1333,47 @@ private struct EditorRepresentable: NSViewRepresentable {
         private var paintedDisplayRange: NSRange?
         private var paintedRunsGeneration = -1
         private var paintedIsDark: Bool?
+        /// Compare word-level backgrounds are also viewport-painted. The diff
+        /// still computes the full list off-main, but the main actor no longer
+        /// installs thousands of temporary attributes that are nowhere near the
+        /// screen after every keystroke.
+        private var compareWordHighlightRanges: [NSRange] = []
+        private var compareWordHighlightColor: NSColor?
+        private var paintedCompareWordRange: NSRange?
+
+        /// Characters inside `paintedDisplayRange` that carry no paint (H1).
+        ///
+        /// AppKit does NOT stretch a temporary attribute across an insertion
+        /// that lands inside it: it splits the run and leaves the inserted
+        /// characters bare. `HighlightRunList.shifting` stretches — which is
+        /// right for the runs and right for the painted *window*, but it means
+        /// the window then claims characters nothing ever painted. Without
+        /// this, every character typed inside a token rendered in the base
+        /// colour until the rehighlight debounce fired: a whole typing burst on
+        /// a large file, where that debounce is 0.3 s.
+        ///
+        /// Kept as a list rather than shrinking the window, so the repair is
+        /// O(edit) and not O(viewport). It is normally one entry of one
+        /// character, consumed by the paint `textDidChange` runs immediately
+        /// afterwards.
+        private var unpaintedHoles: [NSRange] = []
+        /// Multi-cursor typing is one storage edit per cursor before a single
+        /// `textDidChange`; past a handful there is nothing to be gained from
+        /// tracking them separately, and their union is still correct (it only
+        /// ever paints more).
+        private static let unpaintedHoleLimit = 32
+
+        /// The runs no longer describe the text, and nothing may be painted
+        /// from them until the next pass lands (H5).
+        ///
+        /// Set when `storageDidEditCharacters` declines to shift — with a fold
+        /// collapsed, display and full-text offsets differ and an edit can even
+        /// eat a placeholder, so shifting would be a guess. It used to leave
+        /// the runs *trusted*, and a strip scrolled into view before the
+        /// debounce was painted from pre-edit runs at pre-edit offsets: every
+        /// colour in it off by the edit's delta. A missing colour for a third
+        /// of a second is the better failure.
+        private var runsAreStale = false
         /// Set when the storage is replaced wholesale: the Thai fallback font is
         /// a *storage* attribute (fonts change layout, so they can never be
         /// temporary) and has to be swept over the new text once. Ordinary
@@ -1267,7 +1405,19 @@ private struct EditorRepresentable: NSViewRepresentable {
         private struct SyntaxHighlightCacheEntry {
             let language: String
             let utf16Length: Int
-            let textHash: Int
+            /// `Document.revision` the runs were computed at.
+            ///
+            /// This was a content hash of the source text, and the source text
+            /// is `NSTextStorage.string` — a lazily bridged NSString, whose
+            /// `hashValue` walks Swift's foreign path and transcodes UTF-16 to
+            /// UTF-8 as it hashes: 28 ms on a 560 KB document, 56 ms at 1 MB,
+            /// on the main actor, paid BEFORE the cache was consulted and so
+            /// paid in full by a hit (HP1). `revision` already moves on every
+            /// assignment to `text`, and only means anything while the storage
+            /// is known to hold `document.text` —
+            /// `storageIsInSyncWithDocument` is that question, and a lookup
+            /// that cannot answer it yes simply misses.
+            let revision: Int
             /// The engine's run list for this text — a few tens of bytes per
             /// token, where this used to be a document-sized
             /// `NSAttributedString` with its whole attribute-run store.
@@ -1301,6 +1451,13 @@ private struct EditorRepresentable: NSViewRepresentable {
         }
 
         #if DEBUG
+        /// Cancels the two debounced highlight passes, so a test can let an
+        /// in-flight engine result land without a scheduled pass racing it.
+        func cancelPendingHighlightWorkForTesting() {
+            deferredHighlightWorkItem?.cancel()
+            rehighlightWorkItem?.cancel()
+        }
+
         static var syntaxHighlightCacheLimitForTesting: Int { syntaxHighlightCacheLimit }
         static var syntaxHighlightCacheCountForTesting: Int { syntaxHighlightCache.count }
         static func syntaxHighlightCacheContainsForTesting(_ id: Document.ID) -> Bool {
@@ -1310,13 +1467,13 @@ private struct EditorRepresentable: NSViewRepresentable {
             syntaxHighlightCache.removeAll()
             syntaxHighlightCacheOrder.removeAll()
         }
-        static func storeSyntaxHighlightForTesting(for document: Document) {
+        static func storeSyntaxHighlightForTesting(for document: Document, runs: [HighlightRun] = []) {
             storeSyntaxHighlight(
                 SyntaxHighlightCacheEntry(
                     language: document.language,
                     utf16Length: document.textUTF16Count,
-                    textHash: document.text.hashValue,
-                    runs: [],
+                    revision: document.revision,
+                    runs: runs,
                     document: document
                 ),
                 for: document.id
@@ -1334,6 +1491,17 @@ private struct EditorRepresentable: NSViewRepresentable {
                 foldingManager.saveFolds(for: document.id.uuidString)
                 // Keep editor storage canonical as this view tears down.
                 foldingManager.unfoldAll(in: storage)
+            }
+            if comparePeer != nil {
+                // Leaving compare mode does NOT go through `updateCompareContext`
+                // with a nil peer — `EditorView.body` swaps `CompareModeView` for a
+                // plain `EditorRepresentable` and the panes carry a `.id(...)`, so
+                // SwiftUI destroys these coordinators instead of updating them. The
+                // only other call site therefore never ran, and the static cache
+                // kept both documents, the row array and both panes' display text
+                // alive for the rest of the session: ~78 MB for a 200 000-line pair,
+                // after both tabs were closed.
+                CompareEngine.clearCache()
             }
             for obs in [observer, findNavigateObserver, findReplaceObserver, findReplaceAllObserver,
                         findHighlightObserver, findClearObserver,
@@ -1532,6 +1700,10 @@ private struct EditorRepresentable: NSViewRepresentable {
                    originID == self.document.id {
                     return
                 }
+                // The peer moved, so this pane's rows describe a pair of texts that
+                // no longer exists. The rebuild below is async; until it lands the
+                // arrows must not be aimable (C6/C7).
+                self.invalidateCompareTransferArrows()
                 self.applyCompareDisplay(to: tv, document: self.document)
             }
 
@@ -1619,6 +1791,7 @@ private struct EditorRepresentable: NSViewRepresentable {
                 ) { [weak self] _ in
                     guard let self, let textView = self.boundTextView else { return }
                     self.paintVisibleHighlights(in: textView)
+                    self.paintVisibleCompareWordHighlights(in: textView)
                 }
 
                 scrollBoundsObserver = NotificationCenter.default.addMainActorObserver(
@@ -1633,6 +1806,7 @@ private struct EditorRepresentable: NSViewRepresentable {
                     // (compare panes are not syntax-highlighted).
                     if let textView = self.boundTextView {
                         self.paintVisibleHighlights(in: textView)
+                        self.paintVisibleCompareWordHighlights(in: textView)
                     }
                     guard !self.isSyncScrolling, self.comparePeer != nil else { return }
                     guard let sv = self.boundScrollView else { return }
@@ -1772,6 +1946,12 @@ private struct EditorRepresentable: NSViewRepresentable {
                 document.text = editor.realText(from: storage)
                 document.precomputedSyntaxHighlight = nil
                 document.isDirty = true
+                // The ranges describe the previous compare snapshot. Existing
+                // temporary attributes move with the edit, but a scroll before
+                // the debounced rebuild must not paint new text from stale
+                // offsets.
+                compareWordHighlightRanges = []
+                compareWordHighlightColor = nil
                 scheduleSafetySaves(for: document, textView: tv)
                 push(from: tv)
 
@@ -1779,13 +1959,17 @@ private struct EditorRepresentable: NSViewRepresentable {
                 let cursorLoc = tv.selectedRange().location
                 let displayStr = storage.string as NSString
                 let safeLoc = min(cursorLoc, displayStr.length)
-                // Same memo as `push` (which ran a line above, over the same
-                // string and the same caret): a cache hit, not a second scan.
-                let editedLine = lineCursor.lineNumber(
+                // Compare rows are LF-only. A lone CR, NEL, U+2028 or U+2029
+                // remains inside a row, so TextKit's general line cursor would
+                // put the marker on a different row from the diff and gutter.
+                let editedLine = compareLineCursor.lineNumber(
                     in: displayStr, at: safeLoc, stamp: lineCursorStamp(displayStr.length)
                 )
-                editedLines.insert(editedLine)
-                boundGutter?.editedLines = editedLines
+                noteEditedDisplayRow(editedLine)
+
+                // The row array no longer describes this document, so the arrows
+                // beside it address lines that have moved (C6).
+                invalidateCompareTransferArrows()
 
                 // A rebuild may be in flight, built from the text as it was BEFORE
                 // this keystroke. It is stopped by the source-text check in
@@ -1833,6 +2017,17 @@ private struct EditorRepresentable: NSViewRepresentable {
                 // has moved, so the paint has to be thrown away and redone.
                 foldingDidChangeDisplayText(in: tv)
                 return
+            }
+
+            if document.isLargeFileModeActive, !highlightRuns.isEmpty || paintedDisplayRange != nil {
+                // A paste can push a highlighted document over the threshold.
+                // From here both `paintVisibleHighlights` and
+                // `scheduleRehighlight` return at their first guard and
+                // `applyHighlight` is never reached, so nothing would ever
+                // scrub what is already on the layout manager — the colours
+                // from before the paste, stretched and split by AppKit across
+                // the new text, until the tab was switched away and back (H7).
+                dropHighlightRuns(clearingPaintIn: tv)
             }
 
             // Runs were shifted by `storageDidEditCharacters` as the storage was
@@ -1956,7 +2151,7 @@ private struct EditorRepresentable: NSViewRepresentable {
                 vendor: document.networkVendor
             )
             let sourceLength = (sourceText as NSString).length
-            let sourceHash = sourceText.hashValue
+            let sourceRevision = document.revision
 
             guard SyntaxEngine.supportsHighlighting(resolvedLanguage) else {
                 resetHighlightAttributes(in: storage, baseAttributes: baseAttributes)
@@ -1969,12 +2164,12 @@ private struct EditorRepresentable: NSViewRepresentable {
                 document: document,
                 language: resolvedLanguage,
                 sourceLength: sourceLength,
-                sourceHash: sourceHash
+                storageLength: displayLength
             ) {
                 return
             }
 
-            highlightGeneration += 1
+            highlightGeneration &+= 1
             let currentGeneration = highlightGeneration
 
             SyntaxEngine.shared.highlightRuns(
@@ -1983,27 +2178,44 @@ private struct EditorRepresentable: NSViewRepresentable {
                 documentID: document.id
             ) { [weak self, weak textView] result in
                 guard let self else { return }
-                guard
-                    let textView,
-                    self.highlightGeneration == currentGeneration,
-                    self.boundTextView === textView,
-                    let storage = textView.textStorage
-                else { return }
 
+                // The cache entry is keyed on the text it was computed from, so
+                // it is sound whatever this pane has moved on to in the
+                // meantime — and a tab switched away from mid-parse should not
+                // have to parse again when it comes back. Stored BEFORE the
+                // guard below for exactly that reason.
                 if let result {
                     Self.storeSyntaxHighlight(
                         SyntaxHighlightCacheEntry(
                             language: resolvedLanguage,
                             utf16Length: sourceLength,
-                            textHash: sourceHash,
+                            revision: sourceRevision,
                             runs: result.runs,
                             document: document
                         ),
                         for: document.id
                     )
-                    self.setHighlightRuns(result.runs, in: textView)
                 } else {
                     Self.storeSyntaxHighlight(nil, for: document.id)
+                }
+
+                // One text view serves every tab, so `boundTextView ===
+                // textView` is true whatever tab is showing and says nothing
+                // about WHICH document these runs describe. Without the
+                // document check a pass started in tab A was painted onto tab
+                // B — and stayed there, because a tab switch onto a cached tab
+                // bumps no generation of its own (H2).
+                guard
+                    let textView,
+                    self.highlightGeneration == currentGeneration,
+                    self.boundTextView === textView,
+                    self.document.id == document.id,
+                    let storage = textView.textStorage
+                else { return }
+
+                if let result {
+                    self.setHighlightRuns(result.runs, in: textView)
+                } else {
                     self.resetHighlightAttributes(
                         in: storage,
                         baseAttributes: self.editorBaseAttributes(for: textView)
@@ -2043,7 +2255,7 @@ private struct EditorRepresentable: NSViewRepresentable {
                 document: document,
                 language: resolvedLanguage,
                 sourceLength: (sourceText as NSString).length,
-                sourceHash: sourceText.hashValue
+                storageLength: storage.length
             ) {
                 return
             }
@@ -2086,7 +2298,7 @@ private struct EditorRepresentable: NSViewRepresentable {
                 document: document,
                 language: resolvedLanguage,
                 sourceLength: (sourceText as NSString).length,
-                sourceHash: sourceText.hashValue
+                storageLength: storage.length
             )
         }
 
@@ -2095,30 +2307,45 @@ private struct EditorRepresentable: NSViewRepresentable {
         ///
         /// Neither is keyed on the appearance any more: a run carries a style
         /// id, so the same list paints light or dark.
+        ///
+        /// Nor on a content hash of the storage (HP1) — see
+        /// `SyntaxHighlightCacheEntry.revision`. Both lookups need the storage
+        /// to be known to hold `document.text`; when that cannot be claimed
+        /// they miss and the engine runs, which is slower but never wrong.
         private func applyPreparedHighlightIfAvailable(
             to textView: NSTextView,
             document: Document,
             language: String,
             sourceLength: Int,
-            sourceHash: Int
+            storageLength: Int
         ) -> Bool {
+            guard document.id == self.document.id,
+                  storageIsInSyncWithDocument(storageLength: storageLength)
+            else { return false }
+            let revision = document.revision
+
             if let cached = Self.syntaxHighlightCache[document.id],
                cached.language == language,
                cached.utf16Length == sourceLength,
-               cached.textHash == sourceHash {
+               cached.revision == revision {
                 setHighlightRuns(cached.runs, in: textView)
                 return true
             }
 
+            // The open-time precompute comes from `DocumentStore`, which has no
+            // view and no revision of this pane's to compare against — it is
+            // keyed on a hash of `doc.text`. That string is a NATIVE Swift
+            // String, so hashing it costs 0.5 ms at 560 KB rather than 28, and
+            // this path is only reached once, when the run cache has missed.
             if let precomputed = document.precomputedSyntaxHighlight,
                precomputed.language == language,
                precomputed.utf16Length == sourceLength,
-               precomputed.textHash == sourceHash {
+               precomputed.textHash == document.text.hashValue {
                 Self.storeSyntaxHighlight(
                     SyntaxHighlightCacheEntry(
                         language: precomputed.language,
                         utf16Length: precomputed.utf16Length,
-                        textHash: precomputed.textHash,
+                        revision: revision,
                         runs: precomputed.runs,
                         document: document
                     ),
@@ -2154,6 +2381,11 @@ private struct EditorRepresentable: NSViewRepresentable {
             let visibleText = (storage.string as NSString).substring(with: range)
             guard !visibleText.isEmpty else { return }
             let documentID = document.id
+            // `range` describes the text as it is right now. A keystroke inside
+            // the ~80 ms before this lands moves everything after it, and the
+            // snippet's runs are offset by `range.location` — so they would be
+            // painted a delta out of place (H6).
+            let currentGeneration = highlightGeneration
             SyntaxEngine.shared.snapshotRuns(
                 text: visibleText,
                 language: language
@@ -2161,6 +2393,7 @@ private struct EditorRepresentable: NSViewRepresentable {
                 guard let self,
                       let textView,
                       let storage = textView.textStorage,
+                      self.highlightGeneration == currentGeneration,
                       self.document.id == documentID,
                       self.boundTextView === textView,
                       self.comparePeer == nil,
@@ -2189,6 +2422,7 @@ private struct EditorRepresentable: NSViewRepresentable {
         func setHighlightRuns(_ runs: [HighlightRun], in textView: NSTextView) {
             highlightRuns = runs
             runsGeneration &+= 1
+            runsAreStale = false
             paintVisibleHighlights(in: textView)
         }
 
@@ -2196,8 +2430,10 @@ private struct EditorRepresentable: NSViewRepresentable {
         func dropHighlightRuns(clearingPaintIn textView: NSTextView) {
             highlightRuns = []
             runsGeneration &+= 1
+            runsAreStale = false
             clearPaintedAttributes(in: textView, range: nil)
             paintedDisplayRange = nil
+            unpaintedHoles = []
             paintedRunsGeneration = runsGeneration
         }
 
@@ -2229,20 +2465,47 @@ private struct EditorRepresentable: NSViewRepresentable {
                 // — a few thousand entries at most, never the document.
                 clearPaintedAttributes(in: textView, range: nil)
                 paintedDisplayRange = nil
+                unpaintedHoles = []
                 paintedRunsGeneration = runsGeneration
                 paintedIsDark = isDark
             }
 
             guard let target = viewportCharacterRange(in: textView) else { return }
 
+            // The painted window is only a claim about the *window*. An edit
+            // inside it leaves characters AppKit never gave an attribute to, so
+            // the holes have to be painted even where the window says there is
+            // nothing to do (H1).
+            let holes = unpaintedHoles.compactMap { hole -> NSRange? in
+                let hit = NSIntersectionRange(hole, target)
+                return hit.length > 0 ? hit : nil
+            }
+
             var pieces: [NSRange]
             if let painted = paintedDisplayRange {
-                if NSIntersectionRange(painted, target) == target { return }
-                pieces = Self.subtracting(painted, from: target)
+                if holes.isEmpty, NSIntersectionRange(painted, target) == target { return }
+                if NSIntersectionRange(painted, target).length == 0 {
+                    // A jump of several screens — go-to-line, a find result, a
+                    // scroller drag. `NSUnionRange` spans the gap between two
+                    // disjoint ranges, and the four-viewport trim below only
+                    // fires past a six-screen jump, so anything shorter
+                    // recorded a band nothing ever painted as painted and the
+                    // early return above refused to paint it on the way back
+                    // (H4). The old window is gone: scrub it and start over.
+                    clearPaintedAttributes(in: textView, range: painted)
+                    paintedDisplayRange = nil
+                    unpaintedHoles = []
+                    pieces = [target]
+                } else {
+                    pieces = Self.subtracting(painted, from: target) + holes
+                }
             } else {
                 pieces = [target]
             }
             guard !pieces.isEmpty else { return }
+            // Whatever was inside this paint is repaired; a hole outside it
+            // still matters for the strip it lives in.
+            unpaintedHoles = unpaintedHoles.flatMap { Self.subtracting(target, from: $0) }
 
             let segments = visibleSegments(in: storage)
             let baseColor = (textView as? EditorTextView)?.editorForegroundColor ?? .editorForeground
@@ -2276,6 +2539,71 @@ private struct EditorRepresentable: NSViewRepresentable {
             }
         }
 
+        /// Install compare word backgrounds only for the visible band plus the
+        /// same one-screen margin used by syntax paint. Full-line backgrounds
+        /// remain in `DiffLayoutManager.lineHighlights`; this owns only the
+        /// temporary `.backgroundColor` ranges inside changed rows.
+        private func paintVisibleCompareWordHighlights(in textView: NSTextView) {
+            guard comparePeer != nil,
+                  let color = compareWordHighlightColor,
+                  !compareWordHighlightRanges.isEmpty,
+                  let layoutManager = textView.layoutManager,
+                  let storage = textView.textStorage,
+                  storage.length > 0,
+                  let target = viewportCharacterRange(in: textView)
+            else { return }
+
+            var pieces: [NSRange]
+            if let painted = paintedCompareWordRange {
+                if NSIntersectionRange(painted, target) == target { return }
+                if NSIntersectionRange(painted, target).length == 0 {
+                    layoutManager.removeTemporaryAttribute(.backgroundColor, forCharacterRange: painted)
+                    pieces = [target]
+                    paintedCompareWordRange = nil
+                } else {
+                    pieces = Self.subtracting(painted, from: target)
+                }
+            } else {
+                pieces = [target]
+            }
+
+            for piece in pieces where piece.length > 0 {
+                let pieceEnd = NSMaxRange(piece)
+                var low = 0
+                var high = compareWordHighlightRanges.count
+                while low < high {
+                    let mid = (low + high) / 2
+                    if NSMaxRange(compareWordHighlightRanges[mid]) <= piece.location {
+                        low = mid + 1
+                    } else {
+                        high = mid
+                    }
+                }
+                var index = low
+                while index < compareWordHighlightRanges.count {
+                    let range = compareWordHighlightRanges[index]
+                    if range.location >= pieceEnd { break }
+                    let visible = NSIntersectionRange(range, piece)
+                    if visible.length > 0, NSMaxRange(visible) <= storage.length {
+                        layoutManager.addTemporaryAttribute(
+                            .backgroundColor, value: color, forCharacterRange: visible
+                        )
+                    }
+                    index += 1
+                }
+            }
+
+            let union = paintedCompareWordRange.map { NSUnionRange($0, target) } ?? target
+            if union.length > 4 * max(target.length, 1) {
+                for stale in Self.subtracting(target, from: union) {
+                    layoutManager.removeTemporaryAttribute(.backgroundColor, forCharacterRange: stale)
+                }
+                paintedCompareWordRange = target
+            } else {
+                paintedCompareWordRange = union
+            }
+        }
+
         private func paint(
             displayRange piece: NSRange,
             segments: [(full: NSRange, display: NSRange)],
@@ -2299,6 +2627,11 @@ private struct EditorRepresentable: NSViewRepresentable {
             // an appearance change a pure repaint: the base colour never has to
             // be written into the storage.
             layoutManager.addTemporaryAttributes([.foregroundColor: baseColor], forCharacterRange: piece)
+
+            // The base colour alone, and nothing from the runs: they describe
+            // text this storage no longer holds, so every offset in them is out
+            // by the edit's delta (H5). Cleared by the next `setHighlightRuns`.
+            guard !runsAreStale else { return }
 
             for segment in segments {
                 let hit = NSIntersectionRange(piece, segment.display)
@@ -2394,11 +2727,14 @@ private struct EditorRepresentable: NSViewRepresentable {
         /// differ, and an edit can even delete a placeholder; rather than guess,
         /// that case keeps the unshifted runs and waits for the rebuild.
         func storageDidEditCharacters(newRange: NSRange, delta: Int) {
-            guard comparePeer == nil,
-                  !foldingManager.isMutating,
-                  foldingManager.regions.isEmpty,
-                  !highlightRuns.isEmpty || paintedDisplayRange != nil
-            else { return }
+            guard comparePeer == nil, !foldingManager.isMutating else { return }
+            guard foldingManager.regions.isEmpty else {
+                // Deliberately not shifted — but not to be trusted either. See
+                // `runsAreStale` (H5).
+                if !highlightRuns.isEmpty { runsAreStale = true }
+                return
+            }
+            guard !highlightRuns.isEmpty || paintedDisplayRange != nil else { return }
             let oldRange = NSRange(
                 location: newRange.location,
                 length: max(0, newRange.length - delta)
@@ -2408,8 +2744,18 @@ private struct EditorRepresentable: NSViewRepresentable {
                 replacing: oldRange,
                 withLength: newRange.length
             )
-            // AppKit shifts the temporary attributes with the edit, so the
-            // painted window has moved in exactly the same way.
+            // The painted WINDOW moves with the text — but the paint inside it
+            // does not survive intact. AppKit splits a temporary-attribute run
+            // around an insertion and leaves the inserted characters bare, so
+            // the window has to carry a hole where the new text landed (H1).
+            if paintedDisplayRange != nil {
+                unpaintedHoles = HighlightRunList.shifting(
+                    unpaintedHoles.map { HighlightRun(range: $0, style: 1) },
+                    replacing: oldRange,
+                    withLength: newRange.length
+                ).map(\.range)
+                if newRange.length > 0 { noteUnpainted(newRange) }
+            }
             if let painted = paintedDisplayRange {
                 paintedDisplayRange = HighlightRunList.shifting(
                     [HighlightRun(range: painted, style: 1)],
@@ -2417,6 +2763,16 @@ private struct EditorRepresentable: NSViewRepresentable {
                     withLength: newRange.length
                 ).first?.range
             }
+        }
+
+        /// Record a span inside the painted window that carries no paint. Past
+        /// `unpaintedHoleLimit` the holes are merged into their union, which is
+        /// still correct — it only ever paints more — and is clipped to the
+        /// viewport before anything is drawn.
+        private func noteUnpainted(_ range: NSRange) {
+            unpaintedHoles.append(range)
+            guard unpaintedHoles.count > Self.unpaintedHoleLimit else { return }
+            unpaintedHoles = [unpaintedHoles.dropFirst().reduce(unpaintedHoles[0], NSUnionRange)]
         }
 
         private func editorBaseAttributes(for textView: NSTextView) -> [NSAttributedString.Key: Any] {
@@ -2470,6 +2826,10 @@ private struct EditorRepresentable: NSViewRepresentable {
                     removeFillerLines(from: storage)
                 }
                 currentLineInfos = []
+                compareInfoRevisions = nil
+                compareWordHighlightRanges = []
+                compareWordHighlightColor = nil
+                paintedCompareWordRange = nil
                 boundGutter?.compareLineInfos = nil
                 boundGutter?.compareTransferPointsRight = nil
                 boundGutter?.onCompareBlockTransfer = nil
@@ -2541,11 +2901,15 @@ private struct EditorRepresentable: NSViewRepresentable {
                         }
                     }
                 }
+                let rowRanges = display.rowRanges.map(\.range)
                 let snapshot = CompareLayoutSnapshot(
                     displayText: display.displayText,
                     lineInfos: display.lineInfos,
-                    rowRanges: display.rowRanges.map(\.range),
-                    wordHighlightRanges: wordHighlightRanges
+                    rowRanges: rowRanges,
+                    wordHighlightRanges: wordHighlightRanges,
+                    fillerRuns: CompareStorageWrite.fillerRuns(
+                        rowRanges: rowRanges, isFiller: display.lineInfos.map(\.isFiller)
+                    )
                 )
                 guard generation.isCurrent(thisVersion) else { return }
 
@@ -2562,8 +2926,14 @@ private struct EditorRepresentable: NSViewRepresentable {
                     // gone from the document with no way back. Bail instead, and
                     // drop the memo so the next rebuild is not short-circuited by
                     // the early-return guard at the top.
-                    guard CompareApplyGuard.shouldApply(builtFrom: side == .left ? leftText : rightText,
-                                                        documentText: self.document.text) else {
+                    guard let livePeer = self.comparePeer,
+                          CompareApplyGuard.shouldApply(
+                              builtFrom: side == .left ? leftText : rightText,
+                              peerSnapshot: side == .left ? rightText : leftText,
+                              documentText: self.document.text,
+                              peerText: livePeer.text
+                          )
+                    else {
                         self.lastCompareLeftText = nil
                         self.lastCompareRightText = nil
                         return
@@ -2596,40 +2966,30 @@ private struct EditorRepresentable: NSViewRepresentable {
                     // replace only the changed middle. This preserves temp attrs on unchanged
                     // ranges and keeps layout invalidation limited to the affected region,
                     // preventing intermediate render frames that cause visible highlight blink.
-                    let oldStr = storage.string as NSString
-                    let newStr = ns.string as NSString
-                    let oldLen = oldStr.length
-                    let newLen = newStr.length
-
-                    // Chunked rather than one character(at:) per UTF-16 unit: that
-                    // is an ObjC message per character, on the main thread, over
-                    // the whole display text on every rebuild.
-                    let prefixLen = NSString.commonPrefixLength(oldStr, newStr)
-                    let suffixLen = NSString.commonSuffixLength(oldStr, newStr, notBefore: prefixLen)
-                    let needsTextReplace = (prefixLen + suffixLen < oldLen) || (prefixLen + suffixLen < newLen)
-
+                    // The write itself lives in `CompareStorageWrite` so the tests drive the
+                    // real one — including the filler-attribute reconcile, which is what the
+                    // incremental path got wrong (see that file).
+                    let (_, needsTextReplace) = CompareStorageWrite.perform(
+                        display: ns,
+                        fillerRuns: snapshot.fillerRuns,
+                        into: storage,
+                        willReplaceText: {
+                            // The storage is about to stop describing what any line
+                            // memo was taken against, and it is display text, not
+                            // `document.text` (U19/U23).
+                            self.noteStorageReplaced(syncedRevision: nil)
+                            // Clear lineHighlights before the storage edit so the
+                            // DiffLayoutManager.processEditing callback (which adjusts highlight
+                            // ranges) doesn't corrupt the values we're about to set.
+                            diffLM?.lineHighlights = []
+                        }
+                    )
                     if needsTextReplace {
-                        // The storage is about to stop describing what any line
-                        // memo was taken against, and it is display text, not
-                        // `document.text` (U19/U23).
-                        self.noteStorageReplaced(syncedRevision: nil)
-                        // Clear lineHighlights before the storage edit so the
-                        // DiffLayoutManager.processEditing callback (which adjusts highlight
-                        // ranges) doesn't corrupt the values we're about to set.
-                        diffLM?.lineHighlights = []
-                        let oldRange = NSRange(location: prefixLen,
-                                              length: oldLen - prefixLen - suffixLen)
-                        let newRange = NSRange(location: prefixLen,
-                                              length: newLen - prefixLen - suffixLen)
-                        storage.beginEditing()
-                        storage.replaceCharacters(in: oldRange,
-                                                  with: ns.attributedSubstring(from: newRange))
-                        storage.endEditing()
-                        // This edit bypasses shouldChangeText, so it registers nothing with
-                        // the undo manager while shifting every offset after oldRange —
-                        // a later ⌘Z would replay stale ranges into the rebuilt display
-                        // text, possibly onto filler lines. Plain typing does NOT reach
-                        // here (the common prefix/suffix already covers the user's own
+                        // The replace bypasses shouldChangeText, so it registers nothing with
+                        // the undo manager while shifting every offset after the replaced
+                        // middle — a later ⌘Z would replay stale ranges into the rebuilt
+                        // display text, possibly onto filler lines. Plain typing does NOT
+                        // reach here (the common prefix/suffix already covers the user's own
                         // characters), so undo survives ordinary editing; it is dropped
                         // only when the diff itself restructures, which is exactly when
                         // the recorded ranges stop meaning anything.
@@ -2638,26 +2998,27 @@ private struct EditorRepresentable: NSViewRepresentable {
                     // Set the correct line highlights now that the storage is final.
                     diffLM?.lineHighlights = lineHighlights
 
-                    // Temp attrs before prefixLen are preserved by the incremental edit.
-                    // Clear only from prefixLen onward and re-apply the full word-highlight set
-                    // (highlights before prefixLen are identical in the new diff, so re-adding
-                    // them is harmless; clearing them separately adds no benefit).
+                    // The diff computes word ranges off-main for the whole file,
+                    // but temporary attributes are installed only around the
+                    // viewport. Rebuilds reset the small painted window; scroll
+                    // notifications add the strips that enter view.
                     if let lm = textView.layoutManager {
-                        let clearFrom = needsTextReplace ? prefixLen : 0
-                        let clearLen  = storage.length - clearFrom
-                        if clearLen > 0 {
+                        if storage.length > 0 {
                             lm.removeTemporaryAttribute(.backgroundColor,
-                                forCharacterRange: NSRange(location: clearFrom, length: clearLen))
-                        }
-                        for range in snapshot.wordHighlightRanges {
-                            let end = range.location + range.length
-                            guard end <= storage.length else { continue }
-                            lm.addTemporaryAttribute(.backgroundColor, value: wordHighlightColor,
-                                forCharacterRange: range)
+                                forCharacterRange: NSRange(location: 0, length: storage.length))
                         }
                     }
+                    self.compareWordHighlightRanges = snapshot.wordHighlightRanges
+                    self.compareWordHighlightColor = wordHighlightColor
+                    self.paintedCompareWordRange = nil
+                    self.paintVisibleCompareWordHighlights(in: textView)
 
                     self.currentLineInfos = snapshot.lineInfos
+                    // The real line numbers in `lineInfos` address these two texts
+                    // and no others. Stamping the revisions they were built from is
+                    // what makes a transfer arrow refuse to act on a document that
+                    // has moved under it (see `transferCompareBlock`).
+                    self.compareInfoRevisions = (own: self.document.revision, peer: livePeer.revision)
 
                     if needsTextReplace {
                         let newDisplayLoc = self.displayOffset(for: savedRealLoc, in: storage)
@@ -2665,17 +3026,104 @@ private struct EditorRepresentable: NSViewRepresentable {
                     }
 
                     self.boundGutter?.compareLineInfos = snapshot.lineInfos
-                    self.boundGutter?.compareTransferPointsRight = (side == .left)
-                    self.boundGutter?.onCompareBlockTransfer = { [weak self] rows in
-                        self?.transferCompareBlock(displayRows: rows)
+                    // The `*` markers are kept against REAL lines and mapped to the
+                    // rows this rebuild produced; display rows move whenever the
+                    // diff inserts a filler above them, which is most rebuilds.
+                    self.boundGutter?.editedLines = self.editedDisplayLines(for: snapshot.lineInfos)
+                    if self.compareTransfersAreSupported(peer: livePeer) {
+                        self.boundGutter?.compareTransferPointsRight = (side == .left)
+                        self.boundGutter?.onCompareBlockTransfer = { [weak self] rows in
+                            self?.transferCompareBlock(displayRows: rows)
+                        }
+                    } else {
+                        self.boundGutter?.compareTransferPointsRight = nil
+                        self.boundGutter?.onCompareBlockTransfer = nil
                     }
                     self.boundGutter?.needsDisplay = true
                     textView.needsDisplay = true
+                    #if DEBUG
+                    Self.compareApplyCount += 1
+                    #endif
                 }
             }
         }
 
         // MARK: - Compare block transfer (copy diff block to other pane)
+
+        /// Record that the user typed on display row `row` (1-based).
+        ///
+        /// Remembered as a REAL line (C8), so a later rebuild that moves the row
+        /// still marks the line they typed on. The gutter is handed the display
+        /// row directly — it is the row the caret is on by definition — and the
+        /// full remap happens on the next rebuild, which is also the only moment
+        /// the mapping can be exact.
+        func noteEditedDisplayRow(_ row: Int) {
+            if row >= 1, row - 1 < currentLineInfos.count,
+               let realLine = currentLineInfos[row - 1].realLineNumber {
+                editedLines.insert(realLine)
+            }
+            var markedRows = boundGutter?.editedLines ?? []
+            markedRows.insert(row)
+            boundGutter?.editedLines = markedRows
+        }
+
+        /// `editedLines` (real line numbers) as the display rows `infos` puts them
+        /// on. A real line that has no row in this rebuild simply has no marker.
+        private func editedDisplayLines(for infos: [CompareLineInfo]) -> Set<Int> {
+            guard !editedLines.isEmpty else { return [] }
+            var rows: Set<Int> = []
+            for (index, info) in infos.enumerated() {
+                if let real = info.realLineNumber, editedLines.contains(real) {
+                    rows.insert(index + 1)
+                }
+            }
+            return rows
+        }
+
+        /// Whether block transfer means anything for this pair of documents.
+        ///
+        /// It does not on a CR-only document. `LineHashing.splitLines` breaks on
+        /// LF and nothing else, so a classic-Mac file reaches compare mode as ONE
+        /// row whose `realLineNumber` is 1, while `CompareBlockSplice` splits the
+        /// target on its own separator and sees N lines — so `(0, 1)` replaced the
+        /// target's first CR-line with the sender's entire document. (The
+        /// September audit taught the splice about CR and nothing else, which is
+        /// what put the two halves out of step.)
+        ///
+        /// Refusing is the honest answer rather than teaching the pipeline to
+        /// split on CR: the display ranges, `realText(from:)`, `realTextOffset`
+        /// and the gutter's row walk are all LF-based, and a half-converted CR
+        /// mode would be wrong in more places than this one. The rows still
+        /// render; only the arrows are withheld.
+        private func compareTransfersAreSupported(peer: Document) -> Bool {
+            document.lineEnding != .cr && peer.lineEnding != .cr
+        }
+
+        /// Whether `currentLineInfos` still describes both documents.
+        ///
+        /// `document.text` is updated synchronously by `textDidChange`, but the
+        /// row array is only refreshed when a rebuild finishes — after the
+        /// debounce (0.08 s under 200 lines, 0.35 s over 5000) plus a round trip
+        /// through the global queue. In that window every `realLineNumber` below
+        /// an inserted line is one too small, so the arrow drawn beside a block
+        /// sends the block one line above it, and the receiving pane resolves its
+        /// own range from an equally stale array. It also makes a double-click on
+        /// an insertion arrow splice twice, because `applyCompareBlockTransfer`
+        /// runs synchronously while the rebuild behind it does not.
+        private func compareRowsDescribeBothDocuments(peer: Document) -> Bool {
+            guard let stamp = compareInfoRevisions else { return false }
+            return stamp.own == document.revision && stamp.peer == peer.revision
+        }
+
+        /// Stop drawing and hit-testing the transfer arrows until the next
+        /// rebuild rewires them. The revision stamp above is the guard that makes
+        /// a stale transfer harmless; this is what stops the user aiming at one.
+        private func invalidateCompareTransferArrows() {
+            guard boundGutter?.compareTransferPointsRight != nil else { return }
+            boundGutter?.compareTransferPointsRight = nil
+            boundGutter?.onCompareBlockTransfer = nil
+            boundGutter?.needsDisplay = true
+        }
 
         /// Called when the user clicks a transfer arrow in this pane's gutter.
         /// Collects the block's real (non-filler) lines from this side and asks the
@@ -2683,6 +3131,8 @@ private struct EditorRepresentable: NSViewRepresentable {
         /// rows are 1:1 aligned between panes, so the row range needs no translation.
         func transferCompareBlock(displayRows: NSRange) {
             guard let peer = comparePeer,
+                  compareTransfersAreSupported(peer: peer),
+                  compareRowsDescribeBothDocuments(peer: peer),
                   NSMaxRange(displayRows) <= currentLineInfos.count,
                   // Same contiguity check the receiving side applies: a block
                   // whose real lines are not one increasing run has no
@@ -2717,9 +3167,25 @@ private struct EditorRepresentable: NSViewRepresentable {
         /// the display-row block with `replacementLines`. An all-filler block on this
         /// side means the lines exist only on the other side — pure insertion after the
         /// nearest real line above. An empty `replacementLines` deletes this side's lines.
+        #if DEBUG
+        /// The peer half of a transfer, driven directly by the audit seam — the
+        /// notification observer that normally calls it is installed by
+        /// `startObserving`, which the seam deliberately does not call.
+        func applyCompareBlockTransferForTesting(displayRows: NSRange, replacementLines: [String]) {
+            applyCompareBlockTransfer(displayRows: displayRows, replacementLines: replacementLines)
+        }
+        #endif
+
         private func applyCompareBlockTransfer(displayRows: NSRange, replacementLines: [String]) {
             let infos = currentLineInfos
-            guard !infos.isEmpty,
+            guard let peer = comparePeer,
+                  compareTransfersAreSupported(peer: peer),
+                  // The receiving side indexes ITS document by ITS row array, so
+                  // it has to be as current as the sending side's. It is also what
+                  // makes a repeat click before the rebuild lands a no-op: the
+                  // first transfer bumps this document's revision.
+                  compareRowsDescribeBothDocuments(peer: peer),
+                  !infos.isEmpty,
                   displayRows.location >= 0,
                   NSMaxRange(displayRows) <= infos.count
             else { return }
@@ -2739,6 +3205,9 @@ private struct EditorRepresentable: NSViewRepresentable {
             document.text = newText
             document.precomputedSyntaxHighlight = nil
             document.isDirty = true
+            // This document just moved, so this pane's rows no longer describe it
+            // — same window as a keystroke (C6). The rebuild below rewires them.
+            invalidateCompareTransferArrows()
             // Same safety-save pair every other text-mutating path uses; draft-only left
             // an autosave-enabled user's transfer unsaved on quit.
             if let tv = boundTextView {
@@ -2908,32 +3377,102 @@ private struct EditorRepresentable: NSViewRepresentable {
             }
         }
 
+        /// The saved side of `computeSavedLineMarks`, split and interned once.
+        ///
+        /// `saved` is `Document.savedText`, which only moves when the file is
+        /// saved, while the diff behind it runs 350 ms after every typing
+        /// burst. Keyed on the string's UTF-8 length and hash: it is a native
+        /// Swift String (it comes from `initialText` or `doc.text`), so hashing
+        /// it is a fraction of what splitting and interning it costs.
+        nonisolated private struct SavedLineMarkBaseline: Sendable {
+            let utf8Count: Int
+            let hash: Int
+            /// The interned saved lines, in order — the diff's A side.
+            let lineIDs: [Int32]
+            /// line text → id, for interning the current side against.
+            let ids: [String: Int32]
+            let nextID: Int32
+        }
+
+        nonisolated(unsafe) private static var savedLineMarkMemo: SavedLineMarkBaseline?
+        nonisolated private static let savedLineMarkMemoLock = NSLock()
+
+        nonisolated private static func savedLineMarkBaseline(
+            for saved: String
+        ) -> SavedLineMarkBaseline {
+            let utf8Count = saved.utf8.count
+            let hash = saved.hashValue
+
+            savedLineMarkMemoLock.lock()
+            let cached = savedLineMarkMemo
+            savedLineMarkMemoLock.unlock()
+            if let cached, cached.utf8Count == utf8Count, cached.hash == hash { return cached }
+
+            let lines = saved.components(separatedBy: "\n")
+            var ids: [String: Int32] = [:]
+            ids.reserveCapacity(lines.count)
+            var nextID: Int32 = 0
+            let lineIDs: [Int32] = lines.map { line in
+                if let id = ids[line] { return id }
+                let id = nextID
+                ids[line] = id
+                nextID += 1
+                return id
+            }
+            let baseline = SavedLineMarkBaseline(
+                utf8Count: utf8Count, hash: hash, lineIDs: lineIDs, ids: ids, nextID: nextID
+            )
+            // One entry: a pane only ever diffs against its own baseline, and
+            // holding a second document's split would double the largest thing
+            // this layer keeps in memory for no gain.
+            savedLineMarkMemoLock.lock()
+            savedLineMarkMemo = baseline
+            savedLineMarkMemoLock.unlock()
+            return baseline
+        }
+
+        #if DEBUG
+        static func clearSavedLineMarkMemoForTesting() {
+            savedLineMarkMemoLock.lock()
+            savedLineMarkMemo = nil
+            savedLineMarkMemoLock.unlock()
+        }
+        #endif
+
         nonisolated static func computeSavedLineMarks(
             saved: String,
             current: String
         ) -> [Int: SavedLineMarkStyle] {
-            let savedLines   = saved.components(separatedBy: "\n")
-            let currentLines = current.components(separatedBy: "\n")
-
             // Intern the lines first: this runs on every keystroke outside
             // compare mode, and feeding raw Strings to the DP made each of its
             // n*m equality tests a String comparison. Only the SHAPE of the op
             // sequence is read below — the line text never is — so diffing ids
             // is equivalent, and interning preserves the equality relation
             // exactly, which is all DiffCalc's tie-breaks depend on.
-            var lineIDs: [String: Int32] = [:]
-            lineIDs.reserveCapacity(savedLines.count + currentLines.count)
-            var nextLineID: Int32 = 0
-            func intern(_ lines: [String]) -> [Int32] {
-                lines.map { line in
-                    if let id = lineIDs[line] { return id }
-                    let id = nextLineID
-                    lineIDs[line] = id
-                    nextLineID += 1
-                    return id
-                }
+            //
+            // The SAVED side only changes when the file is saved, so it is
+            // memoised (TP4): splitting and interning it was half the work of
+            // every post-edit pause — ~52 000 String allocations and as many
+            // dictionary hashes on a 900 KB file, 350 ms after every burst.
+            let baseline = savedLineMarkBaseline(for: saved)
+            let currentLines = current.components(separatedBy: "\n")
+
+            // The current side is interned AGAINST the baseline's table rather
+            // than into it: a line the baseline already knows keeps its id
+            // (which is what makes the diff see a match), and the handful that
+            // are new go in a side table, so the big dictionary is never
+            // copied.
+            var freshIDs: [String: Int32] = [:]
+            var nextLineID = baseline.nextID
+            let currentIDs: [Int32] = currentLines.map { line in
+                if let id = baseline.ids[line] { return id }
+                if let id = freshIDs[line] { return id }
+                let id = nextLineID
+                freshIDs[line] = id
+                nextLineID += 1
+                return id
             }
-            let ops = DiffCalc.diff(intern(savedLines), intern(currentLines)) { $0 == $1 }
+            let ops = DiffCalc.diff(baseline.lineIDs, currentIDs) { $0 == $1 }
 
             // Group consecutive onlyInA/onlyInB runs.
             // Mixed run (deletions + insertions) → modified (amber).
@@ -3551,6 +4090,20 @@ nonisolated enum CompareBenchmarkSeam {
         return CompareTransferGeometry.replaceRange(infos: display.lineInfos, displayRows: displayRows)
     }
 
+    /// One rebuild per entry of `rightVariants`, with the LEFT side held fixed —
+    /// the shape a settled keystroke has, where only one document moved.
+    ///
+    /// The cache is deliberately NOT cleared: the point of the workload is the
+    /// per-side hash memo behind it, and a cold call would measure the opposite.
+    /// Clear it once with `rowHistogram` before timing.
+    static func keystrokeRebuildChecksum(left: String, rightVariants: [String]) -> Int {
+        var checksum = 0
+        for right in rightVariants {
+            checksum &+= histogram(of: CompareEngine.buildRows(leftText: left, rightText: right))[6]
+        }
+        return checksum
+    }
+
     /// Checksum over both panes' built display, for the perf harness: the whole
     /// display build including the word-level diff, from a cold cache.
     static func displayChecksum(left: String, right: String) -> Int {
@@ -3596,6 +4149,12 @@ enum EditorViewAuditSeam {
             }
     }
 
+    /// Drop the memoised saved side (TP4), so a test can compare a cold
+    /// baseline against a hot one.
+    static func clearSavedLineMarkMemo() {
+        EditorRepresentable.Coordinator.clearSavedLineMarkMemoForTesting()
+    }
+
     // MARK: S5 — whole-document highlight cache
 
     static var highlightCacheLimit: Int {
@@ -3610,10 +4169,10 @@ enum EditorViewAuditSeam {
         EditorRepresentable.Coordinator.syntaxHighlightCacheContainsForTesting(id)
     }
 
-    /// Stores a small entry for `document`, exactly the way a finished
-    /// highlight does.
-    static func storeHighlight(for document: Document) {
-        EditorRepresentable.Coordinator.storeSyntaxHighlightForTesting(for: document)
+    /// Stores an entry for `document` at its current revision, exactly the way
+    /// a finished highlight does.
+    static func storeHighlight(for document: Document, runs: [HighlightRun] = []) {
+        EditorRepresentable.Coordinator.storeSyntaxHighlightForTesting(for: document, runs: runs)
     }
 
     static func clearHighlightCache() {
@@ -3697,6 +4256,11 @@ enum EditorViewAuditSeam {
             layoutManager.ensureLayout(for: container)
             textView.setFrameOrigin(.zero)
             scrollView.layoutSubtreeIfNeeded()
+            // `makeNSView` says this the moment it assigns `textView.string`:
+            // the storage holds exactly `document.text` at this revision. The
+            // run cache's O(1) identity (HP1) asks for it, so a probe that
+            // skipped it would miss its own cache entry every time.
+            coordinator.noteStorageReplaced(syncedRevision: document.revision)
         }
 
         var foldingManager: FoldingManager { coordinator.foldingManager }
@@ -3768,6 +4332,51 @@ enum EditorViewAuditSeam {
             paintedForegroundColors().reduce(0) { $0 + ($1 == nil ? 0 : 1) }
         }
 
+        /// One character's painted colour, for documents too big to map.
+        func paintedForegroundColor(at index: Int) -> NSColor? {
+            textView.layoutManager?.temporaryAttribute(
+                .foregroundColor, atCharacterIndex: index, effectiveRange: nil
+            ) as? NSColor
+        }
+
+        /// What an unstyled character must end up painted with.
+        var baseForegroundColor: NSColor { textView.editorForegroundColor }
+
+        /// A tab switch: the coordinator and the text view take a new document,
+        /// the storage is replaced wholesale, and the coordinator is told so —
+        /// exactly the three steps `updateNSView` takes. Returns the incoming
+        /// document; `probe.document` stays the outgoing one.
+        @discardableResult
+        func swapDocument(text: String, language: String = "plaintext") -> Document {
+            let incoming = Document(url: nil, initialText: text, encoding: .utf8, hasBOM: false)
+            incoming.language = language
+            coordinator.document = incoming
+            textView.document = incoming
+            textView.string = text
+            coordinator.noteStorageReplaced(syncedRevision: incoming.revision)
+            return incoming
+        }
+
+        /// A reload from disk: the same document, new text, the storage
+        /// replaced wholesale.
+        func replaceStorageWholesale(with text: String) {
+            document.text = text
+            textView.string = text
+            coordinator.noteStorageReplaced(syncedRevision: document.revision)
+        }
+
+        /// The tab-switch entry point: cached runs if there are any, a viewport
+        /// snippet plus a deferred full pass if there are not.
+        func applyCachedHighlightOrDefer() {
+            coordinator.applyCachedHighlightOrDefer(to: textView, document: coordinator.document)
+        }
+
+        /// Cancel both debounced passes, so only the result already in flight
+        /// can land.
+        func cancelPendingHighlightWork() {
+            coordinator.cancelPendingHighlightWorkForTesting()
+        }
+
         /// Every attribute key present in the STORAGE, anywhere. The invariant
         /// is that syntax colouring never appears here.
         func storageAttributeKeys() -> Set<String> {
@@ -3825,6 +4434,178 @@ enum EditorViewAuditSeam {
             (0..<storage.length).map {
                 storage.attribute(.foregroundColor, at: $0, effectiveRange: nil) as? NSColor
             }
+        }
+    }
+}
+#endif
+
+// MARK: - Compare coordinator seam (DEBUG)
+
+#if DEBUG
+/// Test seam for the compare findings of the 17 September 2026 audit.
+///
+/// `EditorRepresentable.Coordinator` is file-private, and the findings here (C2,
+/// C6, C7) are all about *when a transfer arrow may act*, which is a decision
+/// only two live, peered coordinators make. This builds exactly that: two real
+/// TextKit 1 stacks with a gutter each, wired to each other the way
+/// `CompareModeView` wires them — and with no global notification observers,
+/// which is the only reason `startObserving` is not called.
+@MainActor
+enum CompareCoordinatorAuditSeam {
+
+    /// A `.compareBlockTransfer` as it went over the notification centre.
+    struct PostedTransfer: Sendable {
+        let targetDocumentID: Document.ID
+        let displayRows: NSRange
+        let lines: [String]
+    }
+
+    @MainActor
+    final class PanePair {
+        let leftDocument: Document
+        let rightDocument: Document
+
+        private let leftPane: Pane
+        private let rightPane: Pane
+        private var transferObserver: NSObjectProtocol?
+
+        /// Every transfer this pair has posted, in order.
+        private(set) var postedTransfers: [PostedTransfer] = []
+
+        private struct Pane {
+            let document: Document
+            let textView: EditorTextView
+            let gutter: LineNumberRulerView
+            let scrollView: NSScrollView
+            let coordinator: EditorRepresentable.Coordinator
+        }
+
+        init(left: String, right: String, lineEnding: TextLineEnding = .lf) {
+            leftDocument = Document(url: nil, initialText: left, encoding: .utf8, hasBOM: false)
+            rightDocument = Document(url: nil, initialText: right, encoding: .utf8, hasBOM: false)
+            leftDocument.lineEnding = lineEnding
+            rightDocument.lineEnding = lineEnding
+            leftPane = Self.makePane(document: leftDocument, text: left)
+            rightPane = Self.makePane(document: rightDocument, text: right)
+            leftPane.coordinator.updateCompareContext(peer: rightDocument, side: .left)
+            rightPane.coordinator.updateCompareContext(peer: leftDocument, side: .right)
+            transferObserver = NotificationCenter.default.addMainActorObserver(
+                forName: .compareBlockTransfer, object: nil, queue: .main
+            ) { [weak self] notification in
+                guard let self,
+                      let info = notification.userInfo,
+                      let target = info["targetDocumentID"] as? Document.ID,
+                      let rows = info["displayRows"] as? NSValue,
+                      let lines = info["lines"] as? [String]
+                else { return }
+                self.postedTransfers.append(
+                    PostedTransfer(targetDocumentID: target, displayRows: rows.rangeValue, lines: lines)
+                )
+            }
+        }
+
+        isolated deinit {
+            if let transferObserver { NotificationCenter.default.removeObserver(transferObserver) }
+        }
+
+        private static func makePane(document: Document, text: String) -> Pane {
+            let storage = NSTextStorage(string: text)
+            let layoutManager = DiffLayoutManager()
+            storage.addLayoutManager(layoutManager)
+            let container = NSTextContainer(
+                size: NSSize(width: 400, height: CGFloat.greatestFiniteMagnitude)
+            )
+            container.widthTracksTextView = true
+            layoutManager.addTextContainer(container)
+            let textView = EditorTextView(frame: NSRect(x: 0, y: 0, width: 400, height: 300),
+                                          textContainer: container)
+            textView.isRichText = false
+            let scrollView = NSScrollView(frame: NSRect(x: 0, y: 0, width: 400, height: 300))
+            scrollView.documentView = textView
+            layoutManager.ownerTextView = textView
+            let gutter = LineNumberRulerView(scrollView: scrollView, textView: textView)
+            let coordinator = EditorRepresentable.Coordinator(document: document)
+            coordinator.boundTextView = textView
+            coordinator.boundScrollView = scrollView
+            coordinator.boundGutter = gutter
+            textView.document = document
+            textView.foldingManager = coordinator.foldingManager
+            return Pane(document: document, textView: textView, gutter: gutter,
+                        scrollView: scrollView, coordinator: coordinator)
+        }
+
+        private func pane(left: Bool) -> Pane { left ? leftPane : rightPane }
+
+        /// Rebuild both panes and spin the run loop until both applies land. The
+        /// build is dispatched to a global queue and back, so there is nothing to
+        /// await; the counter is the only observable the apply leaves behind.
+        @discardableResult
+        func rebuild(timeout: TimeInterval = 5) -> Bool {
+            let target = EditorRepresentable.Coordinator.compareApplyCount + 2
+            leftPane.coordinator.applyCompareDisplay(to: leftPane.textView, document: leftDocument)
+            rightPane.coordinator.applyCompareDisplay(to: rightPane.textView, document: rightDocument)
+            let deadline = Date().addingTimeInterval(timeout)
+            while EditorRepresentable.Coordinator.compareApplyCount < target, Date() < deadline {
+                RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.01))
+            }
+            return EditorRepresentable.Coordinator.compareApplyCount >= target
+        }
+
+        /// A keystroke through the real path: edit the storage and hand the
+        /// coordinator the notification AppKit would have delivered. The rebuild
+        /// it schedules is debounced, so the pane is left in exactly the window
+        /// C6 is about — `document.text` already moved, the row array has not.
+        func type(left: Bool, at location: Int, _ text: String) {
+            let target = pane(left: left)
+            target.textView.textStorage?.replaceCharacters(
+                in: NSRange(location: location, length: 0), with: text
+            )
+            target.textView.setSelectedRange(
+                NSRange(location: location + (text as NSString).length, length: 0)
+            )
+            target.coordinator.textDidChange(
+                Notification(name: NSText.didChangeNotification, object: target.textView)
+            )
+        }
+
+        /// Move a document without touching its pane — what a peer edit looks
+        /// like from the other side, minus the notification.
+        func setDocumentText(left: Bool, to text: String) {
+            pane(left: left).document.text = text
+        }
+
+        /// Click the transfer arrow this pane draws beside `displayRows`.
+        func clickTransferArrow(left: Bool, displayRows: NSRange) {
+            pane(left: left).coordinator.transferCompareBlock(displayRows: displayRows)
+        }
+
+        /// Deliver a posted transfer to its target pane, the way that pane's own
+        /// `.compareBlockTransfer` observer would.
+        func deliver(_ transfer: PostedTransfer) {
+            let target = transfer.targetDocumentID == leftDocument.id ? leftPane : rightPane
+            target.coordinator.applyCompareBlockTransferForTesting(
+                displayRows: transfer.displayRows, replacementLines: transfer.lines
+            )
+        }
+
+        /// Whether this pane's gutter is currently drawing transfer arrows.
+        func arrowsAreLive(left: Bool) -> Bool {
+            let gutter = pane(left: left).gutter
+            return gutter.compareTransferPointsRight != nil && gutter.onCompareBlockTransfer != nil
+        }
+
+        /// The `*` marker rows the gutter has been handed.
+        func markedRows(left: Bool) -> Set<Int> { pane(left: left).gutter.editedLines }
+
+        func wordBackground(left: Bool, at index: Int) -> NSColor? {
+            pane(left: left).textView.layoutManager?.temporaryAttribute(
+                .backgroundColor, atCharacterIndex: index, effectiveRange: nil
+            ) as? NSColor
+        }
+
+        /// Record a keystroke on a display row, the way `textDidChange` does.
+        func noteEdit(left: Bool, atDisplayRow row: Int) {
+            pane(left: left).coordinator.noteEditedDisplayRow(row)
         }
     }
 }

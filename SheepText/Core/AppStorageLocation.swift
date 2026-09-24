@@ -3,7 +3,7 @@
 //  SheepText
 //
 //  Where the app keeps what it persists: preferences, the session, recents,
-//  security-scoped bookmarks, drafts, backups and plugins.
+//  security-scoped bookmarks, drafts and backups.
 //
 
 import Foundation
@@ -94,6 +94,21 @@ nonisolated enum AppStorageLocation {
     /// container's copy of them.
     static let sandboxMigrationMarkerKey = "sheeptext.migratedFromSandboxContainer"
 
+    /// Keys the sandbox needed and an unsandboxed app cannot use.
+    ///
+    /// These two dictionaries hold app-scoped security-scoped bookmark blobs —
+    /// on this machine 449 KB of them, essentially the whole preferences
+    /// domain. Since 3.7 `prepare`, `restore` and `remember` all short-circuit
+    /// on `!isSandboxed`, so nothing reads them, nothing writes them, and
+    /// nothing would ever prune them; `cfprefsd` reads and caches the domain at
+    /// every launch. They are not even valid for a non-sandboxed process.
+    /// Named by string rather than through `SecurityScopedResourceAccess` so
+    /// this stays true if that type is one day deleted.
+    static let obsoleteSandboxKeys: Set<String> = [
+        "sheeptext.securityScoped.fileBookmarks",
+        "sheeptext.securityScoped.workspaceBookmarks"
+    ]
+
     /// The old container's Data directory, whether or not it still exists.
     static var sandboxContainerData: URL {
         let bundleID = Bundle.main.bundleIdentifier ?? "Bestchaan.SheepText"
@@ -118,12 +133,26 @@ nonisolated enum AppStorageLocation {
     /// Copy a sandbox container's settings and Application Support tree into
     /// the plain user-domain locations an unsandboxed app reads.
     ///
-    /// Settings are copied key by key and overwrite what is in the destination:
-    /// the destination domain holds whatever the app wrote before it was ever
-    /// sandboxed, which is years stale, while the container is the state the
-    /// user actually has. Files are copied item by item and never overwrite —
-    /// a draft already in the new location is newer than the container's.
-    /// The container is left untouched, so this is undoable by hand.
+    /// Settings are copied key by key and overwrite what is in the destination.
+    /// Files are copied item by item and never overwrite. The two halves have
+    /// opposite policies on purpose, and the reason is the same for both: the
+    /// container is the only state the user has. This bundle id has only ever
+    /// been sandboxed (`ENABLE_APP_SANDBOX = YES` arrived with the BeeSheep →
+    /// SheepText rename), so nothing ever wrote the destination domain or
+    /// `~/Library/Application Support/SheepText` before 3.7 — a value there is
+    /// either absent or something this migration itself put there on an
+    /// earlier, interrupted run. Overwriting a setting is then harmless, and
+    /// NOT overwriting a file is what makes an interrupted run safe to repeat.
+    /// (The previous comment claimed the destination held "years stale"
+    /// pre-sandbox settings. There are none.)
+    ///
+    /// **One way.** The marker lives in the destination domain, which a
+    /// sandboxed 3.6 cannot see, so running 3.6 again after 3.7 writes to the
+    /// container and nothing brings it back. The container is left untouched,
+    /// so that is recoverable by hand; it is not recovered automatically.
+    ///
+    /// The container's security-scoped bookmarks are deliberately NOT copied:
+    /// see `obsoleteSandboxKeys`.
     @discardableResult
     static func migrateFromSandboxContainer(
         container: URL,
@@ -142,9 +171,12 @@ nonisolated enum AppStorageLocation {
            let stored = try? PropertyListSerialization.propertyList(
                from: data, options: [], format: nil
            ) as? [String: Any] {
-            for (key, value) in stored where key != sandboxMigrationMarkerKey {
+            for (key, value) in stored
+            where key != sandboxMigrationMarkerKey && !obsoleteSandboxKeys.contains(key) {
                 destination.set(value, forKey: key)
             }
+            // Also from an earlier migration, before this skipped them.
+            for key in obsoleteSandboxKeys { destination.removeObject(forKey: key) }
         }
 
         if let applicationSupport {

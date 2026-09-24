@@ -60,11 +60,28 @@ final class UpdateChecker {
     // MARK: - Private
 
     private static func fetchLatestRelease() async throws -> GitHubRelease {
-        let url = URL(string: "https://api.github.com/repos/bestonehxh/SheepText/releases/latest")!
+        let url = URL(string: "https://api.github.com/repos/\(repositoryPath)/releases/latest")!
         var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 15)
         request.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
-        let (data, _) = try await URLSession.shared.data(for: request)
+        let (data, response) = try await URLSession.shared.data(for: request)
+        // The response used to be discarded, so a 403 body — which is what the
+        // unauthenticated API answers after 60 requests an hour — went to the
+        // decoder and came back as "could not reach GitHub".
+        if let http = response as? HTTPURLResponse,
+           let error = responseError(forStatusCode: http.statusCode) {
+            throw error
+        }
         return try JSONDecoder().decode(GitHubRelease.self, from: data)
+    }
+
+    /// `nil` for a status this app will read a release out of. Split out as a
+    /// pure function so the rate-limit case can be tested without a network.
+    nonisolated static func responseError(forStatusCode status: Int) -> UpdateCheckError? {
+        switch status {
+        case 200..<300: return nil
+        case 403, 429:  return .rateLimited
+        default:        return .badStatus(status)
+        }
     }
 
     private func present(_ release: GitHubRelease, silent: Bool) {
@@ -77,9 +94,8 @@ final class UpdateChecker {
             alert.informativeText = "SheepText \(latest) is available (you have \(current))."
             alert.addButton(withTitle: "Download")
             alert.addButton(withTitle: "Later")
-            if alert.runModal() == .alertFirstButtonReturn,
-               let url = URL(string: release.htmlURL) {
-                NSWorkspace.shared.open(url)
+            if alert.runModal() == .alertFirstButtonReturn {
+                NSWorkspace.shared.open(Self.downloadURL(htmlURL: release.htmlURL))
             }
         } else if !silent {
             let alert = NSAlert()
@@ -93,8 +109,49 @@ final class UpdateChecker {
     private func presentError(_ error: Error) {
         let alert = NSAlert()
         alert.messageText     = "Update Check Failed"
-        alert.informativeText = "Could not reach GitHub. Check your internet connection.\n\n\(error.localizedDescription)"
+        // A rate limit is not a connection problem, and telling the user to
+        // check their internet when GitHub is throttling them sends them
+        // looking in the wrong place.
+        if let updateError = error as? UpdateCheckError {
+            alert.informativeText = updateError.errorDescription ?? "\(updateError)"
+        } else {
+            alert.informativeText = "Could not reach GitHub. Check your internet connection.\n\n\(error.localizedDescription)"
+        }
         alert.runModal()
+    }
+
+    // MARK: - Where "Download" goes
+
+    /// The repository the app updates from, as path components. The host check
+    /// below compares components, not a string prefix, so
+    /// `/bestonehxh/SheepTextEvil` cannot pass as `/bestonehxh/SheepText`.
+    nonisolated static let repositoryPath = "bestonehxh/SheepText"
+
+    /// Where "Download" goes when the release JSON does not name a page this
+    /// app is willing to open.
+    nonisolated static let releasesPageURL =
+        URL(string: "https://github.com/\(repositoryPath)/releases/latest")!
+
+    /// `html_url` out of the release JSON is a string this app did not write —
+    /// it went straight to `NSWorkspace.open`, which honours `file://` and
+    /// every registered custom scheme, and since 3.7 there is no sandbox around
+    /// what that launches. Accept only an https page in this repository;
+    /// anything else means the hard-coded releases page, which is always right
+    /// even when it is not the exact release.
+    nonisolated static func downloadURL(htmlURL: String) -> URL {
+        guard let url = URL(string: htmlURL),
+              url.scheme?.lowercased() == "https",
+              url.host?.lowercased() == "github.com"
+        else { return releasesPageURL }
+
+        // pathComponents of "/owner/repo/releases/..." is ["/", "owner", "repo", …].
+        let expected = repositoryPath.split(separator: "/").map(String.init)
+        let components = url.pathComponents.dropFirst()
+        guard components.count >= expected.count,
+              Array(components.prefix(expected.count)) == expected
+        else { return releasesPageURL }
+
+        return url
     }
 
     /// Compare two version strings.
@@ -125,6 +182,20 @@ final class UpdateChecker {
     nonisolated private static func numericComponents(of version: String) -> [Int] {
         let core = version.prefix { $0 != "-" && $0 != "+" && $0 != " " }
         return core.split(separator: ".").map { Int($0) ?? 0 }
+    }
+}
+
+enum UpdateCheckError: LocalizedError, Equatable {
+    case rateLimited
+    case badStatus(Int)
+
+    var errorDescription: String? {
+        switch self {
+        case .rateLimited:
+            return "GitHub is rate-limiting update checks from this network. Try again later."
+        case .badStatus(let code):
+            return "GitHub answered the update check with HTTP \(code)."
+        }
     }
 }
 

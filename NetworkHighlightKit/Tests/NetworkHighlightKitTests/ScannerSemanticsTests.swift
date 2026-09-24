@@ -204,6 +204,87 @@ final class ScannerSemanticsTests: XCTestCase {
         assertDoesNotClaim(.cisco, "service port 443", "port", [.interface])
     }
 
+    // MARK: - Unicode spaces are spaces
+
+    /// A config pasted out of a browser, a Confluence page or Word carries
+    /// NBSP where the spaces were, and `.txt` is a first-class extension for
+    /// this language. "Every byte >= 0x80 is a word byte" killed BOTH spans
+    /// around one: the address failed `boundaryAfter` on the NBSP's lead byte
+    /// `C2` and the mask failed `boundaryBefore` on its continuation byte `A0`.
+    /// `assertClaims` works in byte offsets and its fixtures are ASCII; these
+    /// are not, so they check the UTF-16 spans `spans(in:)` actually returns.
+    private func claimedToken(
+        _ vendor: Vendor, _ text: String, _ token: String
+    ) -> (text: String, rule: NetworkRule)? {
+        let ns = text as NSString
+        let want = ns.range(of: token)
+        guard want.location != NSNotFound else { return nil }
+        let touching = NetworkHighlighter(vendor: vendor).spans(in: text).filter {
+            $0.range.lowerBound < NSMaxRange(want) && want.location < $0.range.upperBound
+        }
+        guard touching.count == 1 else { return nil }
+        let range = NSRange(location: touching[0].range.lowerBound, length: touching[0].range.count)
+        guard NSMaxRange(range) <= ns.length else { return nil }
+        return (ns.substring(with: range), touching[0].rule)
+    }
+
+    func testANonBreakingSpaceIsABoundaryLikeAPlainSpace() {
+        for separator in ["\u{00A0}", "\u{2007}", "\u{202F}", "\u{2028}", "\u{2029}",
+                          "\u{0085}", "\u{3000}", "\u{2009}"] {
+            let label = separator.debugDescription
+            let text = "ip address 10.0.0.1\(separator)255.255.255.0"
+            XCTAssertEqual(claimedToken(.cisco, text, "10.0.0.1")?.rule, .ipv4, label)
+            XCTAssertEqual(claimedToken(.cisco, text, "10.0.0.1")?.text, "10.0.0.1", label)
+            XCTAssertEqual(claimedToken(.cisco, text, "255.255.255.0")?.rule, .mask, label)
+
+            let named = "\(separator)GigabitEthernet1/0/1 up"
+            XCTAssertEqual(
+                claimedToken(.cisco, named, "GigabitEthernet1/0/1")?.text,
+                "GigabitEthernet1/0/1", label
+            )
+        }
+    }
+
+    /// The mirror image: a letter on the other side of the boundary still
+    /// blocks the match, and a ZWJ/ZWSP still does — ZWJ holds an emoji
+    /// sequence together, so treating it as a separator would split a grapheme.
+    func testLettersAndZeroWidthJoinersAreStillWordBytes() {
+        for text in ["ห้อง10.0.0.1 here", "ip address 10.0.0.1\u{200D}x",
+                     "ip address 10.0.0.1\u{200B}"] {
+            XCTAssertNotEqual(
+                claimedToken(.cisco, text, "10.0.0.1")?.rule, .ipv4, text.debugDescription
+            )
+        }
+    }
+
+    /// `spansUTF16` splits on what `NSString.lineRange(for:)` splits on, so the
+    /// editor's incremental slice and the package's whole-document pass see the
+    /// same lines. The offsets have to survive it: CRLF is two UTF-16 units,
+    /// U+2028 is one, NEL is one.
+    func testEveryLineTerminatorKeepsTheUTF16OffsetsExact() {
+        for terminator in ["\n", "\r\n", "\r", "\u{2028}", "\u{2029}", "\u{0085}"] {
+            let text = "interface Gi1/0/1" + terminator
+                + " ip address 10.0.0.1 255.255.255.0" + terminator
+                + " description ห้อง 🐑" + terminator
+                + "10.20.30.40 up"
+            let ns = text as NSString
+            let spans = NetworkHighlighter(vendor: .cisco).spans(in: text)
+            XCTAssertFalse(spans.isEmpty, terminator.debugDescription)
+            for span in spans {
+                let range = NSRange(location: span.range.lowerBound, length: span.range.count)
+                XCTAssertLessThanOrEqual(NSMaxRange(range), ns.length, terminator.debugDescription)
+                XCTAssertEqual(ns.substring(with: range).utf16.count, span.range.count)
+            }
+            // The address opening the last line is only reachable when the
+            // terminator really ended a line.
+            XCTAssertTrue(
+                spans.contains { ns.substring(with: NSRange(location: $0.range.lowerBound,
+                                                            length: $0.range.count)) == "10.20.30.40" },
+                "10.20.30.40 not claimed after \(terminator.debugDescription)"
+            )
+        }
+    }
+
     func testHuaweiDigitLedSpeedPorts() {
         assertClaims(.huawei, "100GE1/2/3 down down", "100GE1/2/3", .interface)
         assertClaims(.huawei, "10GE1/1/17 up up", "10GE1/1/17", .interface)

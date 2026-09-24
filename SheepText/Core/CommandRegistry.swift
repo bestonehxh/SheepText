@@ -1,10 +1,10 @@
 //
 //  CommandRegistry.swift
-//  id → handler map. Commands are registered by built-ins and by plugins.
+//  id → handler map, filled by the built-in commands.
 //  The palette reads from CommandRegistry.list() to show its entries.
 //
-//  Thread model: the registry itself is an actor. Handlers are called from
-//  their registering thread (main for built-ins, plugin queue for plugins).
+//  Everything here is main-actor: the registry is written at launch and read
+//  by the palette, both on the main thread.
 //
 
 import Foundation
@@ -21,14 +21,6 @@ final class CommandRegistry {
         let id: String
         let title: String
         let handler: ([Any]) -> Void
-        /// Source: built-in, or a plugin ID. Used when reloading plugins so we
-        /// can remove only that plugin's commands.
-        let source: Source
-    }
-
-    enum Source: Equatable {
-        case builtIn
-        case plugin(String)
     }
 
     private(set) var entries: [String: Entry] = [:]
@@ -38,16 +30,12 @@ final class CommandRegistry {
         recentCommandIDs = AppStorageLocation.defaults.stringArray(forKey: recentCommandsKey) ?? []
     }
 
-    func register(id: String, title: String, source: Source = .builtIn, handler: @escaping ([Any]) -> Void) {
-        entries[id] = Entry(id: id, title: title, handler: handler, source: source)
+    func register(id: String, title: String, handler: @escaping ([Any]) -> Void) {
+        entries[id] = Entry(id: id, title: title, handler: handler)
     }
 
     func unregister(id: String) {
         entries.removeValue(forKey: id)
-    }
-
-    func unregisterAll(from source: Source) {
-        entries = entries.filter { $0.value.source != source }
     }
 
     func execute(_ id: String, args: [Any] = []) {

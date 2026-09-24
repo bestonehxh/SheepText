@@ -3,7 +3,7 @@
 //  The find-and-replace bar that slides down from the top of the editor.
 //
 //  Triggered by notifications (.findBarShow, .findBarShowWithReplace) so
-//  menu items, keybindings, and plugins can all open it without coupling.
+//  menu items and keybindings can both open it without coupling.
 //
 //  Matching strategy:
 //    - Plain text search by default (fast, honors options)
@@ -70,7 +70,7 @@ nonisolated enum FindMatching {
     /// The subset of `ranges` that still describes a match of `regex` in `text`.
     ///
     /// Match ranges were computed once and then applied blind. Anything that
-    /// edited the document in between — the user typing, a plugin, a compare
+    /// edited the document in between — the user typing, a compare
     /// transfer, an external reload — moved the text out from under them, and
     /// Replace wrote the replacement over whatever now occupied those offsets.
     /// A range survives only if the text at exactly those offsets is exactly a

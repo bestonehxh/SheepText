@@ -8,39 +8,50 @@ nonisolated enum DiffOp<T> {
 
 nonisolated enum DiffCalc {
 
-    /// Ceiling on the edit distance the Myers search explores before giving up.
+    /// Bounds on the Myers search. Myers is O(D x (n+m)) in time and — with the
+    /// packed V trace below — O(D^2 / 2) `Int32` in space, so both have to be
+    /// bounded for inputs that are not related at all (there D approaches n+m).
+    /// Each bound is on the thing it is actually about:
     ///
-    /// Myers is O(D x (n+m)) in time and — with the packed V trace below —
-    /// O(D^2 / 2) `Int32` in space, so both have to be bounded for inputs that
-    /// are not related at all (there D approaches n+m).
+    /// * `myersWorkBudget` bounds the TIME, counted AS IT GOES (see `work` in
+    ///   `myersMiddle`): one unit per diagonal visited plus one per element
+    ///   comparison inside a snake. It used to be spent up front as
+    ///   `myersWorkBudget / (rn + rm)`, which made the tolerated edit distance
+    ///   inversely proportional to file size — roughly `D <= 6_000_000 / n`, so
+    ///   `maxD` was 60 on a 200 000-line pair and forty scattered edits fell
+    ///   back and reported 190 243 changed rows. That is the same failure the
+    ///   old `n*m > 4_000_000` cliff produced, moved up a couple of orders of
+    ///   magnitude.
+    /// * `myersMinDistance` is the distance ALWAYS allowed, whatever the inputs
+    ///   look like — the 3000 every earlier release documented, kept so that
+    ///   nothing that used to be exact stops being exact.
+    /// * `myersMaxDistance` bounds the MEMORY: the trace is D*(D+1)/2 `Int32`,
+    ///   so 4096 is 8.4 M entries = 34 MB, transient and allocated on the
+    ///   background compare queue. (It was 3000 = 18 MB, which is below the
+    ///   D = 4000 that two thousand edited lines cost — in a file that is still
+    ///   99 % identical to its twin.)
+    /// * Between the two, the ceiling is RELATEDNESS, which is what "these two
+    ///   files are not versions of each other" actually means: `D >= 3/4 (rn+rm)`
+    ///   leaves fewer than a quarter of the lines shared. On the 2000-line pairs
+    ///   the numbers below were measured on it lands on exactly the 3000 the old
+    ///   memory ceiling did, so every documented boundary is unchanged.
     ///
-    /// * `myersWorkBudget / (rn + rm)` bounds the TIME: roughly 24 million
-    ///   element comparisons before we give up.
-    /// * `myersMaxDistance` bounds the MEMORY: D <= 3000 means a trace of
-    ///   3000*3001/2 `Int32` = 18 MB, the same order as the 16 MB the old exact
-    ///   LCS table allocated for two 2000-line files (and that table grew
-    ///   quadratically from there, which is why the old code refused above it).
-    ///
-    /// What the ceiling means in practice. D is about twice the number of lines
+    /// What the ceilings mean in practice. D is about twice the number of lines
     /// that actually differ, so:
     ///
-    /// * anything whose trimmed middles total 3000 lines or fewer is diffed
-    ///   EXACTLY whatever it contains — including the two 2001-line files
-    ///   differing in two lines that the old size-based cliff reported as 1991
-    ///   changed lines;
-    /// * above that, the ceiling is only reached when the sides are mostly
-    ///   unrelated. Measured on 2000-line pairs: 50 % changed -> D = 2000,
-    ///   75 % changed -> D = 3000, both exact; fully disjoint -> D = 4000,
-    ///   which falls back.
+    /// * a pair differing in up to ~2000 lines is diffed EXACTLY whatever its
+    ///   size — 200 000 lines with 40 scattered edits, or with 2000 of them;
+    /// * above that the exact search is abandoned, and so it is when the sides
+    ///   are mostly unrelated whatever their size. Measured on 2000-line pairs:
+    ///   50 % changed -> D = 2000, 75 % changed -> D = 3000, both exact; fully
+    ///   disjoint -> D = 4000, which falls back.
     ///
     /// The fallback is the existing `prefixSuffixDiff`, i.e. exactly the output
     /// the old code produced in its own fallback regime — so nothing that used
-    /// to fall back changes shape, it just falls back on relatedness instead of
-    /// on size. The cost is that a hopeless pair now spends ~24 ms proving it
-    /// (two disjoint 2000-line files) where the old exact DP took ~4 ms to
-    /// return the same zero matches.
+    /// to fall back changes shape.
     private static let myersWorkBudget = 24_000_000
-    private static let myersMaxDistance = 3_000
+    private static let myersMinDistance = 3_000
+    private static let myersMaxDistance = 4_096
 
     static func diff<T>(
         _ a: [T],
@@ -90,7 +101,11 @@ nonisolated enum DiffCalc {
             return result
         }
 
-        let maxD = min(myersMaxDistance, myersWorkBudget / (rn + rm))
+        // Relatedness, floored by the distance always allowed and capped by the
+        // trace's memory ceiling. The time bound is counted inside `myersMiddle`
+        // rather than guessed at from the input size.
+        let relatednessCeiling = 3 * (rn + rm) / 4
+        let maxD = min(myersMaxDistance, max(myersMinDistance, relatednessCeiling))
         if let middle = myersMiddle(a, b, aOffset: prefix, bOffset: prefix,
                                     n: rn, m: rm, maxD: maxD, equal: equal) {
             result.append(contentsOf: middle)
@@ -107,8 +122,9 @@ nonisolated enum DiffCalc {
     /// Greedy forward Myers (O(ND)) over `a[aOffset ..< aOffset+n]` and
     /// `b[bOffset ..< bOffset+m]`, with a saved V trace for the backtrack.
     ///
-    /// Returns nil when the edit distance exceeds `maxD`, so the caller can fall
-    /// back rather than spend O(n*m) proving what it already suspects.
+    /// Returns nil when the edit distance exceeds `maxD`, or when the search has
+    /// spent `myersWorkBudget` units of work, so the caller can fall back rather
+    /// than spend O(n*m) proving what it already suspects.
     ///
     /// The trace is packed: row `d` stores only the diagonals reachable at
     /// distance `d-1`, i.e. k in `-(d-1) ... (d-1)` stepping by 2 — `d` entries
@@ -131,6 +147,12 @@ nonisolated enum DiffCalc {
         var trace: [Int32] = []
         trace.reserveCapacity(256)
 
+        // Work actually done, not work predicted: one unit per diagonal visited
+        // and one per element comparison inside a snake. A pair drawn from a
+        // tiny alphabet (a config that is mostly "!" and blank lines) has a long
+        // snake on every diagonal, which no function of `n` and `m` can see
+        // coming — this is the only bound that catches it.
+        var work = 0
         var found = -1
         var d = 0
         search: while d <= bound {
@@ -142,6 +164,8 @@ nonisolated enum DiffCalc {
                     k += 2
                 }
             }
+            work += d + 1
+            if work > myersWorkBudget { return nil }
 
             var k = -d
             while k <= d {
@@ -152,10 +176,12 @@ nonisolated enum DiffCalc {
                     x = Int(v[vOffset + k - 1]) + 1      // right: a contributes a line
                 }
                 var y = x - k
+                let snakeStart = x
                 while x < n && y < m && equal(a[aOffset + x], b[bOffset + y]) {
                     x += 1
                     y += 1
                 }
+                work += x - snakeStart
                 v[vOffset + k] = Int32(x)
                 if x >= n && y >= m {
                     found = d

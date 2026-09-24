@@ -133,19 +133,43 @@ public struct NetworkHighlighter: Sendable {
         let n = buffer.count
         var i = 0
         while lineStart <= n {
-            // Find the end of this line (the 0x0A scalar; a CR before it is
-            // just another byte and no rule matches one), and note on the SAME
-            // walk whether it is all ASCII. That answer used to come from a
-            // second pass (`isASCII`) and the UTF-16 length from a third
-            // (`utf16Length`) — on an ASCII document, which is what a config
-            // almost always is, that was two extra passes over every byte for a
-            // count `line.count` already gives.
+            // Find the end of this line, and note on the SAME walk whether it
+            // is all ASCII. That answer used to come from a second pass
+            // (`isASCII`) and the UTF-16 length from a third (`utf16Length`) —
+            // on an ASCII document, which is what a config almost always is,
+            // that was two extra passes over every byte for a count
+            // `line.count` already gives.
+            //
+            // A "line" here is what `NSString.lineRange(for:)` and
+            // `enumerateSubstrings(.byLines)` call one — LF, CR, CRLF, NEL,
+            // U+2028 and U+2029 — because the editor derives its incremental
+            // ranges from those and the two layers have to agree or an
+            // incremental pass stops equalling a clean one. This used to split
+            // on 0x0A alone.
             i = lineStart
             var lineIsASCII = true
+            var terminatorBytes = 0
+            var terminatorUnits = 0
             while i < n {
                 let byte = buffer[i]
-                if byte == 0x0A { break }
-                if byte >= 0x80 { lineIsASCII = false }
+                if byte == 0x0A { terminatorBytes = 1; terminatorUnits = 1; break }
+                if byte >= 0x80 {
+                    lineIsASCII = false
+                    if byte == 0xC2, i + 1 < n, buffer[i + 1] == 0x85 {
+                        terminatorBytes = 2; terminatorUnits = 1; break      // NEL
+                    }
+                    if byte == 0xE2, i + 2 < n, buffer[i + 1] == 0x80,
+                       buffer[i + 2] == 0xA8 || buffer[i + 2] == 0xA9 {
+                        terminatorBytes = 3; terminatorUnits = 1; break      // LS / PS
+                    }
+                } else if byte == 0x0D {
+                    if i + 1 < n, buffer[i + 1] == 0x0A {
+                        terminatorBytes = 2; terminatorUnits = 2             // CRLF
+                    } else {
+                        terminatorBytes = 1; terminatorUnits = 1
+                    }
+                    break
+                }
                 i += 1
             }
             let lineEnd = i
@@ -176,8 +200,8 @@ public struct NetworkHighlighter: Sendable {
             }
 
             if lineEnd == n { break }
-            utf16LineStart += 1          // the \n itself
-            lineStart = lineEnd + 1
+            utf16LineStart += terminatorUnits   // CRLF is two units, U+2028 one
+            lineStart = lineEnd + terminatorBytes
         }
         return out
     }

@@ -25,7 +25,18 @@ nonisolated struct FindInFilesSummary: Sendable {
     var matches: [FindInFilesMatch]
     var searchedFiles: Int
     var skippedFiles: Int
+    /// How many of `skippedFiles` were skipped because their bytes are not on
+    /// this machine — see `isDataless`. Counted separately because "skipped"
+    /// otherwise reads as "searched and found nothing".
+    var datalessFiles: Int = 0
     var hitLimit: Bool
+}
+
+/// One file `replaceAll` could not rewrite. The loop keeps going, so a summary
+/// can name both what changed and what did not.
+nonisolated struct ReplaceInFilesFailure: Sendable, Hashable {
+    let url: URL
+    let message: String
 }
 
 nonisolated struct ReplaceInFilesSummary: Sendable {
@@ -33,7 +44,13 @@ nonisolated struct ReplaceInFilesSummary: Sendable {
     var replacementCount: Int
     var searchedFiles: Int
     var skippedFiles: Int
+    var datalessFiles: Int = 0
     var backupDirectory: URL?
+    /// Non-empty means a partial result: some files were rewritten and these
+    /// were not. It used to be a `throw` out of the loop, which lost the whole
+    /// summary — including the backup directory, the only way back to the
+    /// originals — while leaving the earlier files already rewritten.
+    var failures: [ReplaceInFilesFailure] = []
 }
 
 nonisolated enum FindInFilesError: LocalizedError {
@@ -63,11 +80,14 @@ nonisolated enum FindInFilesEngine {
     /// - Parameter isCancelled: consulted once per file and once per match, so a
     ///   superseded search stops reading files instead of running to completion
     ///   behind the one the user is waiting for.
+    /// - Parameter isDataless: injectable so a test can stand in for a File
+    ///   Provider placeholder, which cannot be created without root.
     static func search(
         root: URL,
         tree: FileNode?,
         options: FindInFilesOptions,
-        isCancelled: () -> Bool = { false }
+        isCancelled: () -> Bool = { false },
+        isDataless: (URL) -> Bool = Self.isDataless
     ) throws -> FindInFilesSummary {
         let query = options.query.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !query.isEmpty else { throw FindInFilesError.emptyQuery }
@@ -76,6 +96,7 @@ nonisolated enum FindInFilesEngine {
         var matches: [FindInFilesMatch] = []
         var searchedFiles = 0
         var skippedFiles = 0
+        var datalessFiles = 0
 
         // One scope resolve for the whole search. It used to happen per file —
         // a UserDefaults bookmark-dictionary copy and a
@@ -98,6 +119,7 @@ nonisolated enum FindInFilesEngine {
                     matches: matches,
                     searchedFiles: searchedFiles,
                     skippedFiles: skippedFiles,
+                    datalessFiles: datalessFiles,
                     hitLimit: matches.count >= maxMatches
                 )
             }
@@ -105,6 +127,12 @@ nonisolated enum FindInFilesEngine {
             let url = node.url
             guard shouldSearch(url) else {
                 skippedFiles += 1
+                continue
+            }
+            // Before the read, which is what would download it.
+            guard !isDataless(url) else {
+                skippedFiles += 1
+                datalessFiles += 1
                 continue
             }
 
@@ -132,8 +160,25 @@ nonisolated enum FindInFilesEngine {
             matches: matches,
             searchedFiles: searchedFiles,
             skippedFiles: skippedFiles,
+            datalessFiles: datalessFiles,
             hitLimit: matches.count >= maxMatches
         )
+    }
+
+    /// A file whose bytes are not on this machine — see `TextFileIO.isDataless`
+    /// for what that means and how it is detected.
+    ///
+    /// Why the search cares: a placeholder reports its **logical** size, so it
+    /// sails through the 2 MB gate exactly like a materialised file, and
+    /// `Data(contentsOf:)` then blocks until the provider has downloaded it.
+    /// One Find in Files over a synced folder pulls the whole tree down,
+    /// gigabytes over the network, with the search apparently hung — and
+    /// `replaceAll` then *writes* each match, marking it dirty for the sync
+    /// client. `.conf` and `.txt` are both extensions SheepText searches, and
+    /// on the machine this was found on the entire OneDrive root is
+    /// placeholders.
+    nonisolated static func isDataless(_ url: URL) -> Bool {
+        TextFileIO.isDataless(url)
     }
 
     /// Search only needs the characters, not the encoding, and the overwhelming
@@ -147,11 +192,20 @@ nonisolated enum FindInFilesEngine {
         return TextFileIO.decode(data: data).text
     }
 
+    /// Rewrites every match in the workspace, backing each original up first.
+    ///
+    /// **It does not throw out of the loop.** It used to, and any failure —
+    /// a curly quote that the file's Windows-1252 encoding cannot store, a
+    /// read-only file, a full disk — abandoned the pass with the files before
+    /// it already rewritten, no summary, no reload of the open tabs onto them,
+    /// and (because the view cleared `lastBackupURL` on the error) no way left
+    /// to reach the backups. Per-file failures are collected instead.
     static func replaceAll(
         root: URL,
         tree: FileNode?,
         options: FindInFilesOptions,
-        replacement: String
+        replacement: String,
+        isDataless: (URL) -> Bool = Self.isDataless
     ) throws -> ReplaceInFilesSummary {
         let query = options.query.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !query.isEmpty else { throw FindInFilesError.emptyQuery }
@@ -164,7 +218,9 @@ nonisolated enum FindInFilesEngine {
         var replacementCount = 0
         var searchedFiles = 0
         var skippedFiles = 0
+        var datalessFiles = 0
         var backupDirectory: URL?
+        var failures: [ReplaceInFilesFailure] = []
 
         // One scope resolve for the whole pass; see `search`.
         _ = SecurityScopedResourceAccess.prepare(
@@ -177,6 +233,11 @@ nonisolated enum FindInFilesEngine {
             let url = node.url
             guard shouldSearch(url) else {
                 skippedFiles += 1
+                continue
+            }
+            guard !isDataless(url) else {
+                skippedFiles += 1
+                datalessFiles += 1
                 continue
             }
 
@@ -203,21 +264,31 @@ nonisolated enum FindInFilesEngine {
                 withTemplate: replacementTemplate
             )
 
-            let backupRoot: URL
-            if let existingBackupDirectory = backupDirectory {
-                backupRoot = existingBackupDirectory
-            } else {
-                backupRoot = try makeBackupDirectory()
-                backupDirectory = backupRoot
-            }
-            try backupOriginalFile(data: data, url: url, root: root, backupRoot: backupRoot)
+            do {
+                let backupRoot: URL
+                if let existingBackupDirectory = backupDirectory {
+                    backupRoot = existingBackupDirectory
+                } else {
+                    backupRoot = try makeBackupDirectory()
+                    backupDirectory = backupRoot
+                }
+                try backupOriginalFile(data: data, url: url, root: root, backupRoot: backupRoot)
 
-            try TextFileIO.write(
-                text: replaced,
-                to: url,
-                encoding: decoded.encoding,
-                writeBOM: decoded.hadBOM
-            )
+                try TextFileIO.write(
+                    text: replaced,
+                    to: url,
+                    encoding: decoded.encoding,
+                    writeBOM: decoded.hadBOM
+                )
+            } catch {
+                // The backup is written before the file, so a file that fails
+                // here is either untouched or recoverable from the backup
+                // directory the summary still carries.
+                failures.append(
+                    ReplaceInFilesFailure(url: url, message: error.localizedDescription)
+                )
+                continue
+            }
 
             changedURLs.insert(url)
             replacementCount += count
@@ -228,7 +299,9 @@ nonisolated enum FindInFilesEngine {
             replacementCount: replacementCount,
             searchedFiles: searchedFiles,
             skippedFiles: skippedFiles,
-            backupDirectory: backupDirectory
+            datalessFiles: datalessFiles,
+            backupDirectory: backupDirectory,
+            failures: failures
         )
     }
 

@@ -38,6 +38,18 @@ import Foundation
 ///    `ห้อง 10.0.0.1` IS an address because the space between them is a real
 ///    boundary. Combining marks and ZWJ sequences are word bytes too, so a
 ///    token is never split in the middle of a grapheme.
+///
+///    **The Unicode SPACES are the exception, and they are handled in the
+///    boundary helpers rather than in `isWord`.** A space is not a letter, and
+///    "every byte >= 0x80 is a word byte" swallowed U+00A0 (NBSP), the
+///    en/em-space family, U+2028/U+2029 and U+0085 along with the letters. A
+///    config pasted out of a browser, a Confluence page or Word is full of
+///    NBSP, and `10.0.0.1<NBSP>255.255.255.0` lost BOTH spans — the address
+///    failed `boundaryAfter` on the NBSP's lead byte and the mask failed
+///    `boundaryBefore` on its continuation byte. `isWord` still sees one byte
+///    at a time and still answers `true` for all of them, so the grapheme
+///    protection above is untouched; `boundaryBefore`/`boundaryAfter` look at
+///    the two or three bytes that form the character.
 /// 2. **The optional blank between an interface name and its number is
 ///    `[ \t]`, not `\s`.** SheepTerm's `\s?` also matches a newline, so
 ///    `GigabitEthernet\n1/0/1` matched across a line break. Every rule here has
@@ -74,13 +86,67 @@ public enum HighlightScanner {
     @inline(__always) public static func lower(_ b: UInt8) -> UInt8 {
         (b >= 0x41 && b <= 0x5A) ? b + 0x20 : b
     }
-    /// \b before a word char: start of buffer or a non-word byte behind.
-    @inline(__always) static func boundaryBefore(_ b: Bytes, _ i: Int) -> Bool {
-        i == 0 || !isWord(b[i - 1])
+    /// The UTF-8 encodings of the Unicode space and line separators, which
+    /// `isWord` cannot tell from letters because it sees one byte at a time.
+    ///
+    /// Two-byte: U+0085 NEL (`C2 85`), U+00A0 NBSP (`C2 A0`).
+    /// Three-byte: U+2000…U+200A (`E2 80 80…8A`), U+2028 LINE SEPARATOR and
+    /// U+2029 PARAGRAPH SEPARATOR (`E2 80 A8/A9`), U+202F NARROW NBSP
+    /// (`E2 80 AF`), U+3000 IDEOGRAPHIC SPACE (`E3 80 80`).
+    ///
+    /// Not here on purpose: U+200B…U+200D (zero width space, ZWNJ, ZWJ) are
+    /// `E2 80 8B…8D` and are NOT separators — ZWJ holds an emoji sequence
+    /// together, so treating it as a boundary would split a grapheme.
+    @inline(__always) static func isSeparatorLead(_ b: Bytes, _ i: Int) -> Bool {
+        let lead = b[i]
+        if lead == 0xC2 {
+            guard i + 1 < b.count else { return false }
+            let tail = b[i + 1]
+            return tail == 0x85 || tail == 0xA0
+        }
+        if lead == 0xE2 {
+            guard i + 2 < b.count, b[i + 1] == 0x80 else { return false }
+            let tail = b[i + 2]
+            return (tail >= 0x80 && tail <= 0x8A) || tail == 0xA8 || tail == 0xA9 || tail == 0xAF
+        }
+        if lead == 0xE3 {
+            return i + 2 < b.count && b[i + 1] == 0x80 && b[i + 2] == 0x80
+        }
+        return false
     }
-    /// \b after a word char: end of buffer or a non-word byte ahead.
+
+    /// The same characters, seen from their trailing edge.
+    @inline(__always) static func isSeparatorEnd(_ b: Bytes, _ end: Int) -> Bool {
+        if end >= 2, b[end - 2] == 0xC2 {
+            let tail = b[end - 1]
+            if tail == 0x85 || tail == 0xA0 { return true }
+        }
+        guard end >= 3 else { return false }
+        let tail = b[end - 1]
+        if b[end - 3] == 0xE2, b[end - 2] == 0x80 {
+            if (tail >= 0x80 && tail <= 0x8A) || tail == 0xA8 || tail == 0xA9 || tail == 0xAF {
+                return true
+            }
+        }
+        return b[end - 3] == 0xE3 && b[end - 2] == 0x80 && tail == 0x80
+    }
+
+    /// \b before a word char: start of buffer, a non-word byte behind, or a
+    /// Unicode space ending there. The `>= 0x80` test keeps the ASCII path to
+    /// one extra compare — an ASCII word byte can never end a separator.
+    @inline(__always) static func boundaryBefore(_ b: Bytes, _ i: Int) -> Bool {
+        if i == 0 { return true }
+        let previous = b[i - 1]
+        if !isWord(previous) { return true }
+        return previous >= 0x80 && isSeparatorEnd(b, i)
+    }
+    /// \b after a word char: end of buffer, a non-word byte ahead, or a Unicode
+    /// space beginning there.
     @inline(__always) static func boundaryAfter(_ b: Bytes, _ e: Int) -> Bool {
-        e == b.count || !isWord(b[e])
+        if e == b.count { return true }
+        let next = b[e]
+        if !isWord(next) { return true }
+        return next >= 0x80 && isSeparatorLead(b, e)
     }
 
     public static func bit(of rule: BuiltIn) -> UInt16 {

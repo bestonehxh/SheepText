@@ -52,6 +52,8 @@ enum LineEndingHygiene {
          #"Do not special-case CRLF. Test the trailing UTF-16 unit / UTF-8 byte and both endings fall out for free."#),
         (#"hasPrefix("\r\n")"#,
          #"Do not special-case CRLF. Test the leading UTF-16 unit / UTF-8 byte and both endings fall out for free."#),
+        (#"rangeOfCharacter(from: .newlines)"#,
+         #"CharacterSet.newlines uses TextKit-style separators (CR, NEL, U+2028/U+2029), which is not the LF-only row definition used by compare and several file formats. Use the subsystem's scalar/UTF-16 scanner."#),
     ]
 
     /// `hasSuffix("\r")` is deliberately NOT banned. Every use of it here runs on a
@@ -157,10 +159,11 @@ final class LineEndingHygieneTests: XCTestCase {
         let lines = text.split(separator: "\n")
         let count = text.reduce(into: 0) { c, ch in if ch == "\n" { c += 1 } }
         let crlf = text.contains("\r\n")
+        let firstBreak = text.rangeOfCharacter(from: .newlines)
         """#
         let found = LineEndingHygiene.violations(in: bad, path: "Bad.swift")
-        XCTAssertEqual(found.count, 4, "expected one hit per line, got:\n\(found)")
-        XCTAssertEqual(Set(found.map(\.line)), [1, 2, 3, 4])
+        XCTAssertEqual(found.count, 5, "expected one hit per line, got:\n\(found)")
+        XCTAssertEqual(Set(found.map(\.line)), [1, 2, 3, 4, 5])
     }
 
     /// The two holes that let the ⇧⌘D CRLF blank-line bug through review.

@@ -383,7 +383,7 @@ final class DocumentSyncShortcutTests: XCTestCase {
     }
 
     /// A change made to the document from outside the editor (reload from disk,
-    /// a plugin, a compare block transfer) must NOT be shortcut away.
+    /// a compare block transfer) must NOT be shortcut away.
     func testExternalDocumentChangeIsNotShortcutAway() {
         let probe = EditorViewAuditSeam.Probe(text: "alpha\nbeta\n")
         probe.applyEdit(range: NSRange(location: 0, length: 0), with: "X")

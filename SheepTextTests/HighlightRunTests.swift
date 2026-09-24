@@ -77,6 +77,16 @@ final class HighlightRunPainterTests: XCTestCase {
         XCTAssertNotEqual(HighlightStyleTable.styleID(forCapture: "keyword.type"),
                           HighlightStyleTable.styleID(forCapture: "keyword"))
     }
+
+    func testCaptureComponentsResolveLikeTheJoinedCapture() {
+        for components in [["keyword"], ["keyword", "function", "builtin"], ["no", "such", "capture"]] {
+            XCTAssertEqual(
+                HighlightStyleTable.styleID(forCaptureComponents: components),
+                HighlightStyleTable.styleID(forCapture: components.joined(separator: "."))
+            )
+        }
+        XCTAssertEqual(HighlightStyleTable.styleID(forCaptureComponents: []), HighlightStyleTable.none)
+    }
 }
 
 final class HighlightRunListTests: XCTestCase {

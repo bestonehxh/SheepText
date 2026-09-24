@@ -127,14 +127,7 @@ struct CommandPaletteView: View {
     }
 
     private func paletteSubtitle(for entry: CommandRegistry.Entry) -> String {
-        var parts = [entry.id]
-        switch entry.source {
-        case .builtIn:
-            parts.append("Built-in")
-        case .plugin(let pluginID):
-            parts.append(pluginID)
-        }
-        return parts.joined(separator: "  ")
+        entry.id
     }
 
     /// Subsequence match with small positional bonuses. Higher = better.

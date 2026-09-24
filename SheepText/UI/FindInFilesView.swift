@@ -24,6 +24,7 @@ struct FindInFilesView: View {
     @State private var groupedResults: [MatchGroup] = []
     @State private var searchedFiles = 0
     @State private var skippedFiles = 0
+    @State private var datalessFiles = 0
     @State private var hitLimit = false
     @State private var errorMessage: String?
     @State private var replaceMessage: String?
@@ -260,6 +261,11 @@ struct FindInFilesView: View {
         if skippedFiles > 0 {
             parts.append("\(skippedFiles) skipped")
         }
+        // Named separately: "skipped" otherwise reads as "searched and found
+        // nothing", and this one means "we deliberately did not download it".
+        if datalessFiles > 0 {
+            parts.append("\(datalessFiles) cloud-only")
+        }
         if hitLimit {
             parts.append("limited")
         }
@@ -315,6 +321,7 @@ struct FindInFilesView: View {
                 groupedResults = Self.group(summary.matches)
                 searchedFiles = summary.searchedFiles
                 skippedFiles = summary.skippedFiles
+                datalessFiles = summary.datalessFiles
                 hitLimit = summary.hitLimit
                 errorMessage = nil
                 if clearingReplaceMessage { replaceMessage = nil }
@@ -323,6 +330,7 @@ struct FindInFilesView: View {
                 groupedResults = []
                 searchedFiles = 0
                 skippedFiles = 0
+                datalessFiles = 0
                 hitLimit = false
                 errorMessage = error.localizedDescription
                 if clearingReplaceMessage { replaceMessage = nil }
@@ -378,7 +386,18 @@ struct FindInFilesView: View {
             case .success(let summary):
                 documents.reloadCleanOpenDocumentsFromDisk(urls: summary.changedURLs)
                 lastBackupURL = summary.backupDirectory
-                replaceMessage = "Replaced \(summary.replacementCount) matches in \(summary.changedURLs.count) files."
+                var message = "Replaced \(summary.replacementCount) matches in \(summary.changedURLs.count) files."
+                if !summary.failures.isEmpty {
+                    // Name them: "some files failed" with no names and no way
+                    // back to the backups is what made the old failure path
+                    // unrecoverable.
+                    let names = summary.failures.map { $0.url.lastPathComponent }
+                    message += " \(summary.failures.count) could not be written: \(names.joined(separator: ", "))."
+                }
+                if summary.datalessFiles > 0 {
+                    message += " \(summary.datalessFiles) cloud-only files skipped."
+                }
+                replaceMessage = message
                 // Refresh the hit list against the rewritten files, but keep the
                 // "Replaced N matches" line — the old code got that for free
                 // because the re-search was synchronous and ran BEFORE the message
@@ -387,7 +406,9 @@ struct FindInFilesView: View {
             case .failure(let error):
                 errorMessage = error.localizedDescription
                 replaceMessage = nil
-                lastBackupURL = nil
+                // NOT cleared: a failure that reaches here happens before any
+                // file is written, and if an earlier pass did leave backups
+                // this is the only pointer to them.
             }
         }
     }
@@ -408,6 +429,7 @@ struct FindInFilesView: View {
         groupedResults = []
         searchedFiles = 0
         skippedFiles = 0
+        datalessFiles = 0
         hitLimit = false
         errorMessage = nil
         replaceMessage = nil

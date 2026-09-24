@@ -5,12 +5,47 @@
 //  Design:
 //  - A fold replaces a multi-line brace block in NSTextStorage with a 1-char
 //    NSTextAttachment placeholder (FoldPlaceholder).
+//  - The placeholder character carries `.foldRegionID`, a number unique to this
+//    manager. THAT attribute — not an offset — is what identifies a fold.
 //  - Each FoldRegion remembers the original text so it can be restored.
 //  - `isMutating` lets the coordinator skip document-text sync during fold ops.
 //  - `fullText(from:)` reconstructs the real (unfolded) text for saving.
 //
+//  WHY THE IDENTITY ATTRIBUTE. Until September 2026 a region's position was
+//  maintained purely by offset arithmetic against `editedRange`/`changeInLength`,
+//  and a region whose placeholder appeared to fall inside the replaced span was
+//  destroyed. That is right for a single edit and wrong for every grouped one:
+//  `NSTextStorage` coalesces a `beginEditing`/`endEditing` group into ONE
+//  notification whose range spans from the first sub-edit to the last, so
+//  Replace All, multi-cursor typing, ⇧⌘D and ⇧⌘K each looked like one enormous
+//  replacement that swallowed every fold between their first and last cursor.
+//  The regions were dropped, the U+FFFC attachment characters stayed in the
+//  storage, and `fullText(from:)` copied them straight into `document.text` —
+//  the draft, the auto save and the bytes written on ⌘S. The folded blocks were
+//  simply gone.
+//
+//  So the arithmetic is now only a HINT. After every edit each region's guess is
+//  verified against the attribute actually sitting in the storage, and a single
+//  mismatch re-derives every position by enumerating `.foldRegionID` over the
+//  storage. A region whose placeholder really has gone is RETIRED rather than
+//  destroyed, because an undo can bring the character — attribute included —
+//  straight back.
+//
 
 import AppKit
+
+extension NSAttributedString.Key {
+    /// Identity of the fold a placeholder character stands for, as an `Int`
+    /// unique within one `FoldingManager`.
+    ///
+    /// It rides on the character, so it survives everything that moves the
+    /// character: grouped edits, undo, redo, a paste of a copied attributed
+    /// run. `NSTextView.font =` and the base-attribute passes in
+    /// `EditorTextView` use `addAttribute`/`setFont:range:`, which merge rather
+    /// than replace, so they leave it (and the `.attachment` next to it) alone —
+    /// the same exposure the placeholder attachment has always had.
+    nonisolated static let foldRegionID = NSAttributedString.Key("sheeptext.foldRegionID")
+}
 
 nonisolated private struct FoldMainActorNotification: @unchecked Sendable {
     let value: Notification
@@ -26,13 +61,15 @@ final class FoldingManager {
 
     /// The attachment character a collapsed fold stands behind.
     private static let placeholderUnit: unichar = 0xFFFC
+    private static let placeholderSet = CharacterSet(charactersIn: "\u{FFFC}")
 
     // MARK: - Types
 
     struct FoldRegion {
+        /// Identity, mirrored onto the placeholder character as `.foldRegionID`.
+        let id: Int
         var displayLocation: Int     // index of the attachment char in textStorage
         let originalText: String     // the text the attachment stands for
-        let originalAttributedText: NSAttributedString
 
         var displayRange: NSRange { NSRange(location: displayLocation, length: 1) }
 
@@ -57,10 +94,10 @@ final class FoldingManager {
         /// rows. Counted over UTF-8 so a line break is a byte, not a grapheme.
         let hiddenLineCount: Int
 
-        init(displayLocation: Int, originalText: String, originalAttributedText: NSAttributedString) {
+        init(id: Int, displayLocation: Int, originalText: String) {
+            self.id = id
             self.displayLocation = displayLocation
             self.originalText = originalText
-            self.originalAttributedText = originalAttributedText
             self.originalUTF16Length = (originalText as NSString).length
             self.hiddenLineCount = originalText.utf8.reduce(into: 0) { count, byte in
                 if byte == 0x0A { count += 1 }
@@ -73,6 +110,24 @@ final class FoldingManager {
     private(set) var regions: [FoldRegion] = []
     private(set) var isMutating = false
     private var didFoldMutation = false
+
+    private var nextRegionID = 1
+
+    /// Folds whose placeholder is no longer in the storage, kept by id so an
+    /// undo that brings the character back can bring the fold back with it.
+    ///
+    /// Deleting a fold chip and pressing ⌘Z used to leave a U+FFFC in
+    /// `document.text` that no region claimed, and the block's text — which only
+    /// ever lived in the dropped region — was gone for good. The undo re-inserts
+    /// the character with its attributes (verified against a real
+    /// `NSTextView`/`UndoManager`), so the identity is right there to be matched.
+    ///
+    /// Bounded: a region holds the whole folded block, and nothing else would
+    /// ever evict one. Oldest first — an undo that is going to resurrect a fold
+    /// follows the delete closely.
+    private var retired: [Int: FoldRegion] = [:]
+    private var retiredOrder: [Int] = []
+    private static let retiredLimit = 32
 
     // MARK: - Keeping regions aligned with user edits
     //
@@ -126,50 +181,246 @@ final class FoldingManager {
         observedStorage = nil
     }
 
-    /// Drop the subscription once the last fold is gone; `fold` reinstalls it.
+    /// Drop the subscription once nothing is left to track; `fold` reinstalls it.
+    ///
+    /// A retired region counts: it is the thing an undo resurrects, and an
+    /// unsubscribed manager would never see that undo arrive.
     private func stopObservingIfIdle() {
-        if regions.isEmpty { stopObservingEdits() }
+        if regions.isEmpty && retired.isEmpty { stopObservingEdits() }
     }
 
     private func storageDidProcessEditing(_ textStorage: NSTextStorage) {
         // fold/unfold/unfoldAll shift the regions themselves.
-        guard !isMutating, !regions.isEmpty else { return }
+        guard !isMutating, !regions.isEmpty || !retired.isEmpty else { return }
         guard textStorage.editedMask.contains(.editedCharacters) else { return }
-        adjustRegions(editedRange: textStorage.editedRange,
+        reseatRegions(in: textStorage,
+                      editedRange: textStorage.editedRange,
                       changeInLength: textStorage.changeInLength)
         stopObservingIfIdle()
     }
 
-    /// Re-point every region for one text edit.
+    /// Where offset arithmetic alone thinks `location` ended up, or nil when the
+    /// edit replaced the span it sat in.
     ///
     /// `editedRange` is in NEW coordinates and `changeInLength` is the delta, so
     /// the span the edit replaced was `[start, start + length - delta)` in the
     /// old ones — the same arithmetic `DiffLayoutManager.processEditing` does.
-    /// A placeholder that lay inside the replaced span no longer exists, so its
-    /// region is dropped rather than moved: keeping it would splice a folded
-    /// block back into text the user deleted.
+    /// For a SINGLE edit this is exact. For a coalesced group it is a guess that
+    /// is wrong in exactly one direction: it reports "replaced" for placeholders
+    /// that merely lie between two sub-edits. That is why every answer is
+    /// checked against the storage below.
+    private static func shiftedLocation(_ location: Int,
+                                        editedRange: NSRange,
+                                        changeInLength delta: Int) -> Int? {
+        let editStart = editedRange.location
+        let oldEditEnd = editStart + (editedRange.length - delta)
+        if location + 1 <= editStart { return location }
+        if location >= oldEditEnd { return location + delta }
+        return nil
+    }
+
+    /// Re-point every region after one text edit, and resurrect any fold the
+    /// edit brought back.
+    ///
+    /// Fast path: take the arithmetic's guess and verify it against the
+    /// `.foldRegionID` actually in the storage — N attribute reads, no scan. One
+    /// disagreement (a grouped edit, a whole-storage replacement, a genuinely
+    /// deleted chip) drops into a single enumeration of the attribute over the
+    /// whole storage, which is authoritative by construction.
     ///
     /// Runs for zero-delta edits too. Typing over a one-character selection that
     /// happens to be the placeholder changes no length at all, and a fix that
     /// only reacted to length changes would leave a region pointing at a
     /// character that is no longer an attachment.
-    func adjustRegions(editedRange: NSRange, changeInLength delta: Int) {
-        guard !regions.isEmpty else { return }
-        let editStart = editedRange.location
-        let oldEditEnd = editStart + (editedRange.length - delta)
+    func reseatRegions(in textStorage: NSTextStorage, editedRange: NSRange, changeInLength delta: Int) {
+        guard !regions.isEmpty || !retired.isEmpty else { return }
 
-        regions = regions.compactMap { region in
-            var region = region
-            let loc = region.displayLocation
-            if loc + 1 <= editStart {
-                return region                    // entirely before the edit
-            } else if loc >= oldEditEnd {
-                region.displayLocation = loc + delta
-                return region                    // entirely after the replaced span
-            } else {
-                return nil                       // the placeholder was replaced
+        var candidates: [Int] = []
+        candidates.reserveCapacity(regions.count)
+        var agreed = true
+        for region in regions {
+            guard let candidate = Self.shiftedLocation(region.displayLocation,
+                                                       editedRange: editedRange,
+                                                       changeInLength: delta),
+                  Self.placeholderMatches(region, at: candidate, in: textStorage)
+            else { agreed = false; break }
+            candidates.append(candidate)
+        }
+
+        guard agreed else {
+            rederiveRegions(in: textStorage)
+            return
+        }
+
+        for (index, candidate) in candidates.enumerated() {
+            regions[index].displayLocation = candidate
+        }
+        // Regions stay sorted: every survivor moved by the same delta or not at all.
+        if !retired.isEmpty {
+            resurrectRegions(in: textStorage, searching: editedRange)
+        }
+    }
+
+    /// Whether the character at `location` is a placeholder this region may
+    /// still claim.
+    ///
+    /// An identity that matches is proof. A placeholder carrying NO identity is
+    /// accepted too, because a whole-storage `setAttributes` replaces the
+    /// dictionary rather than merging into it — and if one ever runs without
+    /// putting the fold attributes back (the one that exists today,
+    /// `Coordinator.resetHighlightAttributes`, does), falling back to the plain
+    /// offset arithmetic is exactly the behaviour this code had before, which is
+    /// right for a single edit. What is never accepted is a placeholder wearing
+    /// somebody else's identity.
+    private static func placeholderMatches(_ region: FoldRegion,
+                                           at location: Int,
+                                           in textStorage: NSTextStorage) -> Bool {
+        guard location >= 0, location < textStorage.length,
+              (textStorage.string as NSString).character(at: location) == placeholderUnit
+        else { return false }
+        guard let id = textStorage.attribute(.foldRegionID, at: location, effectiveRange: nil) as? Int
+        else { return true }
+        return id == region.id
+    }
+
+    /// Rebuild every position from the storage itself.
+    ///
+    /// The attribute is the truth: a region is where its id is, a region whose
+    /// id is nowhere is retired, and a retired id that has reappeared is live
+    /// again. Nothing here depends on what the edit claimed to do, which is the
+    /// whole point — a coalesced group claims far more than it did.
+    private func rederiveRegions(in textStorage: NSTextStorage) {
+        var found: [Int: Int] = [:]   // id → location
+        let fullRange = NSRange(location: 0, length: textStorage.length)
+        let ns = textStorage.string as NSString
+        if textStorage.length > 0 {
+            textStorage.enumerateAttribute(.foldRegionID, in: fullRange, options: []) { value, range, _ in
+                guard let id = value as? Int else { return }
+                // The attribute can outlive its character only through a bug, but
+                // a run longer than one unit means someone typed inside it — take
+                // the placeholder, not the run.
+                for offset in 0..<range.length {
+                    let location = range.location + offset
+                    guard ns.character(at: location) == Self.placeholderUnit else { continue }
+                    if found[id] == nil { found[id] = location }
+                    break
+                }
             }
         }
+
+        var live: [FoldRegion] = []
+        live.reserveCapacity(regions.count)
+        var unmatched: [FoldRegion] = []
+        for region in regions {
+            if let location = found[region.id] {
+                var moved = region
+                moved.displayLocation = location
+                live.append(moved)
+                found.removeValue(forKey: region.id)
+            } else {
+                unmatched.append(region)
+            }
+        }
+
+        // Fallback for a placeholder whose identity was stripped rather than
+        // deleted. `setAttributes` over a range REPLACES the dictionary, so any
+        // future whole-storage attribute pass that forgets to put the fold
+        // attributes back (the one that exists today,
+        // `Coordinator.resetHighlightAttributes`, does put them back) would
+        // leave the character in place with nothing on it. Pair what is left in
+        // order, and only when the counts agree — a mismatch means something
+        // really was deleted, and guessing there would splice a block into the
+        // wrong place.
+        if !unmatched.isEmpty {
+            let anonymous = Self.unclaimedFoldPlaceholders(in: textStorage,
+                                                           excluding: Set(found.values)
+                                                               .union(live.map(\.displayLocation)))
+            if anonymous.count == unmatched.count {
+                for (region, location) in zip(unmatched, anonymous) {
+                    var moved = region
+                    moved.displayLocation = location
+                    live.append(moved)
+                }
+                unmatched.removeAll()
+            }
+        }
+        for region in unmatched { retire(region) }
+        // Whatever ids are left are folds the storage has and this manager had
+        // written off — an undo, or a redo of an undone delete.
+        for (id, location) in found {
+            guard var region = retired[id] else { continue }
+            region.displayLocation = location
+            live.append(region)
+            dropRetired(id)
+        }
+        regions = live.sorted { $0.displayLocation < $1.displayLocation }
+    }
+
+    /// Placeholder characters that carry no fold identity and are not already
+    /// spoken for, in document order. A U+FFFC with no `.foldRegionID` and no
+    /// `FoldPlaceholder` attachment is the user's own content, not a fold.
+    private static func unclaimedFoldPlaceholders(in textStorage: NSTextStorage,
+                                                  excluding claimed: Set<Int>) -> [Int] {
+        let ns = textStorage.string as NSString
+        var result: [Int] = []
+        var search = NSRange(location: 0, length: ns.length)
+        while search.length > 0 {
+            let hit = ns.rangeOfCharacter(from: placeholderSet, options: [], range: search)
+            guard hit.location != NSNotFound else { break }
+            if !claimed.contains(hit.location),
+               textStorage.attribute(.foldRegionID, at: hit.location, effectiveRange: nil) == nil,
+               textStorage.attribute(.attachment, at: hit.location, effectiveRange: nil) is FoldPlaceholder {
+                result.append(hit.location)
+            }
+            let next = NSMaxRange(hit)
+            search = NSRange(location: next, length: ns.length - next)
+        }
+        return result
+    }
+
+    /// Look for retired folds inside the text an edit just inserted.
+    ///
+    /// Bounded by the edit, so the common "one retired fold, user keeps typing"
+    /// case costs one attribute enumeration over the typed characters rather
+    /// than a pass over the document.
+    private func resurrectRegions(in textStorage: NSTextStorage, searching editedRange: NSRange) {
+        let bounded = NSIntersectionRange(editedRange,
+                                          NSRange(location: 0, length: textStorage.length))
+        guard bounded.length > 0 else { return }
+        let ns = textStorage.string as NSString
+        var revived: [FoldRegion] = []
+        textStorage.enumerateAttribute(.foldRegionID, in: bounded, options: []) { value, range, _ in
+            guard let id = value as? Int, var region = self.retired[id] else { return }
+            for offset in 0..<range.length where ns.character(at: range.location + offset) == Self.placeholderUnit {
+                region.displayLocation = range.location + offset
+                revived.append(region)
+                break
+            }
+        }
+        guard !revived.isEmpty else { return }
+        for region in revived { dropRetired(region.id) }
+        regions.append(contentsOf: revived)
+        regions.sort { $0.displayLocation < $1.displayLocation }
+    }
+
+    private func retire(_ region: FoldRegion) {
+        if retired[region.id] == nil {
+            retiredOrder.append(region.id)
+        }
+        retired[region.id] = region
+        while retiredOrder.count > Self.retiredLimit {
+            retired.removeValue(forKey: retiredOrder.removeFirst())
+        }
+    }
+
+    private func dropRetired(_ id: Int) {
+        retired.removeValue(forKey: id)
+        if let index = retiredOrder.firstIndex(of: id) { retiredOrder.remove(at: index) }
+    }
+
+    private func clearRetired() {
+        retired.removeAll()
+        retiredOrder.removeAll()
     }
 
     /// Arm the one-shot "the next `textDidChange` came from folding, not the
@@ -344,7 +595,24 @@ final class FoldingManager {
 
     func fold(range: NSRange, in textStorage: NSTextStorage) {
         guard NSMaxRange(range) <= textStorage.length, range.length > 1 else { return }
-        let original = (textStorage.string as NSString).substring(with: range)
+        // Folding OVER a collapsed fold dissolves it: the outer block's text is
+        // taken with the inner one expanded, and the inner region goes away. It
+        // used to capture the display substring, U+FFFC and all — so the outer
+        // region's `originalText` carried an attachment character that
+        // `fullText` spliced straight into `document.text` and onto disk, and
+        // the inner block was lost. Nesting is reachable from the gutter:
+        // `foldableRanges` skips placeholders when matching braces, so an outer
+        // block stays foldable while an inner one is collapsed.
+        let inner = regions.enumerated().filter {
+            $0.element.displayLocation >= range.location
+                && $0.element.displayLocation < NSMaxRange(range)
+        }
+        let original = inner.isEmpty
+            ? (textStorage.string as NSString).substring(with: range)
+            : expandedText(of: range, in: textStorage)
+        for index in inner.map(\.offset).sorted(by: >) {
+            regions.remove(at: index)
+        }
         // Not `original.contains("\n")`. That compares Characters, so CRLF — one
         // Character that does not equal "\n" — reads as having no line break.
         // It happens to return true today only because this string is bridged
@@ -355,15 +623,15 @@ final class FoldingManager {
             if byte == 0x0A { count += 1 }
         }
         guard lineCount > 0 else { return }
-        let originalAttributed = textStorage.attributedSubstring(from: range)
         let preview   = "{ \(lineCount) line\(lineCount == 1 ? "" : "s") }"
         let attachment = FoldPlaceholder(preview: preview, originalText: original)
+        let id = nextRegionID
+        nextRegionID += 1
 
         let attrStr = NSMutableAttributedString(attachment: attachment)
-        attrStr.addAttributes([
-            .font: NSFont.monospacedSystemFont(ofSize: 13, weight: .regular),
-            .foregroundColor: NSColor.bestTextEditorForeground
-        ], range: NSRange(location: 0, length: 1))
+        var placeholderAttributes = Self.rowAttributes(in: textStorage, at: range.location)
+        placeholderAttributes[.foldRegionID] = id
+        attrStr.addAttributes(placeholderAttributes, range: NSRange(location: 0, length: 1))
 
         // Install (once per storage) before the mutation, so a manager that
         // gains its first fold is already tracking edits.
@@ -379,20 +647,71 @@ final class FoldingManager {
         for i in regions.indices where regions[i].displayLocation >= NSMaxRange(range) {
             regions[i].displayLocation += delta
         }
-        regions.append(FoldRegion(
-            displayLocation: range.location,
-            originalText: original,
-            originalAttributedText: originalAttributed
-        ))
+        regions.append(FoldRegion(id: id, displayLocation: range.location, originalText: original))
         regions.sort { $0.displayLocation < $1.displayLocation }
+    }
+
+    /// `range` of the display text with every collapsed fold inside it expanded.
+    private func expandedText(of range: NSRange, in textStorage: NSTextStorage) -> String {
+        let ns = textStorage.string as NSString
+        var result = ""
+        var pos = range.location
+        let end = NSMaxRange(range)
+        for region in regions where region.displayLocation >= pos && region.displayLocation < end {
+            let loc = region.displayLocation
+            guard ns.character(at: loc) == Self.placeholderUnit else { continue }
+            if loc > pos { result += ns.substring(with: NSRange(location: pos, length: loc - pos)) }
+            result += region.originalText
+            pos = loc + 1
+        }
+        if pos < end { result += ns.substring(with: NSRange(location: pos, length: end - pos)) }
+        return result
+    }
+
+    /// Font / colour / paragraph style as the storage has them at `location`.
+    ///
+    /// The chip used to hard-code `monospacedSystemFont(ofSize: 13)`, so its row
+    /// kept 13 pt metrics at any editor size. Reading the row it replaces gives
+    /// the right size for free and needs no reference to the text view — which
+    /// `restoreFolds` does not have.
+    private static func rowAttributes(in textStorage: NSTextStorage,
+                                      at location: Int) -> [NSAttributedString.Key: Any] {
+        var attributes: [NSAttributedString.Key: Any] = [:]
+        if location >= 0, location < textStorage.length {
+            let existing = textStorage.attributes(at: location, effectiveRange: nil)
+            for key in [NSAttributedString.Key.font, .foregroundColor, .paragraphStyle] {
+                if let value = existing[key] { attributes[key] = value }
+            }
+        }
+        if attributes[.font] == nil {
+            attributes[.font] = NSFont.monospacedSystemFont(ofSize: 13, weight: .regular)
+        }
+        if attributes[.foregroundColor] == nil {
+            attributes[.foregroundColor] = NSColor.bestTextEditorForeground
+        }
+        return attributes
     }
 
     // MARK: - Unfold
 
-    func unfold(at location: Int, in textStorage: NSTextStorage) {
+    /// Expand the fold whose placeholder sits at `location`, and return the range
+    /// the restored text now occupies.
+    ///
+    /// `baseAttributes` is what the restored characters get. The block used to be
+    /// spliced back as the attributed string captured at fold time, and font,
+    /// kern and paragraph style are STORAGE attributes that
+    /// `applyDocumentVisualSettings` rewrites over the storage — which does not
+    /// contain folded text. Fold at 13 pt, zoom to 24 pt, expand, and the block
+    /// came back at 13 pt with 13 pt line heights. Passing nil reads the
+    /// attributes off the placeholder's own row, which is the best a caller
+    /// without a text view can do.
+    @discardableResult
+    func unfold(at location: Int,
+                in textStorage: NSTextStorage,
+                baseAttributes: [NSAttributedString.Key: Any]? = nil) -> NSRange? {
         guard let idx = regions.firstIndex(where: {
             $0.displayLocation == location
-        }) else { return }
+        }) else { return nil }
         let region = regions[idx]
         // Belt and braces: the region must still be pointing at its own
         // attachment character. If an edit moved or ate it and the adjustment
@@ -403,11 +722,13 @@ final class FoldingManager {
               (textStorage.string as NSString).character(at: region.displayLocation) == Self.placeholderUnit
         else {
             regions.remove(at: idx)
+            retire(region)
             stopObservingIfIdle()
-            return
+            return nil
         }
 
-        let restored = region.originalAttributedText
+        let attributes = baseAttributes ?? Self.rowAttributes(in: textStorage, at: region.displayLocation)
+        let restored = NSAttributedString(string: region.originalText, attributes: attributes)
 
         isMutating = true
         textStorage.beginEditing()
@@ -421,7 +742,11 @@ final class FoldingManager {
         for i in regions.indices where regions[i].displayLocation > region.displayLocation {
             regions[i].displayLocation += delta
         }
+        // Deliberately NOT retired: the block is back in the storage as real
+        // text, so there is nothing left for an undo to resurrect.
+        dropRetired(region.id)
         stopObservingIfIdle()
+        return NSRange(location: region.displayLocation, length: region.originalUTF16Length)
     }
 
     /// Forget every fold region WITHOUT touching the text storage.
@@ -433,21 +758,27 @@ final class FoldingManager {
     /// contains it, duplicating every folded block in the file.
     func discardRegions() {
         regions.removeAll()
+        clearRetired()
         stopObservingEdits()
     }
 
-    func unfoldAll(in textStorage: NSTextStorage) {
+    /// Expand every fold. `baseAttributes` as in `unfold(at:in:baseAttributes:)`;
+    /// nil takes each placeholder's own row, which is the editor font at the
+    /// current size rather than the hard-coded 13 pt this used to write.
+    func unfoldAll(in textStorage: NSTextStorage,
+                   baseAttributes: [NSAttributedString.Key: Any]? = nil) {
         isMutating = true
         for region in regions.sorted(by: { $0.displayLocation > $1.displayLocation }) {
-            let restored = NSAttributedString(string: region.originalText, attributes: [
-                .font: NSFont.monospacedSystemFont(ofSize: 13, weight: .regular),
-                .foregroundColor: NSColor.bestTextEditorForeground
-            ])
+            guard NSMaxRange(region.displayRange) <= textStorage.length else { continue }
+            let attributes = baseAttributes
+                ?? Self.rowAttributes(in: textStorage, at: region.displayLocation)
+            let restored = NSAttributedString(string: region.originalText, attributes: attributes)
             textStorage.beginEditing()
             textStorage.replaceCharacters(in: region.displayRange, with: restored)
             textStorage.endEditing()
         }
         regions.removeAll()
+        clearRetired()
         isMutating = false
         stopObservingEdits()
     }
@@ -460,8 +791,21 @@ final class FoldingManager {
 
     /// Reconstructs the full unfolded text — use this for document.text so
     /// the saved file never contains attachment characters.
+    ///
+    /// The last line of defence for the whole subsystem. Whatever goes wrong
+    /// upstream, what comes out of here is what lands in `document.text`, the
+    /// recovery draft and the file on ⌘S, so it never returns a fold placeholder
+    /// it could have resolved: a U+FFFC left in the result sends it back through
+    /// the slow, storage-driven walk, which resolves by identity, then by
+    /// retired region, then by the attachment object's own `originalText`.
     func fullText(from textStorage: NSTextStorage) -> String {
-        if regions.isEmpty { return textStorage.string }
+        if regions.isEmpty {
+            let text = textStorage.string
+            guard !retired.isEmpty,
+                  (text as NSString).rangeOfCharacter(from: Self.placeholderSet).location != NSNotFound
+            else { return text }
+            return resolvingEveryPlaceholder(in: textStorage)
+        }
         let ns = textStorage.string as NSString
         var result = ""
         var pos    = 0
@@ -482,6 +826,62 @@ final class FoldingManager {
             pos = loc + 1
         }
         if pos < ns.length { result += ns.substring(from: pos) }
+
+        guard (result as NSString).rangeOfCharacter(from: Self.placeholderSet).location != NSNotFound
+        else { return result }
+        return resolvingEveryPlaceholder(in: textStorage)
+    }
+
+    /// Rebuild the text placeholder by placeholder, resolving each one from
+    /// whatever still knows what it stood for.
+    ///
+    /// Reaching this is a bug somewhere above, so it logs — but it logs instead
+    /// of losing the user's text. A U+FFFC that carries no fold identity and no
+    /// fold attachment is left alone: it is an object-replacement character the
+    /// user's own content brought with it, not a fold.
+    private func resolvingEveryPlaceholder(in textStorage: NSTextStorage) -> String {
+        let ns = textStorage.string as NSString
+        let byLocation = Dictionary(regions.map { ($0.displayLocation, $0) },
+                                    uniquingKeysWith: { first, _ in first })
+        var result = ""
+        var pos = 0
+        var unresolved = 0
+        var recovered = 0
+
+        var search = NSRange(location: 0, length: ns.length)
+        while search.length > 0 {
+            let hit = ns.rangeOfCharacter(from: Self.placeholderSet, options: [], range: search)
+            guard hit.location != NSNotFound else { break }
+            if hit.location > pos {
+                result += ns.substring(with: NSRange(location: pos, length: hit.location - pos))
+            }
+            if let region = byLocation[hit.location] {
+                result += region.originalText
+            } else if let id = textStorage.attribute(.foldRegionID, at: hit.location, effectiveRange: nil) as? Int,
+                      let region = retired[id] {
+                result += region.originalText
+                recovered += 1
+            } else if let placeholder = textStorage.attribute(.attachment, at: hit.location, effectiveRange: nil)
+                        as? FoldPlaceholder, !placeholder.originalText.isEmpty {
+                result += placeholder.originalText
+                recovered += 1
+            } else if textStorage.attribute(.attachment, at: hit.location, effectiveRange: nil) is FoldPlaceholder {
+                // Ours, but it cannot say what it stood for (a decoded
+                // attachment loses `originalText`). Emitting the character would
+                // write U+FFFC into the file; dropping it is the lesser loss.
+                unresolved += 1
+            } else {
+                result += ns.substring(with: hit)   // not a fold — the user's own character
+            }
+            pos = NSMaxRange(hit)
+            search = NSRange(location: pos, length: ns.length - pos)
+        }
+        if pos < ns.length { result += ns.substring(from: pos) }
+
+        if recovered > 0 || unresolved > 0 {
+            NSLog("SheepText: fold placeholder had no live region (recovered %d, unresolved %d)",
+                  recovered, unresolved)
+        }
         return result
     }
 }

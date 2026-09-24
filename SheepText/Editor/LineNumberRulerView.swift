@@ -135,6 +135,11 @@ final class LineNumberRulerView: NSView {
     /// ones included.
     private var lineCursor = TextLineIndex.Cursor()
 
+    /// The compare branch's own row counter. Compare rows are LF-only, which is
+    /// a different line definition from normal mode's — see
+    /// `TextLineIndex.LineFeedCursor`.
+    private var compareRowCursor = TextLineIndex.LineFeedCursor()
+
     // MARK: - Foldable-marker cache
     //
     // `foldableLines` scans the whole document for brace pairs. `draw()` needs it
@@ -153,6 +158,11 @@ final class LineNumberRulerView: NSView {
     }
 
     private var foldMarkerCache: FoldMarkerCache?
+
+    /// Pending trailing recompute of the marker sets. See
+    /// `scheduleFoldMarkerRecompute`.
+    private var foldMarkerRecompute: DispatchWorkItem?
+    private static let foldMarkerDebounce: TimeInterval = 0.15
 
     /// `foldLineSpans` used to call the single-offset line lookup once per fold
     /// region, per frame — O(regions x length) while scrolling. One batched pass
@@ -243,6 +253,7 @@ final class LineNumberRulerView: NSView {
     }
 
     isolated deinit {
+        foldMarkerRecompute?.cancel()
         for observer in [boundsObserver, textDidChangeObserver, selectionObserver, storageObserver] {
             if let observer {
                 NotificationCenter.default.removeObserver(observer)
@@ -288,6 +299,7 @@ final class LineNumberRulerView: NSView {
         // gutter from the real line numbers, so leave that alone.
         if compareLineInfos == nil { widestNumberSeen = 0 }
         lineCursor.invalidate()
+        compareRowCursor.invalidate()
         foldMarkerCache = nil
         foldSpanCache = nil
     }
@@ -373,11 +385,11 @@ final class LineNumberRulerView: NSView {
         // invalidates the memo even if the change notification has not been
         // delivered yet. `textChangeStamp` covers the same-length edits.
         let lineStamp = textChangeStamp &* 31 &+ fullText.length
-        var displayLineNumber = lineCursor.lineNumber(in: fullText,
-                                                      at: visibleChars.location,
-                                                      stamp: lineStamp)
-
         let infos     = compareLineInfos
+        var displayLineNumber = infos == nil
+            ? lineCursor.lineNumber(in: fullText, at: visibleChars.location, stamp: lineStamp)
+            : 1
+
         let markers   = (infos == nil && !isLargeFileMode)
             ? foldMarkers(displayText: fullText, documentID: documentID)
             : (foldable: Set<Int>(), folded: Set<Int>())
@@ -391,21 +403,39 @@ final class LineNumberRulerView: NSView {
             : []
         var lastLineStart = -1
 
+        var lastCompareRow = -1
+
         layoutManager.enumerateLineFragments(forGlyphRange: visibleGlyphs) { lineRect, _, _, glyphRange, _ in
             guard glyphRange.length > 0 else { return }
 
             let charIndex = layoutManager.characterIndexForGlyph(at: glyphRange.location)
-            let lineRange = fullText.lineRange(for: NSRange(location: charIndex, length: 0))
-            guard lineRange.location != lastLineStart else { return }
-            lastLineStart = lineRange.location
+
+            // Which row this fragment belongs to, and the wrapped-continuation
+            // dedupe, are asked in the row system the branch below indexes with.
+            // In compare mode that is LF-only: `NSString.lineRange` breaks on a
+            // lone CR, U+0085, U+2028 and U+2029, none of which start a compare
+            // row, so a single one of them shifted every symbol, line number and
+            // transfer-arrow block below it by a row.
+            var compareRow = 0
+            if infos != nil {
+                compareRow = self.compareRowCursor.lineNumber(in: fullText, at: charIndex,
+                                                              stamp: lineStamp) - 1
+                guard compareRow != lastCompareRow else { return }
+                lastCompareRow = compareRow
+            } else {
+                let lineRange = fullText.lineRange(for: NSRange(location: charIndex, length: 0))
+                guard lineRange.location != lastLineStart else { return }
+                lastLineStart = lineRange.location
+            }
 
             let y = lineRect.minY + textInsetY - visibleRect.origin.y
             let rowHeight = lineRect.height
 
             if let infos {
                 // ── Compare mode gutter ──────────────────────────────────────
-                let idx = displayLineNumber - 1
-                guard idx >= 0 && idx < infos.count else { displayLineNumber += 1; return }
+                let idx = compareRow
+                displayLineNumber = idx + 1
+                guard idx >= 0 && idx < infos.count else { return }
                 let info = infos[idx]
 
                 // Row background tint (mirrors line background color).
@@ -560,7 +590,9 @@ final class LineNumberRulerView: NSView {
                 }
             }
 
-            displayLineNumber += 1
+            // Compare mode gets its row from the LF cursor above, so it must not
+            // also step here.
+            if infos == nil { displayLineNumber += 1 }
         }
 
         if infos == nil,
@@ -639,6 +671,25 @@ final class LineNumberRulerView: NSView {
             return (cached.foldable, cached.folded)
         }
 
+        // Only the TEXT moving is allowed to lag. `textChangeStamp` is bumped
+        // twice per keystroke (the view's notification and the storage's), so
+        // the cache never hit while the user was typing and every character paid
+        // a whole-document brace scan plus a whole-document line-number pass —
+        // 6.6 ms per gutter draw on a 900 KB / 52 000-line file, and the gutter
+        // draws at least once per keystroke. A chevron that is 150 ms stale is
+        // invisible; that hitch is not.
+        //
+        // A fold or unfold is an interaction, not typing: the region count moves
+        // and it recomputes at once, so clicking a chevron never feels delayed.
+        // Same for a document switch, where the previous file's chevrons would
+        // otherwise be drawn against the new one's rows.
+        if let cached = foldMarkerCache,
+           cached.documentID == documentID,
+           cached.regionCount == foldingManager.regions.count {
+            scheduleFoldMarkerRecompute()
+            return (cached.foldable, cached.folded)
+        }
+
         let foldable = foldingManager.foldableLines(displayText: displayText)
         let folded   = foldingManager.foldedLines(displayText: displayText)
         foldMarkerCache = FoldMarkerCache(
@@ -650,6 +701,36 @@ final class LineNumberRulerView: NSView {
             folded: folded
         )
         return (foldable, folded)
+    }
+
+    /// Drop the stale marker cache one beat after the text stops moving, and ask
+    /// for a redraw — which then recomputes synchronously, because the cache is
+    /// gone. Trailing, and rescheduled by each draw that is still stale, so a
+    /// continuous burst of typing recomputes every 0.15 s rather than per
+    /// character.
+    private func scheduleFoldMarkerRecompute() {
+        guard foldMarkerRecompute == nil else { return }
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.foldMarkerRecompute = nil
+            self.foldMarkerCache = nil
+            self.needsDisplay = true
+        }
+        foldMarkerRecompute = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.foldMarkerDebounce, execute: work)
+    }
+
+    /// The display-row ranges the transfer arrows drawn in the last pass would
+    /// send. Internal rather than private — it is what pins the compare
+    /// gutter's row mapping.
+    var transferArrowRowsForTesting: [NSRange] { transferArrowHitRects.map(\.rows) }
+
+    /// The marker sets `draw` would use right now, including the debounce
+    /// behaviour. Internal rather than private so both can be asserted; nothing
+    /// in the app calls it.
+    func foldMarkersForTesting(documentID: Document.ID?) -> (foldable: Set<Int>, folded: Set<Int>) {
+        guard let text = textView?.textStorage?.string as NSString? else { return ([], []) }
+        return foldMarkers(displayText: text, documentID: documentID)
     }
 
     // MARK: - Compare block transfer
@@ -775,7 +856,12 @@ final class LineNumberRulerView: NSView {
                     guard r.displayLocation >= 0 && r.displayLocation < displayText.length else { return false }
                     return TextLineIndex.lineNumber(in: displayText, at: r.displayLocation) == line
                 }) {
-                    fm.unfold(at: region.displayLocation, in: storage)
+                    // Current base attributes, not the ones captured at fold
+                    // time — see `FoldingManager.unfold`.
+                    let editor = tv as? EditorTextView
+                    let restored = fm.unfold(at: region.displayLocation, in: storage,
+                                             baseAttributes: editor?.editorBaseAttributes())
+                    if let restored { editor?.applyThaiFontFallback(in: restored) }
                     tv.discardUndoHistory()
                     // Arm immediately before the notification this emits, so
                     // `textDidChange` knows the edit is a fold and does not mark

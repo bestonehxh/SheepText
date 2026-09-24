@@ -109,6 +109,34 @@ nonisolated final class SyntaxEngine: @unchecked Sendable {
     private var sessions: [UUID: ParseSession] = [:]
     private var sessionOrder: [UUID] = []
 
+    /// Passes enqueued on `queue` and not yet finished.
+    ///
+    /// `queue` is ONE serial queue shared by every document, so a `queue.sync`
+    /// from the main actor waits for everything ahead of it as well as for its
+    /// own work — and nothing bounds what is ahead. A document only escapes the
+    /// engine at `LargeFilePolicy`'s thresholds (10 MB / 100 000 lines /
+    /// 1 000 000 characters), so the worst case queued in front of a
+    /// `runsImmediately` is a clean pass over a 999 999-character document.
+    /// See `runsImmediately`.
+    ///
+    /// Counted at ENQUEUE, not at the start of the work, so a caller that has
+    /// just handed the engine an async pass sees a busy queue on the very next
+    /// line. Kept under a lock rather than inside `queue` for the same reason:
+    /// asking `queue` whether `queue` is busy means waiting for it.
+    private let inFlightLock = NSLock()
+    private var inFlightPasses = 0
+
+    private func beginQueuedPass() {
+        inFlightLock.lock(); inFlightPasses += 1; inFlightLock.unlock()
+    }
+    private func endQueuedPass() {
+        inFlightLock.lock(); inFlightPasses -= 1; inFlightLock.unlock()
+    }
+    private var queueIsBusy: Bool {
+        inFlightLock.lock(); defer { inFlightLock.unlock() }
+        return inFlightPasses > 0
+    }
+
     init() {}
 
     /// Release the incremental-parse state for a document.
@@ -160,8 +188,10 @@ nonisolated final class SyntaxEngine: @unchecked Sendable {
         // simply never got its highlights. Staleness is the caller's business and
         // every caller already checks: EditorView.Coordinator carries its own
         // per-coordinator `highlightGeneration` and drops late results.
+        beginQueuedPass()
         queue.async { [weak self] in
             guard let self else { return }
+            defer { self.endQueuedPass() }
             let result = self.highlightRuns(
                 for: text,
                 language: language,
@@ -182,8 +212,10 @@ nonisolated final class SyntaxEngine: @unchecked Sendable {
         language: String,
         completion: @escaping @MainActor @Sendable (_ runs: [HighlightRun]?) -> Void
     ) {
+        beginQueuedPass()
         queue.async { [weak self] in
             guard let self else { return }
+            defer { self.endQueuedPass() }
             let result = self.highlightRuns(for: text, language: language)
             DispatchQueue.main.async {
                 completion(result?.runs)
@@ -193,12 +225,30 @@ nonisolated final class SyntaxEngine: @unchecked Sendable {
 
     /// Synchronous runs. `DocumentStore` uses it to precompute the first paint
     /// of a newly opened file.
+    ///
+    /// **It gives up rather than join a queue it does not control.**
+    /// `precomputeInitialHighlight` caps its own input at 40 000 UTF-16 units,
+    /// which bounds the work this call does — but `queue` is one serial queue
+    /// shared by every document, so a `queue.sync` also waits for whatever is
+    /// already on it, and nothing bounds THAT: a document stays inside the
+    /// engine up to `LargeFilePolicy`'s 1 000 000 characters. Open a ~900 KB
+    /// markdown file and open a second file while its first pass is running,
+    /// and the main thread waited for the whole of it — measured at 1.2 s on a
+    /// 400 KB fixture — on a path whose entire purpose is "the first frame is
+    /// already coloured".
+    ///
+    /// `nil` is already the "no precompute" answer every caller handles: the
+    /// ordinary async pass plus `applyVisibleHighlight`'s `snapshotRuns` colour
+    /// the first screen, and that path already deals with runs arriving late.
     func runsImmediately(
         text: String,
         language: String,
         documentID: UUID? = nil
     ) -> SyntaxHighlightRuns? {
-        queue.sync {
+        guard !queueIsBusy else { return nil }
+        beginQueuedPass()
+        defer { endQueuedPass() }
+        return queue.sync {
             highlightRuns(for: text, language: language, documentID: documentID)
         }
     }
@@ -384,6 +434,22 @@ nonisolated final class SyntaxEngine: @unchecked Sendable {
         if markdownInjectionsUnavailable { changedRanges = nil }
         let canReuse = !markdownInjectionsUnavailable
 
+        // Every other injected language needs the same widening markdown's
+        // fences get, and for a reason that is a property of INJECTION rather
+        // than of markdown: the region is styled by a parser the outer tree
+        // knows nothing about, so an edit inside it can recolour lines that
+        // tree does not report. HTML sees a `<script>` body as one `raw_text`
+        // token whose extent did not change, so opening a block comment on its
+        // first line came back as one changed line — `applyInjections` re-parsed
+        // the whole script and produced the right runs, and the painter's
+        // bounds then clipped all of them away except the edited line.
+        if canReuse, let injectionQuery, let ranges = changedRanges {
+            changedRanges = Self.injectionWidenedRanges(
+                query: injectionQuery, tree: tree, context: context,
+                text: text, fullRange: fullRange, ranges: ranges
+            )
+        }
+
         var queryRanges: [NSRange]?
         if canReuse, textEdit != nil, let ranges = changedRanges, priorSession?.runs != nil {
             queryRanges = ranges.filter { NSMaxRange($0) <= sourceLength }
@@ -493,7 +559,10 @@ nonisolated final class SyntaxEngine: @unchecked Sendable {
             // `none` is skipped by the painter, which is what keeps a capture
             // with no colour of its own from erasing the one underneath it —
             // the old `guard !attrs.isEmpty`.
-            painter.paint(HighlightStyleTable.styleID(forCapture: highlight.name), in: hlRange)
+            painter.paint(
+                HighlightStyleTable.styleID(forCaptureComponents: highlight.nameComponents),
+                in: hlRange
+            )
         }
     }
 
@@ -514,21 +583,16 @@ nonisolated final class SyntaxEngine: @unchecked Sendable {
         fullRange: NSRange,
         into painter: inout HighlightRunPainter
     ) {
-        guard let root = tree.rootNode else { return }
-        let cursor = injectionQuery.execute(node: root, in: tree)
-        if let range, range.length > 0 {
-            cursor.setRange(range)
-            cursor.execute(query: injectionQuery, node: root)
-        }
-
         // The same injection site can be reported by more than one match (a
         // grammar's injections.scm often carries several patterns that resolve
         // to the same raw_text node). Parsing it once is enough.
         var visited: Set<InjectionSite> = []
 
-        for injection in cursor.resolve(with: context).injections() {
-            let injRange = NSIntersectionRange(injection.range, fullRange)
-            guard injRange.length > 0 else { continue }
+        for injection in Self.injectionSites(
+            query: injectionQuery, tree: tree, context: context,
+            restrictedTo: range, fullRange: fullRange
+        ) {
+            let injRange = injection.range
             guard visited.insert(
                 InjectionSite(name: injection.name, location: injRange.location, length: injRange.length)
             ).inserted else { continue }
@@ -543,16 +607,29 @@ nonisolated final class SyntaxEngine: @unchecked Sendable {
                   let injQuery = injConfig.queries[.highlights]
             else { continue }
 
-            let injContext = SwiftTreeSitter.Predicate.Context(string: injContent)
-            let injFullRange = NSRange(location: 0, length: (injContent as NSString).length)
+            // `resolve(with:)` builds a caching context — a `[NSRange: String]`
+            // dictionary and two escaping closures — and a query with no
+            // predicates has nothing to resolve. The length is
+            // `injRange.length`; asking the substring for it bridges the string
+            // back to `NSString` for a number already in hand.
+            let injFullRange = NSRange(location: 0, length: injRange.length)
+            let injCursor = injQuery.execute(in: injTree)
+            let injHighlights = injQuery.hasPredicates
+                ? injCursor.resolve(
+                    with: SwiftTreeSitter.Predicate.Context(string: injContent)
+                  ).highlights()
+                : injCursor.highlights()
 
-            for highlight in injQuery.execute(in: injTree).resolve(with: injContext).highlights() {
+            for highlight in injHighlights {
                 var hlRange = NSIntersectionRange(highlight.range, injFullRange)
                 guard hlRange.length > 0 else { continue }
                 hlRange.location += injRange.location
                 hlRange = NSIntersectionRange(hlRange, fullRange)
                 guard hlRange.length > 0 else { continue }
-                painter.paint(HighlightStyleTable.styleID(forCapture: highlight.name), in: hlRange)
+                painter.paint(
+                    HighlightStyleTable.styleID(forCaptureComponents: highlight.nameComponents),
+                    in: hlRange
+                )
             }
         }
     }
@@ -561,6 +638,57 @@ nonisolated final class SyntaxEngine: @unchecked Sendable {
         let name: String
         let location: Int
         let length: Int
+    }
+
+    /// Where the injections query says another grammar's text lives, and which
+    /// grammar. One place, so the widening below and the painting above can
+    /// never disagree about what an injection site is — the same rule markdown
+    /// states for `widening` and its highlight filter.
+    private static func injectionSites(
+        query: Query,
+        tree: MutableTree,
+        context: SwiftTreeSitter.Predicate.Context,
+        restrictedTo range: NSRange?,
+        fullRange: NSRange
+    ) -> [(name: String, range: NSRange)] {
+        guard let root = tree.rootNode else { return [] }
+        let cursor = query.execute(node: root, in: tree)
+        if let range, range.length > 0 {
+            cursor.setRange(range)
+            cursor.execute(query: query, node: root)
+        }
+        var sites: [(name: String, range: NSRange)] = []
+        for injection in cursor.resolve(with: context).injections() {
+            let injRange = NSIntersectionRange(injection.range, fullRange)
+            guard injRange.length > 0 else { continue }
+            sites.append((injection.name, injRange))
+        }
+        return sites
+    }
+
+    /// Grow `ranges` until they cover every injection region they OVERLAP, the
+    /// same predicate and the same fixed point markdown's fences use. nil means
+    /// it did not converge, i.e. repaint the document.
+    private static func injectionWidenedRanges(
+        query: Query,
+        tree: MutableTree,
+        context: SwiftTreeSitter.Predicate.Context,
+        text: String,
+        fullRange: NSRange,
+        ranges: [NSRange]
+    ) -> [NSRange]? {
+        guard !ranges.isEmpty else { return ranges }
+        var current = ranges
+        for _ in 0..<wideningRoundLimit {
+            let sites = injectionSites(
+                query: query, tree: tree, context: context,
+                restrictedTo: unionRange(of: current), fullRange: fullRange
+            ).map(\.range)
+            let widened = widening(current, toCover: sites)
+            if widened == current { return current }
+            current = paragraphRanges(widened, in: text)
+        }
+        return nil
     }
 
     /// Smallest range covering all of `ranges`, or nil when there are none.
@@ -836,9 +964,7 @@ nonisolated final class SyntaxEngine: @unchecked Sendable {
         }
 
         var found: [MarkdownInjection] = []
-        // Bounded because each round strictly grows the ranges and there are
-        // finitely many regions; two rounds cover every case seen in practice.
-        for _ in 0..<4 {
+        for _ in 0..<Self.wideningRoundLimit {
             found = Self.markdownInjections(
                 query: query, tree: tree, nsText: nsText,
                 fullRange: fullRange, restrictedTo: Self.unionRange(of: ranges)
@@ -851,11 +977,40 @@ nonisolated final class SyntaxEngine: @unchecked Sendable {
             // would repaint one line more than every other language, for no
             // reason, and a test written to catch a missing fence would pass on
             // that accident instead.
-            if widened == ranges { break }
+            //
+            // Converged: `found` describes exactly the regions `ranges` covers,
+            // which is the post-condition the caller needs.
+            if widened == ranges { return (found, ranges) }
             ranges = Self.paragraphRanges(widened, in: text)
         }
-        return (found, ranges)
+        // Not converged. The loop used to stop here and return the ranges it
+        // had just grown together with the injections it had found BEFORE that
+        // growth — so a region absorbed on the last round was inside the
+        // repainted bounds and not in the list, `HighlightRunList.replacing`
+        // threw its runs away and nothing put them back. Measured on four
+        // back-to-back fences followed by a paragraph: the paragraph's
+        // `**bold**` lost its colour until a tab switch or a relaunch.
+        //
+        // `nil` is what "repaint the document" already means everywhere else,
+        // and it is the only answer that is certainly right.
+        return (
+            Self.markdownInjections(
+                query: query, tree: tree, nsText: nsText, fullRange: fullRange, restrictedTo: nil
+            ),
+            nil
+        )
     }
+
+    /// How many times a changed-range set may grow to swallow the injection
+    /// regions it runs into before the pass gives up and repaints everything.
+    ///
+    /// Only an ABUTTING chain cascades — `paragraphRanges` widens by one line,
+    /// so it reaches the next region only when that region starts on the line
+    /// after — and a document made of back-to-back fenced blocks is the one
+    /// shape that does it. Eight rounds covers every real document; a document
+    /// that needs more pays one full pass per keystroke, which is correct and
+    /// was the behaviour before incremental markdown existed at all.
+    private static let wideningRoundLimit = 8
 
     /// The `fenced_code_block` and `inline` nodes in the tree, in document
     /// order.
@@ -944,16 +1099,27 @@ nonisolated final class SyntaxEngine: @unchecked Sendable {
               let injQuery = injConfig.queries[.highlights]
         else { return }
 
-        let injContext = Predicate.Context(string: content)
-        let injFullRange = NSRange(location: 0, length: (content as NSString).length)
+        // `markdown_inline`'s bundled highlights.scm has no predicates at all,
+        // and on a full markdown pass there is one of these per paragraph,
+        // heading and list item — so the caching context `resolve(with:)`
+        // builds, a `[NSRange: String]` dictionary plus two escaping closures,
+        // was allocated once per paragraph to resolve nothing.
+        let injFullRange = NSRange(location: 0, length: contentRange.length)
+        let injCursor = injQuery.execute(in: injTree)
+        let injHighlights = injQuery.hasPredicates
+            ? injCursor.resolve(with: Predicate.Context(string: content)).highlights()
+            : injCursor.highlights()
 
-        for highlight in injQuery.execute(in: injTree).resolve(with: injContext).highlights() {
+        for highlight in injHighlights {
             var hlRange = NSIntersectionRange(highlight.range, injFullRange)
             guard hlRange.length > 0 else { continue }
             hlRange.location += contentRange.location
             hlRange = NSIntersectionRange(hlRange, fullRange)
             guard hlRange.length > 0 else { continue }
-            painter.paint(HighlightStyleTable.styleID(forCapture: highlight.name), in: hlRange)
+            painter.paint(
+                HighlightStyleTable.styleID(forCaptureComponents: highlight.nameComponents),
+                in: hlRange
+            )
         }
     }
 
@@ -1146,7 +1312,21 @@ nonisolated final class SyntaxEngine: @unchecked Sendable {
     // one was handed it. The inline grammar then failed to compile a query full
     // of block node types, `LanguageConfiguration` threw, and inline
     // highlighting silently did not exist.
-    private static func highlightsOnlyDirectory(from queriesURL: URL, language: String) -> URL? {
+    //
+    // The copy is unconditional. The `!fileExists` guard outlived the shared
+    // directory, and the destination is the sandbox container's temporary
+    // directory, which survives relaunches and app UPDATES until the OS decides
+    // to clean it — so a shipped fix to the bundled `highlights.scm` was never
+    // read, and a user's own override at
+    // `Application Support/SheepText/SheepTextTreeSitterQueries/markdown/`
+    // was copied to the path the bundled one already occupied and ignored.
+    // `sheeptextQueryCandidates` puts the override first for every other
+    // language; markdown and markdown_inline were the only two it could not
+    // reach. One file copy per language per launch is the simplest thing that
+    // is correct.
+    // Not `private`: `SyntaxAudit2FixTests` checks the copy really does follow
+    // its source, which is the whole of the fix above.
+    static func highlightsOnlyDirectory(from queriesURL: URL, language: String) -> URL? {
         let fm = FileManager.default
         let src = queriesURL.appendingPathComponent("highlights.scm")
         guard fm.fileExists(atPath: src.path) else { return nil }
@@ -1156,9 +1336,8 @@ nonisolated final class SyntaxEngine: @unchecked Sendable {
             .appendingPathComponent(language, isDirectory: true)
         try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
         let dst = dir.appendingPathComponent("highlights.scm")
-        if !fm.fileExists(atPath: dst.path) {
-            try? fm.copyItem(at: src, to: dst)
-        }
+        try? fm.removeItem(at: dst)
+        try? fm.copyItem(at: src, to: dst)
         return fm.fileExists(atPath: dst.path) ? dir : nil
     }
 

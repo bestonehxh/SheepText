@@ -80,14 +80,6 @@ final class ConcurrencyStressTests: XCTestCase {
         }
     }
 
-    /// `PluginLog` is `@unchecked Sendable` and appends to one file from its own
-    /// queue; every bridge and the host log through it.
-    func testPluginLogFromManyThreads() {
-        DispatchQueue.concurrentPerform(iterations: 64) { iteration in
-            PluginLog.shared.log("tsan probe \(iteration)")
-        }
-    }
-
     /// The compare engine's pure core, which `EditorView` calls from
     /// `DispatchQueue.global` on both panes at once.
     func testCompareCoreFromManyThreads() {

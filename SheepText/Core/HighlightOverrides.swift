@@ -1,6 +1,12 @@
 //
 //  HighlightOverrides.swift
-//  Plugin-configurable file-extension -> highlight language overrides.
+//  File-extension -> highlight language overrides.
+//
+//  Whatever is stored here is normalised to lowercase, so a language id that
+//  goes through it comes out lowercased — which is why
+//  `NetworkConfigLanguage.vendor(forEngineLanguage:)` has to resolve its vendor
+//  case-insensitively. `network_config:arubaCX` in, `network_config:arubacx`
+//  out.
 //
 
 import Foundation

@@ -25,11 +25,6 @@ struct PreferencesView: View {
                 .tabItem { Label("Syntax",     systemImage: "curlybraces") }
             KeybindingsSettingsPane()
                 .tabItem { Label("Keys",       systemImage: "keyboard") }
-            // The plugin subsystem's only entry point. PluginsView existed but
-            // nothing ever showed it, so a user had no way to see what had
-            // loaded, install one, or reload after editing.
-            PluginsView()
-                .tabItem { Label("Plugins",    systemImage: "puzzlepiece.extension") }
         }
         // Height matters as much as width here: with only a width set, the
         // window sized itself so the Appearance pane was cut off just below
@@ -417,29 +412,71 @@ private struct SyntaxSettingsPane: View {
 
 // MARK: - Keybindings
 
-private struct KeybindingsSettingsPane: View {
+struct KeybindingsSettingsPane: View {
+
+    /// One printed row. `commandID` names the command the shortcut triggers
+    /// where there is one, which is what lets a test compare this hand-written
+    /// table against the shortcut `BuiltInCommands` prints in the palette.
+    ///
+    /// The table drifted: this pane said "Add All Matches ⌘⌥⌃G" while the
+    /// binding has always been ⌘⌃⌥D. There are three copies of each shortcut
+    /// (here, the `.keyboardShortcut` in `SheepTextMenuCommands`, and the
+    /// palette title), only one of which the compiler checks — so the one thing
+    /// worth doing is making a divergence fail a test.
+    struct Row {
+        let command: String
+        let shortcut: String
+        let commandID: String?
+    }
+
+    static let rows: [Row] = [
+        Row(command: "Command Palette", shortcut: "⌘⇧P", commandID: nil),
+        Row(command: "Find",            shortcut: "⌘F",  commandID: "find.show"),
+        Row(command: "Find Next",       shortcut: "⌘G",  commandID: "find.next"),
+        Row(command: "Find Previous",   shortcut: "⌘⇧G", commandID: "find.previous"),
+        Row(command: "Find in Files",   shortcut: "⌘⇧F", commandID: "search.findInFiles"),
+        // The sidebar toggle is a hidden Button in MainWindowView, not a
+        // registered command, so there is nothing to compare it against.
+        Row(command: "Toggle Sidebar",  shortcut: "⌘0",  commandID: nil),
+        Row(command: "Go to Line",      shortcut: "⌘L",  commandID: "text.gotoLine"),
+        Row(command: "Duplicate Line",  shortcut: "⇧⌘D", commandID: "text.duplicateLine"),
+        Row(command: "Delete Line",     shortcut: "⇧⌘K", commandID: "text.deleteLine"),
+        Row(command: "Add Next Match",  shortcut: "⌘D",  commandID: "selection.addNextMatch"),
+        Row(command: "Add All Matches", shortcut: "⌘⌃⌥D", commandID: "selection.addAllMatches"),
+        Row(command: "Uppercase",       shortcut: "⇧⌘U", commandID: "selection.uppercase"),
+        Row(command: "Lowercase",       shortcut: "⌥⌘U", commandID: "selection.lowercase"),
+    ]
+
+    /// The run of modifier glyphs and the key at the end of a palette title
+    /// ("Find: Find Next  ⌘G" → "⌘G"), or nil when the title carries none.
+    static func trailingShortcut(of title: String) -> String? {
+        guard let start = title.lastIndex(where: { modifierGlyphs.contains($0) }) else { return nil }
+        // Walk back over the rest of the modifier run, then take everything
+        // from there — the key itself is whatever follows the last modifier.
+        var index = start
+        while index > title.startIndex {
+            let previous = title.index(before: index)
+            guard modifierGlyphs.contains(title[previous]) else { break }
+            index = previous
+        }
+        let shortcut = title[index...].trimmingCharacters(in: .whitespaces)
+        return shortcut.isEmpty ? nil : shortcut
+    }
+
+    private static let modifierGlyphs: Set<Character> = ["⌘", "⇧", "⌥", "⌃"]
+
     var body: some View {
         Form {
             Section("Shortcuts") {
-                row("Command Palette",   "⌘⇧P")
-                row("Find",              "⌘F")
-                row("Find in Files",     "⌘⇧F")
-                row("Toggle Sidebar",    "⌘0")
-                row("Go to Line",        "⌘L")
-                row("Duplicate Line",    "⇧⌘D")
-                row("Delete Line",       "⇧⌘K")
-                row("Add Next Match",    "⌘D")
-                row("Add All Matches",   "⌘⌥⌃G")
-                row("Uppercase",         "⇧⌘U")
-                row("Lowercase",         "⌥⌘U")
+                ForEach(Self.rows, id: \.command) { row($0) }
             }
         }
         .formStyle(.grouped)
     }
 
-    private func row(_ command: String, _ shortcut: String) -> some View {
-        LabeledContent(command) {
-            Text(shortcut)
+    private func row(_ entry: Row) -> some View {
+        LabeledContent(entry.command) {
+            Text(entry.shortcut)
                 .font(.system(size: 12, weight: .medium, design: .monospaced))
                 .padding(.horizontal, 8)
                 .padding(.vertical, 3)

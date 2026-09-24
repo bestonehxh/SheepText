@@ -430,8 +430,10 @@ final class EditorCompareAuditFixTests: XCTestCase {
         XCTAssertFalse(stale.displayText.contains("vlan 2000"),
                        "a rebuild from the old snapshot cannot carry the keystroke")
 
-        XCTAssertFalse(CompareApplyGuard.shouldApply(builtFrom: snapshot, documentText: typed))
-        XCTAssertTrue(CompareApplyGuard.shouldApply(builtFrom: typed, documentText: typed))
+        XCTAssertFalse(CompareApplyGuard.shouldApply(
+            builtFrom: snapshot, peerSnapshot: peer, documentText: typed, peerText: peer))
+        XCTAssertTrue(CompareApplyGuard.shouldApply(
+            builtFrom: typed, peerSnapshot: peer, documentText: typed, peerText: peer))
     }
 
     // MARK: - Filler lines stay uneditable

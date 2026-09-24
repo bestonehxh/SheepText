@@ -491,6 +491,12 @@ private struct FileTreeNodeView: View {
             return
         }
         selectedURL = nil
+        // The counterpart of the `documentDidMove` call in `renameNode`, and
+        // missing for the same reasons it was: the tab stayed open pointing at
+        // a trashed path, nothing showed that the file was gone, and ⌘S
+        // recreated it (a write to a missing path succeeds). Deleting a folder
+        // takes every document under it, which the store prefix-matches.
+        documents.documentWasDeleted(at: node.url)
     }
 
     private func promptName(title: String, message: String, value: String) -> String? {

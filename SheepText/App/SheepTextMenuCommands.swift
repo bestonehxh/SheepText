@@ -1,7 +1,7 @@
 //
 //  SheepTextMenuCommands.swift
 //  Native macOS menu bar. Most items delegate to CommandRegistry so
-//  plugins can override or extend them.
+//  the palette and the menu bar stay in step.
 //
 
 import SwiftUI

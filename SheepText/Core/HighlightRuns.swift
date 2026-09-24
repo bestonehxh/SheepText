@@ -255,6 +255,16 @@ nonisolated enum HighlightStyleTable {
         return resolved
     }
 
+    /// Resolve the components SwiftTreeSitter already parsed from a capture.
+    /// Most captures have one component, so this avoids joining a fresh String
+    /// for every capture only for `styleID(forCapture:)` to split it again while
+    /// walking the hierarchy.
+    static func styleID(forCaptureComponents components: [String]) -> HighlightStyleID {
+        guard let first = components.first else { return none }
+        if components.count == 1 { return styleID(forCapture: first) }
+        return styleID(forCapture: components.joined(separator: "."))
+    }
+
     private static func resolve(_ captureName: String) -> HighlightStyleID {
         var scope = normalizedScope(captureName)
         while !scope.isEmpty {

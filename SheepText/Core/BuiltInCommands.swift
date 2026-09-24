@@ -1,7 +1,7 @@
 //
 //  BuiltInCommands.swift
-//  All commands the core ships with. Plugins can override by registering
-//  the same id (last writer wins).
+//  All commands the core ships with. Registered once at launch, before
+//  the first window is shown.
 //
 
 import Foundation
