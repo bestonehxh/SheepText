@@ -86,8 +86,14 @@ final class AppPreferences {
     private let detectsEncodingAutomaticallyKey = "sheeptext.open.detectEncodingAutomatically"
     private let detectsSyntaxByFileExtensionKey = "sheeptext.open.detectSyntaxByFileExtension"
     private let warnsWhenOpeningLargeFilesKey = "sheeptext.open.warnsWhenOpeningLargeFiles"
-    private let checksForUpdatesAutomaticallyKey = "sheeptext.updates.checksAutomatically"
-    private let lastAutomaticUpdateCheckKey = "sheeptext.updates.lastAutomaticCheck"
+    /// Update checks are always automatic (the user, 9 Oct 2026: no option for
+    /// it). `init` clears the updater's own key (`UpdateCore.autoCheckKey`, read
+    /// from `UserDefaults.standard` — what `AppStorageLocation.defaults` is
+    /// outside tests) and the old checker's, so a stored "off" cannot stick.
+    private let checksForUpdatesAutomaticallyKey = UpdateCore.autoCheckKey
+    private let legacyChecksForUpdatesAutomaticallyKey = "sheeptext.updates.checksAutomatically"
+    /// Only the old checker's throttle used this; `init` removes it.
+    private let legacyLastAutomaticUpdateCheckKey = "sheeptext.updates.lastAutomaticCheck"
     private let themeModeKey = "sheeptext.themeMode"
     private let editorFontNameKey = "sheeptext.editor.fontName"
     private let editorFontSizeKey = "sheeptext.editor.fontSize"
@@ -286,22 +292,6 @@ final class AppPreferences {
         didSet { AppStorageLocation.defaults.set(warnsWhenOpeningLargeFiles, forKey: warnsWhenOpeningLargeFilesKey) }
     }
 
-    var checksForUpdatesAutomatically: Bool {
-        didSet { AppStorageLocation.defaults.set(checksForUpdatesAutomatically, forKey: checksForUpdatesAutomaticallyKey) }
-    }
-
-    /// When the last *automatic* update check ran. `UpdateChecker` throttles
-    /// launch-time checks against this; the menu item ignores it.
-    /// nil means "never checked".
-    var lastAutomaticUpdateCheck: Date? {
-        didSet {
-            if let lastAutomaticUpdateCheck {
-                AppStorageLocation.defaults.set(lastAutomaticUpdateCheck, forKey: lastAutomaticUpdateCheckKey)
-            } else {
-                AppStorageLocation.defaults.removeObject(forKey: lastAutomaticUpdateCheckKey)
-            }
-        }
-    }
 
     /// Material used for the tab bar and sidebar. See `GlassChrome.swift`.
     var chromeStyle: ChromeStyle {
@@ -383,8 +373,9 @@ final class AppPreferences {
         detectsEncodingAutomatically = defaults.object(forKey: detectsEncodingAutomaticallyKey) as? Bool ?? true
         detectsSyntaxByFileExtension = defaults.object(forKey: detectsSyntaxByFileExtensionKey) as? Bool ?? true
         warnsWhenOpeningLargeFiles = defaults.object(forKey: warnsWhenOpeningLargeFilesKey) as? Bool ?? true
-        checksForUpdatesAutomatically = defaults.object(forKey: checksForUpdatesAutomaticallyKey) as? Bool ?? true
-        lastAutomaticUpdateCheck = defaults.object(forKey: lastAutomaticUpdateCheckKey) as? Date
+        defaults.removeObject(forKey: checksForUpdatesAutomaticallyKey)
+        defaults.removeObject(forKey: legacyChecksForUpdatesAutomaticallyKey)
+        defaults.removeObject(forKey: legacyLastAutomaticUpdateCheckKey)
         let savedChromeStyle = defaults.string(forKey: chromeStyleKey)
         chromeStyle = savedChromeStyle.flatMap(ChromeStyle.init(rawValue:)) ?? .glass
         let savedHighlightTheme = defaults.string(forKey: highlightThemeKey)

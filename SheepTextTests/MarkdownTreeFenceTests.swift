@@ -1,16 +1,16 @@
 //
 //  MarkdownTreeFenceTests.swift
-//  Markdown fenced code blocks come from the tree, not from a document-wide
-//  regex — so markdown takes the same incremental path as every other
-//  tree-sitter language.
+//  Markdown fenced code blocks, as SheepSyntaxKit's markdown lexer reads them
+//  (the file name dates from the tree-sitter grammar these tests were first
+//  written against; every expectation carried over unchanged).
 //
 //  Two things are under test and they are not the same thing:
 //
-//  1. **What gets highlighted.** The grammar's reading of a fence is
-//     CommonMark's, and it differs from the old regex in four places: an
-//     unclosed fence runs to EOF, `~~~` is a fence, an opener may be indented
-//     up to three spaces, and an info string may carry more than the language
-//     word. Each has a test that names an offset and the style expected there.
+//  1. **What gets highlighted.** A fence is read the CommonMark way, which
+//     differs from the regex before tree-sitter in four places: an unclosed
+//     fence runs to EOF, `~~~` is a fence, an opener may be indented up to
+//     three spaces, and an info string may carry more than the language word.
+//     Each has a test that names an offset and the style expected there.
 //
 //  2. **The changed-ranges contract** — "the previous result and this one
 //     differ only inside these ranges". Markdown used to opt out of it by
@@ -63,8 +63,8 @@ final class MarkdownTreeFenceTests: XCTestCase {
         return style
     }()
 
-    /// The style a fence body carries when nothing has injected into it: the
-    /// markdown grammar's own `@text.literal` on `fenced_code_block`.
+    /// The style a fence body carries when no language highlights it:
+    /// `text.literal`.
     private lazy var untaggedFenceBodyStyle: HighlightStyleID = {
         let text = "```\nlet value = 1\n```\n"
         return HighlightRunList.style(at: offset(of: "let value", in: text), in: runs(text))
@@ -200,15 +200,14 @@ final class MarkdownTreeFenceTests: XCTestCase {
         XCTAssertEqual(style(of: text, at: offset(of: "let value", in: text)), swiftLetStyle)
     }
 
-    /// A fence nested in a block quote. The `>` markers travel inside
-    /// `code_fence_content`, so the injected parser sees them — this pins what
-    /// actually happens rather than what one might hope for.
+    /// A fence nested in a block quote: the `>` markers are stripped before
+    /// the body reaches the fence's language.
     func testFenceInsideBlockQuoteIsHighlighted() {
         let text = "> intro\n>\n> ```swift\n> let value = 1\n> ```\n"
         XCTAssertEqual(style(of: text, at: offset(of: "let value", in: text)), swiftLetStyle)
     }
 
-    /// An empty fence has no `code_fence_content` child at all.
+    /// An empty fence has no body at all.
     func testEmptyFenceDoesNotCrash() {
         let text = "# Title\n\n```swift\n```\n\ntrailing\n"
         XCTAssertFalse(runs(text).isEmpty)
@@ -216,12 +215,9 @@ final class MarkdownTreeFenceTests: XCTestCase {
 
     // MARK: - The inline grammar
 
-    /// `TreeSitterMarkdownInline` ships in the same SPM product the app already
-    /// links, so the block grammar's `inline` nodes get a second injected pass —
-    /// the one that finds emphasis, strong, code spans and links. Before this
-    /// they were unstyled, and so were headings and link destinations: the
-    /// palette had no `text.*` scopes but `text.literal`, so every capture the
-    /// markdown grammars actually emit resolved to "no style".
+    /// Emphasis, strong, code spans, links and headings. There was a time
+    /// they were all unstyled: the palette had no `text.*` scopes but
+    /// `text.literal`, so every one of them resolved to "no style".
     func testInlineGrammarStylesEmphasisStrongCodeAndLinks() {
         let text = "# Title\n\nSome *emphasis*, some **strong**, a `code span` and a [label](https://example.com).\n"
         let cases: [(needle: String, capture: String)] = [
@@ -242,9 +238,10 @@ final class MarkdownTreeFenceTests: XCTestCase {
         }
     }
 
-    /// An `inline` node spans a whole paragraph, so opening an emphasis on its
-    /// first line restyles the second — the same shape as a fence body, and
-    /// covered by the same widening rule.
+    /// Inline markup belongs to the paragraph, not the line: opening an
+    /// emphasis on the first line restyles the second. SheepSyntaxKit's
+    /// markdown reads ahead within the paragraph, and re-lexes from the
+    /// paragraph's start, to keep that exact.
     func testOpeningEmphasisRestylesTheRestOfTheParagraph() {
         let id = UUID()
         defer { SyntaxEngine.shared.discardSession(for: id) }
@@ -315,11 +312,11 @@ final class MarkdownTreeFenceTests: XCTestCase {
         let id = UUID()
         defer { SyntaxEngine.shared.discardSession(for: id) }
         // Turning `//` into `/*` on the first body line puts every later line of
-        // the fence inside a block comment. The markdown tree cannot report
-        // that: to it the whole body is one opaque token, and the edit is one
-        // character on the body's first line. Without the fence widening the
-        // reported range stops short of the last body line and the incremental
-        // run list keeps a stale keyword there — measured, not argued.
+        // the fence inside a block comment. Under tree-sitter the markdown tree
+        // could not report that — to it the body was one opaque token — and it
+        // took a widening rule to cover it. SheepSyntaxKit carries the fence
+        // language's own state from line to line, so the re-lex simply runs
+        // until the states agree again, which is past the last body line.
         //
         // Both texts are the same length, so an offset means the same character
         // in each and the comparison below is not accidentally comparing a
@@ -513,8 +510,8 @@ final class MarkdownTreeFenceTests: XCTestCase {
     // MARK: - Thai (item 5)
 
     /// Thai is BMP, so one Character is one UTF-16 unit but three UTF-8 bytes —
-    /// the parser is fed UTF-16 and the node ranges come back in UTF-16, so a
-    /// fence that follows Thai prose must still land on the right characters.
+    /// everything here is UTF-16, so a fence that follows Thai prose must still
+    /// land on the right characters.
     func testThaiProseBeforeAndInsideAFence() {
         let text = "# หัวข้อ\n\nข้อความภาษาไทยก่อนโค้ด\n\n```swift\nlet ค่า = 1 // หมายเหตุ\n```\n\nท้ายเรื่อง\n"
         let letOffset = offset(of: "let ค่า", in: text)

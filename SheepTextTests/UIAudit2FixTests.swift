@@ -10,85 +10,10 @@ import SwiftUI
 import XCTest
 @testable import SheepText
 
-// MARK: - US3 — the update check trusts whatever the response carried
-
-final class UpdateDownloadURLTests: XCTestCase {
-
-    /// The release JSON's `html_url` went straight to `NSWorkspace.open`, which
-    /// honours `file://` and every registered custom scheme — and the app is
-    /// unsandboxed now, so whatever it launched was unconstrained. "Download"
-    /// has to mean one thing.
-    func testAReleasePageOnGitHubIsAccepted() {
-        XCTAssertEqual(
-            UpdateChecker.downloadURL(
-                htmlURL: "https://github.com/bestonehxh/SheepText/releases/tag/v3.7"
-            ).absoluteString,
-            "https://github.com/bestonehxh/SheepText/releases/tag/v3.7"
-        )
-    }
-
-    func testAFileURLFallsBackToTheReleasesPage() {
-        XCTAssertEqual(
-            UpdateChecker.downloadURL(htmlURL: "file:///Applications/Calculator.app"),
-            UpdateChecker.releasesPageURL
-        )
-    }
-
-    func testPlainHTTPFallsBackToTheReleasesPage() {
-        XCTAssertEqual(
-            UpdateChecker.downloadURL(htmlURL: "http://github.com/bestonehxh/SheepText/releases"),
-            UpdateChecker.releasesPageURL
-        )
-    }
-
-    /// A host that merely starts with "github.com" is a different host, and one
-    /// that merely contains it is somebody else's domain entirely.
-    func testALookalikeHostFallsBackToTheReleasesPage() {
-        for host in ["githubb.com", "github.com.evil.example", "evil.example"] {
-            XCTAssertEqual(
-                UpdateChecker.downloadURL(htmlURL: "https://\(host)/bestonehxh/SheepText/releases"),
-                UpdateChecker.releasesPageURL,
-                "\(host) was accepted"
-            )
-        }
-    }
-
-    /// Right host, wrong repository: still not this app's download.
-    func testAnotherRepositoryFallsBackToTheReleasesPage() {
-        XCTAssertEqual(
-            UpdateChecker.downloadURL(htmlURL: "https://github.com/someone/else/releases/tag/v1"),
-            UpdateChecker.releasesPageURL
-        )
-    }
-
-    /// `/bestonehxh/SheepTextEvil` shares a string prefix with the real repo
-    /// path but is a different repository — the check is per path component.
-    func testARepositoryWhoseNameSharesAPrefixIsRejected() {
-        XCTAssertEqual(
-            UpdateChecker.downloadURL(htmlURL: "https://github.com/bestonehxh/SheepTextEvil/releases"),
-            UpdateChecker.releasesPageURL
-        )
-    }
-
-    func testGarbageFallsBackToTheReleasesPage() {
-        XCTAssertEqual(UpdateChecker.downloadURL(htmlURL: ""), UpdateChecker.releasesPageURL)
-        XCTAssertEqual(UpdateChecker.downloadURL(htmlURL: "not a url at all"),
-                       UpdateChecker.releasesPageURL)
-    }
-
-    /// The `URLResponse` was discarded, so an HTTP 403 — which is what the
-    /// unauthenticated GitHub API answers after 60 requests an hour — was fed
-    /// to the JSON decoder. It threw, and the launch path swallows errors
-    /// silently while the menu item blamed the user's internet connection.
-    func testRateLimitIsItsOwnError() {
-        XCTAssertEqual(UpdateChecker.responseError(forStatusCode: 403)?.errorDescription,
-                       UpdateCheckError.rateLimited.errorDescription)
-        XCTAssertNotNil(UpdateChecker.responseError(forStatusCode: 500))
-        XCTAssertNil(UpdateChecker.responseError(forStatusCode: 200))
-        XCTAssertNil(UpdateChecker.responseError(forStatusCode: 299))
-        XCTAssertNotNil(UpdateChecker.responseError(forStatusCode: 301))
-    }
-}
+// MARK: - US3 — moved
+// The old UpdateChecker was replaced by the Sheep-family in-app updater;
+// UpdaterTests.swift covers the same trust rules (release page and asset URLs
+// only from https://github.com/<this repo>, rate limit as its own error).
 
 // MARK: - UP2 — the tab strip is lazy, so some tabs have no measured frame
 

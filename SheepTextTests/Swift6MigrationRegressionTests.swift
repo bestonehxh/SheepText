@@ -6,20 +6,19 @@ import XCTest
 final class Swift6AppKitRegressionTests: XCTestCase {
     /// The incremental path must not silently degrade back into a full rebuild.
     ///
-    /// It once did: the parse was reused but the highlights query still walked
-    /// the whole tree and a document-sized attributed string was allocated from
-    /// scratch every pass, so an edit in a 100k-character file cost 451 ms
-    /// against 520 ms for a clean parse — 13%. With the query range-restricted
-    /// and last pass's attributes spliced and reused it is ~11 ms. The 5x
-    /// threshold below is deliberately far looser than the ~44x measured, so
-    /// this fails on a structural regression, not on a slow machine.
+    /// Under tree-sitter it once did (451 ms against 520 ms for a clean parse
+    /// of 100k characters). SheepSyntaxKit re-lexes from the edited line and
+    /// stops where the line states rejoin, so an edit is a line, not a file.
+    /// Measured on run lists, not attributed strings: materialising a
+    /// document-sized `NSAttributedString` costs the same on both paths and
+    /// would hide the difference. The 3x threshold is far looser than what a
+    /// one-line re-lex against a 100k-character clean pass gives, so this
+    /// fails on a structural regression, not on a slow machine.
     func testIncrementalHighlightIsSubstantiallyCheaperThanCleanParse() {
         let line = "func value(_ input: Int) -> Int { let result = input * 2; return result } // probe 0\n"
         let base = String(repeating: line, count: 100_000 / (line as NSString).length)
         let documentID = UUID()
-        _ = SyntaxEngine.shared.highlightImmediately(
-            text: base, language: "swift", isDark: true, documentID: documentID
-        )
+        _ = SyntaxEngine.shared.runsImmediately(text: base, language: "swift", documentID: documentID)
 
         var incremental: [Double] = []
         var clean: [Double] = []
@@ -31,21 +30,17 @@ final class Swift6AppKitRegressionTests: XCTestCase {
                 range: base.range(of: "probe 0")
             )
             var start = CFAbsoluteTimeGetCurrent()
-            _ = SyntaxEngine.shared.highlightImmediately(
-                text: edited, language: "swift", isDark: true, documentID: documentID
-            )
+            _ = SyntaxEngine.shared.runsImmediately(text: edited, language: "swift", documentID: documentID)
             incremental.append(CFAbsoluteTimeGetCurrent() - start)
             start = CFAbsoluteTimeGetCurrent()
-            _ = SyntaxEngine.shared.highlightImmediately(
-                text: edited, language: "swift", isDark: true
-            )
+            _ = SyntaxEngine.shared.runsImmediately(text: edited, language: "swift")
             clean.append(CFAbsoluteTimeGetCurrent() - start)
         }
         incremental.sort()
         clean.sort()
 
         XCTAssertLessThan(
-            incremental[2] * 5, clean[2],
+            incremental[2] * 3, clean[2],
             "incremental median \(incremental[2] * 1000) ms vs clean \(clean[2] * 1000) ms"
         )
         SyntaxEngine.shared.discardSession(for: documentID)
@@ -204,7 +199,7 @@ final class Swift6AppKitRegressionTests: XCTestCase {
         )
     }
 
-    func testIncrementalTreeSitterMatchesCleanParseForUnicodeAndCRLFEdit() {
+    func testIncrementalHighlightMatchesCleanParseForUnicodeAndCRLFEdit() {
         let documentID = UUID()
         let original = "let title = \"แกะ 🐑\"\r\nfunc value() -> Int { 1 }\r\n"
         let edited = "let title = \"แกะน้อย 🐑\"\r\nfunc value() -> Int { return 2 }\r\n"
@@ -233,8 +228,7 @@ final class Swift6AppKitRegressionTests: XCTestCase {
             XCTAssertTrue(incremental.isEqual(to: clean))
         }
         // Unlike its three siblings this used to end without discarding, leaking
-        // one session — text, tree copy and attributed string — into the LRU for
-        // the rest of the test run.
+        // one session into the LRU for the rest of the test run.
         SyntaxEngine.shared.discardSession(for: documentID)
     }
 }

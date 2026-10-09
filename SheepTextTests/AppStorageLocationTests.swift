@@ -64,8 +64,13 @@ final class AppStorageLocationTests: XCTestCase {
         }
         var scanned = 0
         var violations: [String] = []
+        // SheepText/Update/ is the Sheep-family updater, copied unchanged from
+        // SheepTerm: it keeps its two keys in `UserDefaults.standard` (what
+        // AppStorageLocation.defaults is outside tests) and is never started
+        // under XCTest (SheepTextAppDelegate.applicationDidFinishLaunching).
         for case let url as URL in walker
-        where url.pathExtension == "swift" && url.lastPathComponent != "AppStorageLocation.swift" {
+        where url.pathExtension == "swift" && url.lastPathComponent != "AppStorageLocation.swift"
+            && url.deletingLastPathComponent().lastPathComponent != "Update" {
             guard let source = try? String(contentsOf: url, encoding: .utf8) else { continue }
             scanned += 1
             for (index, line) in source.components(separatedBy: "\n").enumerated() {

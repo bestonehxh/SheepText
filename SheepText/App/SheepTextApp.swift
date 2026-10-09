@@ -33,7 +33,7 @@ struct SheepTextApp: App {
     /// `.task` is attached to the window's content view, so closing the last
     /// window with the red X and clicking the Dock icon runs the whole body
     /// again — which re-registered every built-in command over whatever had
-    /// replaced it, and re-ran the update check.
+    /// replaced it.
     @State private var didBootstrapServices = false
 
     var body: some Scene {
@@ -54,8 +54,7 @@ struct SheepTextApp: App {
                     applyTheme()
 
                     // Everything under this flag is process-wide setup that a
-                    // second window must not repeat. Read once, because the
-                    // flag is set before the body reaches the update check.
+                    // second window must not repeat.
                     let isFirstWindow = !didBootstrapServices
                     didBootstrapServices = true
 
@@ -124,12 +123,6 @@ struct SheepTextApp: App {
                         }
                     }
 
-                    // Not from a test host: its defaults start empty, so the
-                    // check is always "due" and would reach GitHub — and could
-                    // raise an update alert — on every test run.
-                    if isFirstWindow, !AppStorageLocation.isHostedByXCTest {
-                        UpdateChecker.shared.checkForUpdatesOnLaunchIfDue(preferences: preferences)
-                    }
                 }
                 .onOpenURL { url in
                     documents.openExternalFileURLs([url], preferences: preferences)
@@ -195,6 +188,25 @@ final class SheepTextAppDelegate: NSObject, NSApplicationDelegate {
     var willTerminateHandler: (() -> Void)?
     var reopenMainWindowHandler: (() -> Void)?
     private var pendingOpenFileURLs: [URL] = []
+
+    /// The live delegate, for the in-app updater (SheepTextUpdate.swift),
+    /// which is static and cannot reach the SwiftUI-owned instance otherwise.
+    private static weak var current: SheepTextAppDelegate?
+    /// Set by the updater right before Install & Relaunch quits: the unsaved
+    /// documents question was already asked, so ⌘Q's path must not ask again.
+    static var quitAlreadyConfirmed = false
+
+    override init() {
+        super.init()
+        Self.current = self
+    }
+
+    /// Install & Relaunch's question before it quits — the same one ⌘Q asks
+    /// (save, discard or cancel each unsaved document). false = cancelled.
+    static func confirmQuitForUpdate() -> Bool {
+        guard let handler = current?.shouldTerminateHandler else { return true }
+        return handler() != .terminateCancel
+    }
     /// Window numbers of the main windows that were on screen or minimised when
     /// the app was hidden. See `mainWindow`.
     private var mainWindowsHiddenWithApp: Set<Int> = []
@@ -292,7 +304,16 @@ final class SheepTextAppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        shouldTerminateHandler?() ?? .terminateNow
+        if Self.quitAlreadyConfirmed { return .terminateNow }
+        return shouldTerminateHandler?() ?? .terminateNow
+    }
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        // Not from a test host: the updater would reach GitHub — and could
+        // raise an update alert — on every test run.
+        if !AppStorageLocation.isHostedByXCTest {
+            AppUpdater.shared.start()
+        }
     }
 
     func applicationWillTerminate(_ notification: Notification) {

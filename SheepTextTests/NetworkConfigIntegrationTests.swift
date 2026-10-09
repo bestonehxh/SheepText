@@ -22,6 +22,7 @@
 import XCTest
 import AppKit
 import NetworkHighlightKit
+import SheepSyntaxKit
 @testable import SheepText
 
 @MainActor

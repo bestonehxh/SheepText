@@ -21,6 +21,7 @@
 import AppKit
 import XCTest
 import NetworkHighlightKit
+import SheepSyntaxKit
 @testable import SheepText
 
 @MainActor
@@ -522,35 +523,6 @@ final class SyntaxAudit2FixTests: XCTestCase {
             if immediate == nil { RunLoop.current.run(until: Date().addingTimeInterval(0.01)) }
         } while immediate == nil && Date() < freeDeadline
         XCTAssertNotNil(immediate, "the syntax queue never became free after the concurrent workloads")
-    }
-
-    // MARK: - S7: a query override reaches both markdown grammars
-
-    /// `highlightsOnlyDirectory` copies `highlights.scm` into the sandbox's
-    /// temporary directory, which survives relaunches and app updates — and it
-    /// used to skip the copy whenever a file was already there. So a shipped
-    /// fix to the bundled query was never read, and a user's own override was
-    /// copied to a path the bundled one already occupied and ignored.
-    func testTheMarkdownHighlightsCopyTracksItsSource() throws {
-        let fm = FileManager.default
-        let source = fm.temporaryDirectory
-            .appendingPathComponent("sheeptext-audit2-queries-\(UUID().uuidString)", isDirectory: true)
-        try fm.createDirectory(at: source, withIntermediateDirectories: true)
-        defer { try? fm.removeItem(at: source) }
-        let src = source.appendingPathComponent("highlights.scm")
-
-        for sentinel in ["(comment) @comment\n", "(comment) @comment\n(atx_heading) @text.title\n"] {
-            try Data(sentinel.utf8).write(to: src)
-            guard let dir = SyntaxEngine.highlightsOnlyDirectory(
-                from: source, language: "markdown-audit2-probe"
-            ) else {
-                return XCTFail("no directory for \(sentinel.count) bytes")
-            }
-            let copied = try String(
-                contentsOf: dir.appendingPathComponent("highlights.scm"), encoding: .utf8
-            )
-            XCTAssertEqual(copied, sentinel, "the copy did not follow its source")
-        }
     }
 
     /// Walk a document through a series of one-token substitutions, comparing an

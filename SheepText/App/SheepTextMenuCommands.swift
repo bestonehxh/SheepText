@@ -21,10 +21,10 @@ struct SheepTextMenuCommands: Commands {
 
         // MARK: SheepText (app menu)
         CommandGroup(after: .appInfo) {
-            // "Check for Updates…" always checks and always reports, unlike the
-            // throttled silent check SheepTextApp runs at launch.
+            // Always checks and always reports, unlike the automatic checks
+            // the in-app updater schedules itself (SheepTextUpdate.swift).
             Button("Check for Updates…") {
-                UpdateChecker.shared.checkForUpdates()
+                AppUpdater.shared.checkNow()
             }
         }
 

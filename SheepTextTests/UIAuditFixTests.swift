@@ -10,73 +10,10 @@ import SwiftUI
 import XCTest
 @testable import SheepText
 
-// MARK: - U9 — UpdateChecker.isNewer
-
-final class UpdateCheckerVersionTests: XCTestCase {
-
-    /// The bug: `split(separator: ".").compactMap { Int($0) }` DROPPED any
-    /// component that did not parse whole, which shifts every later component
-    /// left. "1.3.5-beta.2" became [1, 3, 2] — read as 1.3.2, i.e. a downgrade
-    /// — and "1.3.5 (17)" became [1, 3], read as 1.3.0.
-    func testPreReleaseTagIsNotNewerThanItsRelease() {
-        XCTAssertFalse(UpdateChecker.isNewer("1.3.5-beta.2", than: "1.3.5"))
-        XCTAssertFalse(UpdateChecker.isNewer("1.3.5+build.9", than: "1.3.5"))
-    }
-
-    func testBuildNumberSuffixIsNotNewer() {
-        XCTAssertFalse(UpdateChecker.isNewer("1.3.5 (17)", than: "1.3.5"))
-    }
-
-    func testComponentsCompareNumericallyNotLexically() {
-        XCTAssertTrue(UpdateChecker.isNewer("1.10.0", than: "1.9.0"))
-        XCTAssertFalse(UpdateChecker.isNewer("1.9.0", than: "1.10.0"))
-    }
-
-    func testMissingComponentsCountAsZero() {
-        XCTAssertTrue(UpdateChecker.isNewer("2.0", than: "1.9.9"))
-        XCTAssertFalse(UpdateChecker.isNewer("1.3", than: "1.3.0"))
-        XCTAssertTrue(UpdateChecker.isNewer("1.3.1", than: "1.3"))
-    }
-
-    func testEqualVersionsAreNotNewer() {
-        XCTAssertFalse(UpdateChecker.isNewer("1.3.5", than: "1.3.5"))
-    }
-
-    /// A component that is not a number at all must become 0 rather than
-    /// vanish, so the positions of the components after it do not move.
-    func testUnparseableComponentDoesNotShiftLaterComponents() {
-        XCTAssertTrue(UpdateChecker.isNewer("1.x.9", than: "1.0.8"))
-        XCTAssertFalse(UpdateChecker.isNewer("1.x.7", than: "1.0.8"))
-    }
-
-    // MARK: U3 — launch-check throttle
-
-    func testAutomaticCheckIsSkippedWhenPreferenceIsOff() {
-        XCTAssertFalse(UpdateChecker.isAutomaticCheckDue(enabled: false, lastCheck: nil, now: Date()))
-    }
-
-    func testFirstEverAutomaticCheckIsDue() {
-        XCTAssertTrue(UpdateChecker.isAutomaticCheckDue(enabled: true, lastCheck: nil, now: Date()))
-    }
-
-    func testAutomaticCheckIsThrottledForTwentyFourHours() {
-        let now = Date()
-        let hourAgo = now.addingTimeInterval(-3600)
-        XCTAssertFalse(UpdateChecker.isAutomaticCheckDue(enabled: true, lastCheck: hourAgo, now: now))
-
-        let dayAgo = now.addingTimeInterval(-UpdateChecker.automaticCheckInterval - 1)
-        XCTAssertTrue(UpdateChecker.isAutomaticCheckDue(enabled: true, lastCheck: dayAgo, now: now))
-    }
-
-    /// A clock correction can leave a timestamp in the future. That must not
-    /// mean "never check again".
-    func testFutureTimestampIsTreatedAsDue() {
-        let now = Date()
-        XCTAssertTrue(
-            UpdateChecker.isAutomaticCheckDue(enabled: true, lastCheck: now.addingTimeInterval(600), now: now)
-        )
-    }
-}
+// MARK: - U9 / U3 — moved
+// The old UpdateChecker (version compare, launch-check throttle) was replaced
+// by the Sheep-family in-app updater; UpdaterTests.swift covers its ordering
+// and scheduling.
 
 // MARK: - U4 — save commands act on ONE document
 

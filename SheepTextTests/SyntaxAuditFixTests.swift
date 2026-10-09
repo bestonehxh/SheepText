@@ -19,7 +19,7 @@ import AppKit
 import XCTest
 @testable import SheepText
 
-// The engine's test seams (highlightImmediatelyWithRanges, lookup counters)
+// The engine's test seam (highlightImmediatelyWithRanges)
 // exist only in DEBUG builds; the Release test target runs the perf harness only.
 #if DEBUG
 
@@ -522,33 +522,6 @@ final class SyntaxAuditFixTests: XCTestCase {
                 XCTAssertTrue(incremental.isEqual(to: clean), "html injections diverged at step \(index)")
             }
         }
-    }
-
-    // MARK: - S12
-
-    /// A language whose grammar cannot be configured used to re-walk
-    /// `Bundle.allBundles + allFrameworks`, stat two override paths and
-    /// re-attempt the query compile on every single highlight pass.
-    func testFailedConfigurationLookupIsRememberedInsteadOfRetried() {
-        let language = "sheeptext-audit-no-such-grammar"
-        let before = SyntaxEngine.configurationLookupAttempts
-        XCTAssertFalse(SyntaxEngine.shared.lookUpConfigurationForTesting(language))
-        let afterFirst = SyntaxEngine.configurationLookupAttempts
-        XCTAssertEqual(afterFirst, before + 1, "the first lookup should do the work")
-
-        for _ in 0..<5 {
-            XCTAssertFalse(SyntaxEngine.shared.lookUpConfigurationForTesting(language))
-        }
-        XCTAssertEqual(
-            SyntaxEngine.configurationLookupAttempts, afterFirst,
-            "a remembered failure must not re-walk the bundles"
-        )
-
-        // A language that does configure is cached the same way.
-        XCTAssertTrue(SyntaxEngine.shared.lookUpConfigurationForTesting("swift"))
-        let afterSwift = SyntaxEngine.configurationLookupAttempts
-        XCTAssertTrue(SyntaxEngine.shared.lookUpConfigurationForTesting("swift"))
-        XCTAssertEqual(SyntaxEngine.configurationLookupAttempts, afterSwift)
     }
 }
 #endif

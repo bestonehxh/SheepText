@@ -2958,10 +2958,6 @@ final class Document: Identifiable {
     /// files without a BOM, this stays false — don't add one silently.
     var hasBOM: Bool
 
-    /// Tree-sitter tree, opaque here. Kept for future use by the Neon
-    /// upgrade; unused today.
-    var syntaxTreeHandle: SyntaxTreeHandle?
-
     /// Text at last save (or at open for disk files). nil for untitled docs.
     var savedText: String?
 
@@ -3193,11 +3189,6 @@ enum LanguageDetector {
         let normalized = language.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         return normalized.isEmpty ? "plaintext" : normalized
     }
-}
-
-/// Opaque handle for future Tree-sitter integration.
-struct SyntaxTreeHandle {
-    let pointer: OpaquePointer
 }
 
 // MARK: - NSAlert convenience

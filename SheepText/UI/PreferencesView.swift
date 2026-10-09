@@ -104,7 +104,13 @@ private struct GeneralSettingsPane: View {
             }
 
             Section("Updates") {
-                Toggle("Check for updates automatically", isOn: $preferences.checksForUpdatesAutomatically)
+                // Checks are always automatic (at launch, then daily); no toggle.
+                LabeledContent("Installed version") {
+                    Text(Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "—")
+                        .monospacedDigit()
+                        .foregroundStyle(.secondary)
+                    Button("Check Now") { AppUpdater.shared.checkNow() }
+                }
             }
         }
         .formStyle(.grouped)

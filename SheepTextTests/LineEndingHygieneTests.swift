@@ -134,7 +134,11 @@ final class LineEndingHygieneTests: XCTestCase {
 
         var violations: [LineEndingHygiene.Violation] = []
         var scanned = 0
-        for case let url as URL in walker where url.pathExtension == "swift" {
+        // SheepText/Update/ is the Sheep-family updater, copied unchanged from
+        // SheepTerm. It splits GitHub release notes, not documents, and does
+        // so only after `replacingOccurrences(of: "\r\n", with: "\n")`.
+        for case let url as URL in walker
+        where url.pathExtension == "swift" && url.deletingLastPathComponent().lastPathComponent != "Update" {
             guard let source = try? String(contentsOf: url, encoding: .utf8) else { continue }
             scanned += 1
             violations += LineEndingHygiene.violations(

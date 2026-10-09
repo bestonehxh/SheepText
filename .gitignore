@@ -30,3 +30,7 @@ xcuserdata/
 
 # VS Code
 .vscode/
+
+# SwiftPM (SheepSyntaxKit, NetworkHighlightKit)
+.build/
+.swiftpm/

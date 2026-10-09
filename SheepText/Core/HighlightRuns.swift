@@ -69,7 +69,7 @@ nonisolated enum HighlightStyleTable {
     static let none: HighlightStyleID = 0
 
     struct Style: Sendable {
-        /// The tree-sitter scope this style is named by, e.g. `keyword.function`.
+        /// The dotted scope this style is named by, e.g. `keyword.function`.
         let scope: String
         /// sRGB, dark appearance / light appearance.
         let dark: UInt32
@@ -105,8 +105,10 @@ nonisolated enum HighlightStyleTable {
     private static let obliqueScopes: Set<String> = ["emphasis", "markup.italic", "text.emphasis"]
     private static let strokedScopes: Set<String> = ["emphasis.strong", "markup.bold", "text.strong"]
 
-    /// Keys are standard tree-sitter highlight names; the hierarchical resolver
-    /// below means `keyword.function` falls back to `keyword` automatically.
+    /// Keys are the conventional dotted highlight names (the ones tree-sitter
+    /// popularised, which SheepSyntaxKit's `SyntaxScope.captureName` uses);
+    /// the hierarchical resolver below means `keyword.function` falls back to
+    /// `keyword` automatically.
     private static let definitions: [(String, UInt32, UInt32)] = [
         // comments
         ("comment",                    0x5C6370, 0xA0A1A7),
@@ -171,8 +173,8 @@ nonisolated enum HighlightStyleTable {
         ("link_text",                  0x61AFEF, 0x4078F2),
         ("link_uri",                   0x56B6C2, 0x0184BC),
         ("text.literal",               0x98C379, 0x50A14F),
-        // text.* aliases — the nvim-treesitter names the bundled markdown
-        // grammars actually emit. Only `text.literal` was defined, so a
+        // text.* aliases — the names markdown highlighting emits (they were the
+        // nvim-treesitter names of the old bundled grammars). Only `text.literal` was defined, so a
         // markdown heading, link or emphasis resolved through the hierarchy to
         // `text`, which is not a scope either, and came out with no style at
         // all. `text.emphasis` and `text.strong` were already named in
@@ -255,10 +257,9 @@ nonisolated enum HighlightStyleTable {
         return resolved
     }
 
-    /// Resolve the components SwiftTreeSitter already parsed from a capture.
-    /// Most captures have one component, so this avoids joining a fresh String
-    /// for every capture only for `styleID(forCapture:)` to split it again while
-    /// walking the hierarchy.
+    /// Resolve a capture name that arrives already split on its dots. Most
+    /// have one component, so this avoids joining a fresh String only for
+    /// `styleID(forCapture:)` to split it again while walking the hierarchy.
     static func styleID(forCaptureComponents components: [String]) -> HighlightStyleID {
         guard let first = components.first else { return none }
         if components.count == 1 { return styleID(forCapture: first) }
@@ -275,10 +276,9 @@ nonisolated enum HighlightStyleTable {
         return none
     }
 
-    /// Tree-sitter strips the `@` when it stores a capture name, so nothing
-    /// SwiftTreeSitter delivers here has ever carried one; the leading strip is
-    /// kept as a cheap prefix check because the regex highlighters pass scope
-    /// names of their own.
+    /// Capture names arrive without an `@` (SheepSyntaxKit's `captureName`,
+    /// the network highlighter's token names); the leading strip is kept as a
+    /// cheap prefix check for hand-written scope names.
     private static func normalizedScope(_ captureName: String) -> String {
         var scope = captureName.lowercased()
         if scope.hasPrefix("@") { scope.removeFirst() }
