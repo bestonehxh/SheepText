@@ -437,7 +437,7 @@ struct FindInFilesView: View {
     }
 
     private func confirmReplace(matchCount: Int, fileCount: Int) -> Bool {
-        let alert = NSAlert()
+        let alert = SheepAlert()
         alert.messageText = "Replace in Files?"
         alert.informativeText = "Replace \(matchCount) matches in \(fileCount) files. Backup copies will be created before files are changed."
         alert.alertStyle = .warning
@@ -447,7 +447,7 @@ struct FindInFilesView: View {
     }
 
     private func showAlert(title: String, message: String, style: NSAlert.Style) {
-        let alert = NSAlert()
+        let alert = SheepAlert()
         alert.messageText = title
         alert.informativeText = message
         alert.alertStyle = style

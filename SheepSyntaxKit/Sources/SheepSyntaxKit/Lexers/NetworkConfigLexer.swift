@@ -10,9 +10,15 @@
 //    a byte scanner with no AppKit dependency and it knows eleven device
 //    families. It never guesses: `.auto` carries no interface rule at all.
 // 2. **This file** adds what an EDITOR knows and a terminal does not: which
-//    character opens a comment, that the first token of a line is the command,
-//    which words are sub-keywords, and — for Cisco — that `vlan 306s` and
+//    character opens a comment and — for Cisco — that `vlan 306s` and
 //    `spanning-tree mode rpvsts` are not merely uncoloured but WRONG.
+//
+// The colours are SheepTerm's, rule for rule (`NetworkHighlightDefaults
+// .presentation`): every package rule has a `network.*` scope of its own, so
+// the editor and the terminal paint a config identically. Commands and
+// sub-keywords are NOT painted — SheepTerm never coloured them, and a config
+// where every first word is purple buries the values that matter. The data
+// for that layer is still in the table behind `firstTokenIsKeyword`.
 //
 // Paint order is fill → scanner → override, so a scanner span wins over the
 // editor's generic guesses (a first-token keyword, a bare integer) while a
@@ -50,8 +56,8 @@ public struct NetworkConfigCommand: Sendable {
         /// and painting their second token red said a correct config was
         /// broken. A false red is worse than a missed one.
         case vlanList
-        /// A closed set: a member takes the constant colour, anything else is
-        /// an error (`spanning-tree mode rpvsts`).
+        /// A closed set: a member stays plain, anything else is an error
+        /// (`spanning-tree mode rpvsts`).
         case oneOf(Set<String>)
     }
 
@@ -122,7 +128,9 @@ public struct NetworkConfigVendorRules: Sendable {
     /// UTF-16 units that open a whole-line comment when one is the first
     /// non-blank character on the line. Empty = this family has none here.
     public let commentMarkers: [UInt16]
-    /// Paint the first token of every line as the command keyword.
+    /// Paint command words as keywords: the first token of every line, the
+    /// sub-commands a `commands` entry walks and `subKeywords`. Off for every
+    /// family — SheepTerm colours values, not commands.
     public let firstTokenIsKeyword: Bool
     /// Paint a token made only of digits, `.` and `:` as a number. The package
     /// already claims addresses; this catches the bare `100` in
@@ -269,8 +277,8 @@ public struct NetworkConfigVendorRules: Sendable {
     ) -> NetworkConfigVendorRules {
         NetworkConfigVendorRules(
             commentMarkers: comment,
-            firstTokenIsKeyword: true,
-            paintsPlainNumbers: true,
+            firstTokenIsKeyword: false,
+            paintsPlainNumbers: false,
             subKeywords: subKeywords,
             commands: commands,
             vlanListIntroducers: vlanListIntroducers,
@@ -304,17 +312,30 @@ public struct NetworkConfigVendorRules: Sendable {
 
 public enum NetworkConfigHighlighter {
 
-    /// Rule → capture name: `NetworkHighlightDefaults.suggestedTokenNames`
-    /// verbatim. `.mac` takes `property` rather than `number`, so a MAC and an
-    /// IPv4 address never share ink.
-    public static let ruleTokenNames: [NetworkRule: String] = NetworkHighlightDefaults.suggestedTokenNames
+    /// Rule → scope, grouped exactly as SheepTerm groups its colours: a mask
+    /// and a prefix length share one, IPv4 and IPv6 share one, an interface
+    /// name and a bare `1/1/1` port share one.
+    public static let ruleScope: [NetworkRule: SyntaxScope] = [
+        .vlan: .networkVlan,
+        .interface: .networkInterface,
+        .cxPort: .networkInterface,
+        .mask: .networkMask,
+        .cidr: .networkMask,
+        .ipv4: .networkAddress,
+        .ipv6: .networkAddress,
+        .mac: .networkMac,
+        .stateGood: .networkGood,
+        .stateWarn: .networkWarn,
+        .stateBad: .networkBad,
+    ]
+
+    /// Rule → capture name, for hosts that resolve names.
+    public static let ruleTokenNames: [NetworkRule: String] = ruleScope.mapValues(\.captureName)
 
     /// Scope per rule ordinal, resolved once.
     static let ruleScopes: [SyntaxScope] = (0..<NetworkRule.allCases.count).map { ordinal in
-        guard let rule = HighlightScanner.rule(ordinal: ordinal), let token = ruleTokenNames[rule] else {
-            return .none
-        }
-        return SyntaxScope(captureName: token) ?? .none
+        guard let rule = HighlightScanner.rule(ordinal: ordinal) else { return .none }
+        return ruleScope[rule] ?? .none
     }
 
     /// Everything a line needs about its vendor, resolved once per process and
@@ -492,8 +513,9 @@ public enum NetworkConfigHighlighter {
             for i in range { scopes[i - base] = scope }
         }
 
+        /// A validator's verdict: SheepTerm's `state-bad` red.
         mutating func error(_ range: Range<Int>) {
-            overrides.append((.error, range))
+            overrides.append((.networkBad, range))
             blocked.append(range)
         }
     }
@@ -557,7 +579,7 @@ public enum NetworkConfigHighlighter {
             while next < tokens.count, !resolved.subCommands.isEmpty,
                   let sub = lowercased(text, tokens[next]),
                   let child = resolved.subCommands[sub] {
-                paint.fill(.keyword, tokens[next])
+                if rules.firstTokenIsKeyword { paint.fill(.keyword, tokens[next]) }
                 resolved = child
                 next += 1
             }
@@ -584,13 +606,17 @@ public enum NetworkConfigHighlighter {
             if previousOpensAList {
                 let after = paintVlanArgument(at: index, tokens: tokens, text, into: &paint)
                 if after > index {
+                    // `vlan 10,20` is one yellow span in SheepTerm, keyword included.
+                    if rules.vlanListIntroducerMatcher.contains(text, previous) {
+                        paint.fill(.networkVlan, previous)
+                    }
                     previous = tokens[after - 1]
                     index = after
                     continue
                 }
             }
             if rules.freeTextMatcher.contains(text, token) { return }
-            if rules.subKeywordMatcher.contains(text, token) {
+            if rules.firstTokenIsKeyword, rules.subKeywordMatcher.contains(text, token) {
                 paint.fill(.keyword, token)
             } else if rules.paintsPlainNumbers {
                 paintPlainNumber(text, token, into: &paint)
@@ -610,9 +636,8 @@ public enum NetworkConfigHighlighter {
             return paintVlanArgument(at: index, tokens: tokens, text, into: &paint)
         case .oneOf(let allowed):
             let token = tokens[index]
-            if let value = lowercased(text, token), allowed.contains(value) {
-                paint.fill(.constant, token)
-            } else {
+            // A member stays plain, as in SheepTerm; only a wrong value is painted.
+            if !(lowercased(text, token).map(allowed.contains) ?? false) {
                 paint.error(token)
             }
             return index + 1
@@ -656,13 +681,13 @@ public enum NetworkConfigHighlighter {
                 while itemEnd > itemBegin, isBlank(text[itemEnd - 1]) { itemEnd -= 1 }
                 if itemEnd > itemBegin {
                     if isValidVlanItem(text, itemBegin..<itemEnd) {
-                        paint.fill(.number, itemBegin..<itemEnd)
+                        paint.fill(.networkVlan, itemBegin..<itemEnd)
                     } else {
                         paint.error(itemBegin..<itemEnd)
                     }
                 }
                 if cursor == end { break }
-                paint.fill(.punctuation, cursor..<(cursor + 1))
+                paint.fill(.networkVlan, cursor..<(cursor + 1))
                 itemStart = cursor + 1
             }
             cursor += 1

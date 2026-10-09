@@ -1831,7 +1831,7 @@ final class EditorTextView: NSTextView {
     }
 
     private func promptMACAddressConversionOptions() -> MACAddressConversionOptions? {
-        let alert = NSAlert()
+        let alert = SheepAlert()
         alert.messageText = "Convert MAC Address"
         alert.informativeText = "Choose the output format."
         alert.addButton(withTitle: "Convert")

@@ -292,15 +292,15 @@ final class SyntaxAuditFixTests: XCTestCase {
             "the tail that became its own line is not inside changedRanges \(ranges)"
         )
 
-        // And it really did change colour: keyword, not number.
-        let keyword = second.value.attribute(.foregroundColor, at: twenty, effectiveRange: nil) as? NSColor
-        let stillANumber = ns.range(of: "vlan 30 40")
-        let number = second.value.attribute(
-            .foregroundColor, at: stillANumber.location + 8, effectiveRange: nil
+        // And it really did change colour: no longer a VLAN item once `vlan`
+        // is on another line.
+        let tailColour = second.value.attribute(.foregroundColor, at: twenty, effectiveRange: nil) as? NSColor
+        let stillAnItem = ns.range(of: "vlan 30 40")
+        let item = second.value.attribute(
+            .foregroundColor, at: stillAnItem.location + 5, effectiveRange: nil
         ) as? NSColor
-        XCTAssertNotNil(keyword)
-        XCTAssertNotNil(number)
-        XCTAssertNotEqual(keyword, number, "the split tail should now be a keyword, not a number")
+        XCTAssertNotNil(item)
+        XCTAssertNotEqual(tailColour, item, "the split tail should no longer be a VLAN item")
     }
 
     // MARK: - S1 + S2 as one invariant
@@ -473,20 +473,22 @@ final class SyntaxAuditFixTests: XCTestCase {
         let number = colour("10.0.0.1")
         let subKeyword = colour("access")
 
-        for value in [comment, keyword, validVlan, invalidVlan, invalidMode, validMode, number, subKeyword] {
+        for value in [comment, validVlan, invalidVlan, invalidMode, number] {
             XCTAssertNotNil(value)
         }
-        XCTAssertEqual(invalidVlan, invalidMode, "both are the error scope")
+        XCTAssertEqual(invalidVlan, invalidMode, "both are the state-bad red")
         XCTAssertNotEqual(validVlan, invalidVlan)
         XCTAssertNotEqual(validMode, invalidMode)
-        XCTAssertEqual(validVlan, number, "both are the number scope")
-        XCTAssertEqual(subKeyword, keyword, "sub-keywords take the keyword scope")
+        XCTAssertNotEqual(validVlan, number, "a VLAN id and an address wear SheepTerm's two inks")
+        // Command words, sub-keywords and a valid mode are plain, as in SheepTerm.
+        XCTAssertEqual(subKeyword, keyword)
+        XCTAssertEqual(validMode, keyword)
 
-        // A tab-indented line is still tokenised, and the comma is punctuation.
+        // A tab-indented line is still tokenised, and the comma is part of the
+        // yellow list, as SheepTerm's one vlan span is.
         let comma = ns.range(of: ",")
         let commaColour = result.attribute(.foregroundColor, at: comma.location, effectiveRange: nil) as? NSColor
-        XCTAssertNotNil(commaColour)
-        XCTAssertNotEqual(commaColour, validVlan)
+        XCTAssertEqual(commaColour, validVlan)
     }
 
     // MARK: - S11

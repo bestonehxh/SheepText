@@ -382,7 +382,7 @@ private struct DocumentBadges: View {
     }
 
     private func promptGoToLine() {
-        let alert = NSAlert()
+        let alert = SheepAlert()
         alert.messageText = "Go to Line"
         alert.informativeText = "Enter a line number."
         alert.addButton(withTitle: "Go")

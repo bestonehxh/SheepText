@@ -478,7 +478,7 @@ private struct FileTreeNodeView: View {
     }
 
     private func deleteNode() {
-        let alert = NSAlert()
+        let alert = SheepAlert()
         alert.messageText = "Delete \"\(node.name)\"?"
         alert.informativeText = "The item will be moved to the Trash."
         alert.alertStyle = .warning
@@ -500,7 +500,7 @@ private struct FileTreeNodeView: View {
     }
 
     private func promptName(title: String, message: String, value: String) -> String? {
-        let alert = NSAlert()
+        let alert = SheepAlert()
         alert.messageText = title
         alert.informativeText = message
         alert.addButton(withTitle: "OK")
@@ -515,7 +515,7 @@ private struct FileTreeNodeView: View {
     }
 
     private func showFileAlert(_ message: String) {
-        let alert = NSAlert()
+        let alert = SheepAlert()
         alert.messageText = message
         alert.alertStyle = .warning
         alert.runModal()

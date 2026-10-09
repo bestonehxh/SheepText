@@ -227,7 +227,7 @@ final class DocumentStore {
                 removeRecent(accessibleURL)
             }
             if showError {
-                NSAlert.show(message: "Cannot open \(accessibleURL.lastPathComponent): \(error.localizedDescription)", style: .warning)
+                SheepAlert.show(message: "Cannot open \(accessibleURL.lastPathComponent): \(error.localizedDescription)", style: .warning)
             }
             return nil
         }
@@ -324,7 +324,7 @@ final class DocumentStore {
         )
         guard let data = try? Data(contentsOf: accessibleURL),
               let decoded = TextFileIO.decode(data: data, as: encoding) else {
-            NSAlert.show(message: "Cannot decode file as \(encoding.displayName).", style: .warning)
+            SheepAlert.show(message: "Cannot decode file as \(encoding.displayName).", style: .warning)
             return
         }
         let text = decoded.text
@@ -407,7 +407,7 @@ final class DocumentStore {
                         // the edits they just declined to overwrite with.
                         guard try saveNow(doc) else { return false }
                     } catch {
-                        NSAlert.show(message: "Save failed: \(error.localizedDescription)", style: .critical)
+                        SheepAlert.show(message: "Save failed: \(error.localizedDescription)", style: .critical)
                         return false
                     }
                 }
@@ -471,17 +471,17 @@ final class DocumentStore {
     func selectTabToCompare() {
         guard let activeID = activeDocumentID,
               let activeDoc = activeDocument else {
-            NSAlert.show(message: "No active tab to compare.", style: .warning)
+            SheepAlert.show(message: "No active tab to compare.", style: .warning)
             return
         }
 
         let others = documents.filter { $0.id != activeID }
         guard !others.isEmpty else {
-            NSAlert.show(message: "Open another tab first.", style: .warning)
+            SheepAlert.show(message: "Open another tab first.", style: .warning)
             return
         }
 
-        let alert = NSAlert()
+        let alert = SheepAlert()
         alert.messageText = "Select Tab to Compare"
         alert.informativeText = "Compare \"\(activeDoc.displayName)\" with:"
         alert.addButton(withTitle: "Compare")
@@ -504,7 +504,7 @@ final class DocumentStore {
         guard let activeID = activeDocumentID,
               let activeIndex = documents.firstIndex(where: { $0.id == activeID })
         else {
-            NSAlert.show(message: "No active tab to compare.", style: .warning)
+            SheepAlert.show(message: "No active tab to compare.", style: .warning)
             return
         }
 
@@ -519,7 +519,7 @@ final class DocumentStore {
             compareRightDocumentID = documents[activeIndex - 1].id
         } else {
             compareLeftDocumentID = nil
-            NSAlert.show(
+            SheepAlert.show(
                 message: "Open another tab first, then run Compare with Right Tab again.",
                 style: .warning
             )
@@ -530,13 +530,13 @@ final class DocumentStore {
     func selectFileToCompare(_ url: URL) {
         normalizeCompareState()
         guard let leftID = activeDocumentID else {
-            NSAlert.show(message: "No active tab to compare from.", style: .warning)
+            SheepAlert.show(message: "No active tab to compare from.", style: .warning)
             return
         }
 
         guard let right = open(url: url, preferences: AppPreferences.current) else { return }
         guard leftID != right.id else {
-            NSAlert.show(message: "Cannot compare a file with itself.", style: .warning)
+            SheepAlert.show(message: "Cannot compare a file with itself.", style: .warning)
             return
         }
 
@@ -590,7 +590,7 @@ final class DocumentStore {
             return
         }
         do { try saveNow(doc) } catch {
-            NSAlert.show(message: "Save failed: \(error.localizedDescription)", style: .critical)
+            SheepAlert.show(message: "Save failed: \(error.localizedDescription)", style: .critical)
         }
     }
 
@@ -616,7 +616,7 @@ final class DocumentStore {
         }
 
         if !failures.isEmpty {
-            NSAlert.show(
+            SheepAlert.show(
                 message: "Some files could not be saved:\n\(failures.joined(separator: "\n"))",
                 style: .critical
             )
@@ -986,7 +986,7 @@ final class DocumentStore {
     /// Cancel is the first button, so Return is the non-destructive answer: both
     /// of the others lose somebody's work.
     private static func presentExternalChangeAtSaveAlert(for doc: Document) -> ExternalChangeResolution {
-        let alert = NSAlert()
+        let alert = SheepAlert()
         alert.messageText = "\"\(doc.displayName)\" has changed on disk since you opened it."
         alert.informativeText = "Saving replaces the version on disk with yours. Reloading discards your unsaved edits."
         alert.addButton(withTitle: "Cancel")
@@ -1167,7 +1167,7 @@ final class DocumentStore {
     /// Reported when Save As is aimed at a file another tab already holds.
     /// A seam, like the other alerts here, so a test does not block on a modal.
     @ObservationIgnored var reportSaveAsConflict: @MainActor (Document, Document) -> Void = { target, existing in
-        NSAlert.show(
+        SheepAlert.show(
             message: "\"\(existing.displayName)\" is already open in another tab. "
                 + "Close that tab first, or choose a different name for \"\(target.displayName)\".",
             style: .warning
@@ -1227,7 +1227,7 @@ final class DocumentStore {
             return true
         } catch {
             doc.url = previousURL
-            NSAlert.show(message: "Save failed: \(error.localizedDescription)", style: .critical)
+            SheepAlert.show(message: "Save failed: \(error.localizedDescription)", style: .critical)
             return false
         }
     }
@@ -1272,7 +1272,7 @@ final class DocumentStore {
     private enum UnsavedChoice { case save, discard, cancel }
 
     private func presentUnsavedChangesAlert(for doc: Document) -> UnsavedChoice {
-        let alert = NSAlert()
+        let alert = SheepAlert()
         alert.messageText = "Save changes to \"\(doc.displayName)\"?"
         alert.informativeText = "Your changes will be lost if you don't save them."
         alert.addButton(withTitle: "Save")
@@ -1287,7 +1287,7 @@ final class DocumentStore {
     }
 
     private func presentDiscardChangesAlert(for doc: Document) -> Bool {
-        let alert = NSAlert()
+        let alert = SheepAlert()
         alert.messageText = "Close \"\(doc.displayName)\"?"
         alert.informativeText = "Unsaved changes will be lost."
         alert.addButton(withTitle: "Close")
@@ -1308,7 +1308,7 @@ final class DocumentStore {
                         do {
                             guard try saveNow(doc) else { return .terminateCancel }
                         } catch {
-                            NSAlert.show(message: "Save failed: \(error.localizedDescription)", style: .critical)
+                            SheepAlert.show(message: "Save failed: \(error.localizedDescription)", style: .critical)
                             return .terminateCancel
                         }
                     }
@@ -2002,7 +2002,7 @@ final class DocumentStore {
         if doc.externalChangeWarningDate == modificationDate { return }
         doc.externalChangeWarningDate = modificationDate
 
-        let alert = NSAlert()
+        let alert = SheepAlert()
         alert.messageText = "\"\(doc.displayName)\" changed on disk."
         alert.informativeText = "This tab has unsaved edits. Reloading will discard your changes; keeping your edits may overwrite the disk version when you save."
         alert.addButton(withTitle: "Keep My Changes")
@@ -2092,7 +2092,7 @@ final class DocumentStore {
     /// launch — and the returned URL is the instance that owns the scope, so
     /// the retry must read through it.
     private func promptForAccess(to url: URL) -> URL? {
-        let alert = NSAlert()
+        let alert = SheepAlert()
         alert.messageText = "SheepText needs permission to open \(url.lastPathComponent)."
         alert.informativeText = "macOS only lets SheepText read files you have picked yourself. Choose this file once and SheepText will remember it."
         alert.addButton(withTitle: "Choose File…")
@@ -2110,7 +2110,7 @@ final class DocumentStore {
         guard panel.runModal() == .OK, let chosen = panel.url else { return nil }
 
         guard chosen.canonicalFileURL == url.canonicalFileURL else {
-            NSAlert.show(
+            SheepAlert.show(
                 message: "That is a different file, so SheepText still cannot open \(url.lastPathComponent).",
                 style: .warning
             )
@@ -2129,7 +2129,7 @@ final class DocumentStore {
     }
 
     private func presentBinaryFileAlert(for url: URL) -> Bool {
-        let alert = NSAlert()
+        let alert = SheepAlert()
         alert.messageText = "\(url.lastPathComponent) does not look like a text file."
         alert.informativeText = "It contains bytes that text files do not. SheepText can show it, but the contents will be mangled, and saving would overwrite the original with that mangled text."
         alert.addButton(withTitle: "Cancel")
@@ -2143,7 +2143,7 @@ final class DocumentStore {
     /// anything, only about waiting, and they did ask for the file.
     private func presentDatalessFileAlert(for url: URL, byteCount: Int?) -> Bool {
         let size = byteCount.map { " (\(LargeFilePolicy.byteCountLabel($0)))" } ?? ""
-        let alert = NSAlert()
+        let alert = SheepAlert()
         alert.messageText = "\(url.lastPathComponent) is not downloaded to this Mac."
         alert.informativeText = "It is stored in the cloud\(size). SheepText will be unresponsive until the download finishes."
         alert.addButton(withTitle: "Download and Open")
@@ -2153,7 +2153,7 @@ final class DocumentStore {
     }
 
     private func presentHugeFileAlert(for url: URL, byteCount: Int) -> Bool {
-        let alert = NSAlert()
+        let alert = SheepAlert()
         alert.messageText = "Open large file?"
         alert.informativeText = "\(url.lastPathComponent) is \(LargeFilePolicy.byteCountLabel(byteCount)). SheepText will open it in Large File Mode with syntax highlighting and live compare refresh disabled."
         alert.addButton(withTitle: "Open")
@@ -3191,12 +3191,12 @@ enum LanguageDetector {
     }
 }
 
-// MARK: - NSAlert convenience
+// MARK: - SheepAlert convenience
 
-private extension NSAlert {
+private extension SheepAlert {
     @MainActor
     static func show(message: String, style: NSAlert.Style = .informational) {
-        let alert = NSAlert()
+        let alert = SheepAlert()
         alert.messageText = message
         alert.alertStyle = style
         alert.runModal()

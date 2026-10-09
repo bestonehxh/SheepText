@@ -103,7 +103,11 @@ nonisolated enum HighlightStyleTable {
     }()
 
     private static let obliqueScopes: Set<String> = ["emphasis", "markup.italic", "text.emphasis"]
-    private static let strokedScopes: Set<String> = ["emphasis.strong", "markup.bold", "text.strong"]
+    /// The three network state colours are SheepTerm's only bold rules.
+    private static let strokedScopes: Set<String> = [
+        "emphasis.strong", "markup.bold", "text.strong",
+        "network.state.good", "network.state.warn", "network.state.bad"
+    ]
 
     /// Keys are the conventional dotted highlight names (the ones tree-sitter
     /// popularised, which SheepSyntaxKit's `SyntaxScope.captureName` uses);
@@ -215,7 +219,19 @@ nonisolated enum HighlightStyleTable {
         // spelled `log.warning`. Same amber as `log.warning`, and the same
         // meaning as `editorModifiedAmber` in `AppColors`: attention, not
         // failure.
-        ("warning",                    0xD19A66, 0xC18401)
+        ("warning",                    0xD19A66, 0xC18401),
+        // network_config — SheepTerm's rule colours, verbatim on dark
+        // (`NetworkHighlightDefaults.presentation`), so a config reads the same
+        // in the editor as in the terminal. Light is the same hue darkened to
+        // hold contrast on white; SheepTerm has no light theme to copy.
+        ("network.vlan",               0xE8D06B, 0x9A7B00),
+        ("network.interface",          0xF0A860, 0xC0661A),
+        ("network.address",            0x6CD1E0, 0x0184BC),
+        ("network.mask",               0xC678DD, 0xA626A4),
+        ("network.mac",                0xE08BC7, 0xB4489A),
+        ("network.state.good",         0x7DD98C, 0x2E8B3E),
+        ("network.state.warn",         0xE0B568, 0xA86A00),
+        ("network.state.bad",          0xED7A7A, 0xD03A3A)
     ]
 
     /// scope → id, for the exact scopes above.

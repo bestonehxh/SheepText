@@ -78,20 +78,21 @@ final class NetworkConfigIntegrationTests: XCTestCase {
             let list = runs(source, language: language)
             XCTAssertFalse(list.isEmpty, "\(language) produced no runs")
 
-            let error = HighlightStyleTable.styleID(forCapture: "error")
-            let number = HighlightStyleTable.styleID(forCapture: "number")
-            let keyword = HighlightStyleTable.styleID(forCapture: "keyword")
+            let error = HighlightStyleTable.styleID(forCapture: "network.state.bad")
+            let vlan = HighlightStyleTable.styleID(forCapture: "network.vlan")
+            let address = HighlightStyleTable.styleID(forCapture: "network.address")
             let comment = HighlightStyleTable.styleID(forCapture: "comment")
-            let constant = HighlightStyleTable.styleID(forCapture: "constant")
+            let none = HighlightStyleTable.none
 
             XCTAssertEqual(style(list, of: "306s", in: source), error, "\(language): 306s")
             XCTAssertEqual(style(list, of: "rpvsts", in: source), error, "\(language): rpvsts")
-            XCTAssertEqual(style(list, of: "101-102", in: source), number, "\(language): 101-102")
-            XCTAssertEqual(style(list, of: "10.0.0.1", in: source), number, "\(language): address")
-            XCTAssertEqual(style(list, of: "rapid-pvst", in: source), constant, "\(language): mode")
+            XCTAssertEqual(style(list, of: "101-102", in: source), vlan, "\(language): 101-102")
+            XCTAssertEqual(style(list, of: "10.0.0.1", in: source), address, "\(language): address")
             XCTAssertEqual(style(list, of: "! header", in: source), comment, "\(language): comment")
-            XCTAssertEqual(style(list, of: "spanning-tree", in: source), keyword, "\(language): cmd")
-            XCTAssertEqual(style(list, of: "access", in: source), keyword, "\(language): sub-keyword")
+            // SheepTerm paints values, not commands: these stay plain.
+            XCTAssertEqual(style(list, of: "rapid-pvst", in: source), none, "\(language): mode")
+            XCTAssertEqual(style(list, of: "spanning-tree", in: source), none, "\(language): cmd")
+            XCTAssertEqual(style(list, of: "access", in: source), none, "\(language): sub-keyword")
         }
     }
 
@@ -102,26 +103,27 @@ final class NetworkConfigIntegrationTests: XCTestCase {
         let list = runs(source, language: "cisco_ios")
         XCTAssertEqual(
             style(list, of: "GigabitEthernet1/0/24", in: source),
-            HighlightStyleTable.styleID(forCapture: "type")
+            HighlightStyleTable.styleID(forCapture: "network.interface")
         )
         // `shutdown` is bad, `no shutdown` is good — the package's negation rule.
         let bad = style(list, of: " shutdown\n", in: source)
         let ns = source as NSString
         let good = style(list, at: ns.range(of: "no shutdown").location)
-        XCTAssertEqual(scope(good), "string")
+        XCTAssertEqual(scope(good), "network.state.good")
         XCTAssertNotEqual(good, bad)
     }
 
-    /// Paint order, both directions: a scanner span beats the editor's generic
-    /// first-token keyword, and a validator's red beats a scanner span.
+    /// Paint order: a validator's red beats a scanner span, and Cisco's own
+    /// list validation paints `vlan 10` in the same yellow as the package's
+    /// vlan rule does everywhere else.
     func testScannerBeatsFillAndValidatorsBeatTheScanner() {
         // Huawei keeps the package's VLAN rule, which spans the keyword too.
         let huawei = "vlan batch 10 to 20\n"
         let huaweiRuns = runs(huawei, language: "network_config:huawei")
         XCTAssertEqual(
             style(huaweiRuns, of: "vlan", in: huawei),
-            HighlightStyleTable.styleID(forCapture: "constant"),
-            "the scanner's vlan span must win over the first-token keyword"
+            HighlightStyleTable.styleID(forCapture: "network.vlan"),
+            "the scanner's vlan span covers the keyword"
         )
 
         // Cisco suppresses it and validates instead.
@@ -129,11 +131,11 @@ final class NetworkConfigIntegrationTests: XCTestCase {
         let ciscoRuns = runs(cisco, language: "network_config:cisco")
         XCTAssertEqual(
             style(ciscoRuns, of: "vlan", in: cisco),
-            HighlightStyleTable.styleID(forCapture: "keyword")
+            HighlightStyleTable.styleID(forCapture: "network.vlan")
         )
         XCTAssertEqual(
             style(ciscoRuns, of: "306s", in: cisco),
-            HighlightStyleTable.styleID(forCapture: "error")
+            HighlightStyleTable.styleID(forCapture: "network.state.bad")
         )
     }
 
@@ -219,7 +221,7 @@ final class NetworkConfigIntegrationTests: XCTestCase {
         let list = runs(withAddress, language: "network_config")
         XCTAssertEqual(
             style(list, of: "10.20.30.40", in: withAddress),
-            HighlightStyleTable.styleID(forCapture: "number")
+            HighlightStyleTable.styleID(forCapture: "network.address")
         )
         // No first-token keyword, no comment marker: `the` is untouched.
         XCTAssertEqual(style(list, at: 0), HighlightStyleTable.none)
@@ -361,15 +363,16 @@ final class NetworkConfigIntegrationTests: XCTestCase {
         """
         let list = runs(source, language: "cisco_ios")
         let ns = source as NSString
-        let number = HighlightStyleTable.styleID(forCapture: "number")
+        let number = HighlightStyleTable.styleID(forCapture: "network.address")
+        let mask = HighlightStyleTable.styleID(forCapture: "network.mask")
 
-        for token in ["10.20.30.40", "255.255.255.0"] {
+        for (token, expected) in [("10.20.30.40", number), ("255.255.255.0", mask)] {
             let range = ns.range(of: token)
             guard let run = list.first(where: { $0.location == range.location }) else {
                 return XCTFail("no run starts at \(token)")
             }
             XCTAssertEqual(run.length, range.length, "\(token) run length")
-            XCTAssertEqual(run.style, number, "\(token) style")
+            XCTAssertEqual(run.style, expected, "\(token) style")
             // Nothing painted on the character before or after it.
             XCTAssertEqual(style(list, at: range.location - 1), HighlightStyleTable.none)
         }
@@ -379,7 +382,7 @@ final class NetworkConfigIntegrationTests: XCTestCase {
             return XCTFail("no run starts at the MAC")
         }
         XCTAssertEqual(macRun.length, mac.length)
-        XCTAssertEqual(scope(macRun.style), "property")
+        XCTAssertEqual(scope(macRun.style), "network.mac")
         XCTAssertNotEqual(macRun.style, number, "a MAC and an address must not share ink")
 
         // Every run has to land inside the document.
@@ -492,17 +495,16 @@ final class NetworkConfigIntegrationTests: XCTestCase {
         XCTAssertNotEqual(asCisco, asHuawei)
         XCTAssertEqual(
             style(asHuawei, of: "batch", in: source),
-            HighlightStyleTable.styleID(forCapture: "constant")
+            HighlightStyleTable.styleID(forCapture: "network.vlan")
         )
     }
 
     // MARK: - Palette
 
     func testTheStateWordsMapToThreeDistinctColours() {
-        // `warning` was not a scope in the table before this language needed it.
-        let good = HighlightStyleTable.styleID(forCapture: "string")
-        let warn = HighlightStyleTable.styleID(forCapture: "warning")
-        let bad = HighlightStyleTable.styleID(forCapture: "error")
+        let good = HighlightStyleTable.styleID(forCapture: "network.state.good")
+        let warn = HighlightStyleTable.styleID(forCapture: "network.state.warn")
+        let bad = HighlightStyleTable.styleID(forCapture: "network.state.bad")
         for id in [good, warn, bad] { XCTAssertNotEqual(id, HighlightStyleTable.none) }
         XCTAssertNotEqual(good, warn)
         XCTAssertNotEqual(warn, bad)
@@ -511,6 +513,21 @@ final class NetworkConfigIntegrationTests: XCTestCase {
                 HighlightStyleTable.color(warn, isDark: isDark),
                 HighlightStyleTable.color(bad, isDark: isDark)
             )
+        }
+    }
+
+    /// The editor paints a config exactly as SheepTerm does: every rule's dark
+    /// colour is SheepTerm's hex, and its three state words are the bold ones.
+    func testEveryRuleWearsSheepTermsColourOnDark() {
+        for rule in NetworkRule.allCases {
+            guard let token = NetworkConfigHighlighter.ruleTokenNames[rule],
+                  let presentation = NetworkHighlightDefaults.presentation[rule] else {
+                return XCTFail("no capture name or presentation for \(rule.rawValue)")
+            }
+            let id = HighlightStyleTable.styleID(forCapture: token)
+            let style = HighlightStyleTable.styles[Int(id)]
+            XCTAssertEqual(String(format: "%06X", style.dark), presentation.colorHex, rule.rawValue)
+            XCTAssertEqual(style.stroked, presentation.bold, "\(rule.rawValue) bold")
         }
     }
 

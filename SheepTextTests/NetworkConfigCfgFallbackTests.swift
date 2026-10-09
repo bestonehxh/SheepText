@@ -82,7 +82,7 @@ final class NetworkConfigCfgFallbackTests: XCTestCase {
         )
         let ns = doc.text as NSString
         let bad = ns.range(of: "306s").location
-        let error = HighlightStyleTable.styleID(forCapture: "error")
+        let error = HighlightStyleTable.styleID(forCapture: "network.state.bad")
         XCTAssertEqual(HighlightRunList.style(at: bad, in: result.runs), error,
                        "`306s` must be red on a .cfg with no signature, as it was under cisco_ios")
     }

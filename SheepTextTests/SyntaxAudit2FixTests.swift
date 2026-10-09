@@ -47,9 +47,13 @@ final class SyntaxAudit2FixTests: XCTestCase {
         return HighlightRunList.style(at: range.location, in: list)
     }
 
-    private var error: HighlightStyleID { HighlightStyleTable.styleID(forCapture: "error") }
-    private var number: HighlightStyleID { HighlightStyleTable.styleID(forCapture: "number") }
-    private var keyword: HighlightStyleID { HighlightStyleTable.styleID(forCapture: "keyword") }
+    // network_config paints SheepTerm's rule colours: a validator's red is
+    // `state-bad`, a valid VLAN item is the vlan yellow, addresses and masks
+    // have their own inks, and command words are not painted at all.
+    private var error: HighlightStyleID { HighlightStyleTable.styleID(forCapture: "network.state.bad") }
+    private var vlan: HighlightStyleID { HighlightStyleTable.styleID(forCapture: "network.vlan") }
+    private var address: HighlightStyleID { HighlightStyleTable.styleID(forCapture: "network.address") }
+    private var mask: HighlightStyleID { HighlightStyleTable.styleID(forCapture: "network.mask") }
 
     // MARK: - S3: the `vlan` globals are not errors
 
@@ -97,10 +101,10 @@ final class SyntaxAudit2FixTests: XCTestCase {
         XCTAssertEqual(style(list, of: "306s", in: source), error)
         XCTAssertEqual(style(list, of: "4095", in: source), error)
         XCTAssertEqual(style(list, of: "5000", in: source), error)
-        XCTAssertEqual(style(list, of: "101-102", in: source), number)
-        // `vlan configuration` is a sub-command, so it is a keyword and its own
-        // argument is the list.
-        XCTAssertEqual(style(list, of: "configuration", in: source), keyword)
+        XCTAssertEqual(style(list, of: "101-102", in: source), vlan)
+        // `vlan configuration` is a sub-command: its own argument is the list,
+        // and the word itself stays plain, as in SheepTerm.
+        XCTAssertEqual(style(list, of: "configuration", in: source), HighlightStyleTable.none)
     }
 
     /// A leading `+` used to be accepted, because the validator leaned on
@@ -152,7 +156,7 @@ final class SyntaxAudit2FixTests: XCTestCase {
         // `interface Vlan10` is an interface name, never a list.
         XCTAssertEqual(
             style(list, of: "Vlan10", in: good),
-            HighlightStyleTable.styleID(forCapture: "type")
+            HighlightStyleTable.styleID(forCapture: "network.interface")
         )
     }
 
@@ -195,7 +199,7 @@ final class SyntaxAudit2FixTests: XCTestCase {
                 XCTAssertNotEqual(run.style, error, "false red in `\(line)`")
             }
             XCTAssertEqual(
-                style(painted, of: line.contains("except") ? "5-10" : "30-40", in: source), number,
+                style(painted, of: line.contains("except") ? "5-10" : "30-40", in: source), vlan,
                 "`\(line)`: the list should be validated, not ignored"
             )
         }
@@ -239,15 +243,15 @@ final class SyntaxAudit2FixTests: XCTestCase {
                 "`\(token)` is inside free text and must stay plain"
             )
         }
-        // The command word itself is still the command.
-        XCTAssertEqual(style(list, of: "description", in: source), keyword)
-        XCTAssertEqual(style(list, of: "banner", in: source), keyword)
+        // Command words are plain, as in SheepTerm.
+        XCTAssertEqual(style(list, of: "description", in: source), HighlightStyleTable.none)
+        XCTAssertEqual(style(list, of: "banner", in: source), HighlightStyleTable.none)
         // And a real config line beside them still works.
         XCTAssertEqual(
             style(list, of: "GigabitEthernet1/0/1", in: source),
-            HighlightStyleTable.styleID(forCapture: "type")
+            HighlightStyleTable.styleID(forCapture: "network.interface")
         )
-        XCTAssertEqual(style(list, of: "vlan 10\n", in: source), keyword)
+        XCTAssertEqual(style(list, of: "vlan 10\n", in: source), vlan)
     }
 
     // MARK: - S8: a spaced list
@@ -258,8 +262,8 @@ final class SyntaxAudit2FixTests: XCTestCase {
     func testASpacedVlanListValidatesEveryItem() {
         let source = "vlan 10, 20, 5000\n"
         let list = runs(source, language: "network_config:cisco")
-        XCTAssertEqual(style(list, of: "10", in: source), number)
-        XCTAssertEqual(style(list, of: "20", in: source), number)
+        XCTAssertEqual(style(list, of: "10", in: source), vlan)
+        XCTAssertEqual(style(list, of: "20", in: source), vlan)
         XCTAssertEqual(style(list, of: "5000", in: source), error)
 
         // The space itself is not part of any item's run.
@@ -323,8 +327,8 @@ final class SyntaxAudit2FixTests: XCTestCase {
         let nbsp = "\u{00A0}"
         let source = " ip address 10.0.0.1\(nbsp)255.255.255.0\n"
         let list = runs(source, language: "network_config:cisco")
-        XCTAssertEqual(style(list, of: "10.0.0.1", in: source), number)
-        XCTAssertEqual(style(list, of: "255.255.255.0", in: source), number)
+        XCTAssertEqual(style(list, of: "10.0.0.1", in: source), address)
+        XCTAssertEqual(style(list, of: "255.255.255.0", in: source), mask)
     }
 
     /// U+2028/U+2029 split a line for `NSString.lineRange`, which is what the
