@@ -89,7 +89,10 @@ public enum SyntaxLanguage: String, CaseIterable, Sendable {
         case .html: MarkupLexer.lex(.html, &ctx, from, to, &state)
         case .xml: MarkupLexer.lex(.xml, &ctx, from, to, &state)
         case .json: JSONLexer.lex(&ctx, from, to, &state)
-        case .log: LogLexer.lex(&ctx, from, to, &state)
+        // A log is painted exactly as SheepTerm's Auto profile paints a
+        // session: addresses, masks, CIDR, MACs, VLAN ids and the core state
+        // words, in SheepTerm's colours — no keywords, no interface guesses.
+        case .log: NetworkConfigHighlighter.lex(.auto, &ctx, from, to)
         case .markdown: MarkdownLexer.lex(&ctx, from, to, &state)
         case .php: PHPLexer.lex(&ctx, from, to, &state)
         case .python: PythonLexer.lex(&ctx, from, to, &state)

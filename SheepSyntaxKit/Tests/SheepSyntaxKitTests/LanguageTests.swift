@@ -251,15 +251,20 @@ final class LanguageTests: XCTestCase {
         XCTAssertEqual(scope(of: "--- a/file", in: source, .diff), .diffHeader)
     }
 
-    func testLogWholeWords() {
-        let source = "2026-09-27 10:00:00 ERROR download failed on Gi1/0/1 vlan 10 from 10.0.0.1"
-        XCTAssertEqual(scope(of: "2026", in: source, .log), .comment)
-        XCTAssertEqual(scope(of: "ERROR", in: source, .log), .logError)
+    /// A log is SheepTerm's Auto profile: values and the core state words,
+    /// whole words only; no timestamps, no interface names, no keywords.
+    func testLogIsSheepTermsAutoProfile() {
+        let source = "2026-09-27 10:00:00 ERROR download failed on Gi1/0/1 vlan 10 from 10.0.0.1 255.255.255.0 interface up"
+        XCTAssertEqual(scope(of: "2026", in: source, .log), .none)
+        XCTAssertEqual(scope(of: "ERROR", in: source, .log), .networkBad)
         XCTAssertEqual(scope(of: "download", in: source, .log), .none)
-        XCTAssertEqual(scope(of: "failed", in: source, .log), .logError)
-        XCTAssertEqual(scope(of: "Gi1/0/1", in: source, .log), .property)
-        XCTAssertEqual(scope(of: "vlan 10", in: source, .log), .constant)
-        XCTAssertEqual(scope(of: "10.0.0.1", in: source, .log), .function)
+        XCTAssertEqual(scope(of: "failed", in: source, .log), .networkBad)
+        XCTAssertEqual(scope(of: "Gi1/0/1", in: source, .log), .none)
+        XCTAssertEqual(scope(of: "vlan 10", in: source, .log), .networkVlan)
+        XCTAssertEqual(scope(of: "10.0.0.1", in: source, .log), .networkAddress)
+        XCTAssertEqual(scope(of: "255.255.255.0", in: source, .log), .networkMask)
+        XCTAssertEqual(scope(of: "interface", in: source, .log), .none)
+        XCTAssertEqual(scope(of: "up", in: source, .log), .networkGood)
     }
 
     func testSQL() {

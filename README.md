@@ -14,7 +14,7 @@ conversion).
 
 ## ⬇️ Download
 
-[![Download SheepText for macOS](https://img.shields.io/badge/Download-SheepText_4.0_for_macOS-2ea44f?style=for-the-badge&logo=apple&logoColor=white)](https://github.com/bestonehxh/SheepText/releases/latest)
+[![Download SheepText for macOS](https://img.shields.io/badge/Download-SheepText_4.1_for_macOS-2ea44f?style=for-the-badge&logo=apple&logoColor=white)](https://github.com/bestonehxh/SheepText/releases/latest)
 
 **[Get the latest release →](https://github.com/bestonehxh/SheepText/releases/latest)** — download the `.zip`, unzip, and drag **SheepText.app** into `Applications`.
 

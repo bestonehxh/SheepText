@@ -526,6 +526,22 @@ final class DocumentStoreBookkeepingTests: XCTestCase {
             defaults.set(previousOpen, forKey: "sheeptext.session.openFiles")
             defaults.set(previousActive, forKey: "sheeptext.session.activeFile")
         }
+        // `restoreSessionTabs` also brings back unsaved drafts, and the drafts
+        // folder is shared by every test in this process: a draft another test
+        // left behind came back as a third tab, depending on test order. Start
+        // from an empty folder and put whatever was there back afterwards.
+        let drafts = AppStorageLocation.applicationSupport.appendingPathComponent("Drafts", isDirectory: true)
+        let parked = directory.appendingPathComponent("parked-drafts", isDirectory: true)
+        if FileManager.default.fileExists(atPath: drafts.path) {
+            try FileManager.default.moveItem(at: drafts, to: parked)
+        }
+        defer {
+            try? FileManager.default.removeItem(at: drafts)
+            if FileManager.default.fileExists(atPath: parked.path) {
+                try? FileManager.default.moveItem(at: parked, to: drafts)
+            }
+        }
+
         // Both files were open last time; the launch file was also one of them.
         defaults.set([sessionFile.path, launchFile.path], forKey: "sheeptext.session.openFiles")
         defaults.set(sessionFile.path, forKey: "sheeptext.session.activeFile")
