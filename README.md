@@ -4,12 +4,13 @@
 
 # 🐑 SheepText
 
-**A fast, native macOS text editor — AppKit + SwiftUI, tree-sitter highlighting, and a JavaScript plugin system.**
+**A fast, native macOS text editor — AppKit + SwiftUI, with its own pure-Swift syntax highlighter.**
 
 SheepText is built for people who want a lightweight editor that stays out of the way:
 cold start under 300 ms, a small footprint, Sublime-familiar shortcuts — with a few
-tricks aimed at network engineers (Cisco IOS and Aruba CX syntax modes, log
-highlighting, MAC address format conversion).
+tricks aimed at network engineers (device-config highlighting for ten vendor
+families in the same colours as SheepTerm, log highlighting, MAC address format
+conversion).
 
 ## ⬇️ Download
 
@@ -22,7 +23,8 @@ highlighting, MAC address format conversion).
 > `xattr -dr com.apple.quarantine /Applications/SheepText.app`
 >
 > Requires macOS 26.4 (Tahoe) or later, Apple Silicon.
-> The app can check for updates on its own (Settings → General).
+> After that, SheepText updates itself: it checks for new releases automatically and
+> installs them with one click (Settings → Updates → Check Now to check right away).
 
 ## The Sheep family 🐑
 
@@ -31,7 +33,7 @@ SheepText is one of a few small native macOS apps for network engineers:
 |  | App | What it does |
 |---|---|---|
 | <img src="https://raw.githubusercontent.com/bestonehxh/SheepTerm/main/.github/icon.png?v=3" width="48" height="48" alt="SheepTerm"> | **[SheepTerm](https://github.com/bestonehxh/SheepTerm)**<br>[⬇️ Download](https://github.com/bestonehxh/SheepTerm/releases/latest) | SSH / Serial / local-shell terminal for network engineers |
-| <img src="https://raw.githubusercontent.com/bestonehxh/SheepText/main/.github/icon.png?v=3" width="48" height="48" alt="SheepText"> | **[SheepText](https://github.com/bestonehxh/SheepText)**<br>[⬇️ Download](https://github.com/bestonehxh/SheepText/releases/latest) | Fast text editor with tree-sitter highlighting and a JavaScript plugin system |
+| <img src="https://raw.githubusercontent.com/bestonehxh/SheepText/main/.github/icon.png?v=3" width="48" height="48" alt="SheepText"> | **[SheepText](https://github.com/bestonehxh/SheepText)**<br>[⬇️ Download](https://github.com/bestonehxh/SheepText/releases/latest) | Fast native text editor with network-config highlighting and side-by-side compare |
 | <img src="https://raw.githubusercontent.com/bestonehxh/SheepDrop/main/.github/icon.png?v=3" width="48" height="48" alt="SheepDrop"> | **[SheepDrop](https://github.com/bestonehxh/SheepDrop)**<br>[⬇️ Download](https://github.com/bestonehxh/SheepDrop/releases/latest) | SFTP / SCP / FTP / TFTP file transfer — client and built-in server |
 | <img src="https://raw.githubusercontent.com/bestonehxh/SheepTap/main/.github/icon.png?v=3" width="48" height="48" alt="SheepTap"> | **[SheepTap](https://github.com/bestonehxh/SheepTap)**<br>[⬇️ Download](https://github.com/bestonehxh/SheepTap/releases/latest) | Menu-bar viewer for your Mac's network interfaces with click-to-copy |
 | <img src="https://raw.githubusercontent.com/bestonehxh/SheepPing/main/.github/icon.png?v=3" width="48" height="48" alt="SheepPing"> | **[SheepPing](https://github.com/bestonehxh/SheepPing)**<br>[⬇️ Download](https://github.com/bestonehxh/SheepPing/releases/latest) | Continuous multi-host ping monitor with per-host logs and CSV export |
@@ -58,14 +60,21 @@ The servers and hypervisor control a network lab needs, native on the Mac:
   binary-file guard on open
 - Correct Thai / grapheme-cluster column handling
 
-### Syntax highlighting (tree-sitter)
-- **29 languages**: Swift, JSON, YAML, Markdown, HTML, CSS, JavaScript, TypeScript,
-  Python, Go, Rust, Shell, Ruby, Java, C, C#, TOML, XML, Elixir, Scala, Haskell,
-  PHP, SQL, Diff, Dockerfile, plain text, **Log**, **Cisco IOS**, and **Aruba CX**
-- Smart extension detection (`.cfg`/`.ios` → Cisco IOS, `.cx`/`.aoscx` → Aruba CX,
-  `.log`/`.conf` → Log, `Dockerfile` by filename) — remappable at runtime by plugins
+### Syntax highlighting
+- Its own highlighter, written in pure Swift (no tree-sitter, no C): a full pass over a
+  1 MB file takes milliseconds and a keystroke re-colours only the lines it affects
+- **28 languages**: Swift, JSON, YAML, Markdown, HTML, CSS, JavaScript, TypeScript,
+  Python, Go, Rust, Shell, Ruby, Java, C / C++ / Objective-C, C#, TOML, XML, Elixir,
+  Scala, Haskell, PHP, SQL, Diff, Dockerfile, plain text, **Log**, and **Network config**
+- **Network config**: one mode for Cisco, Aruba CX, ArubaOS, Huawei, H3C Comware,
+  Juniper, Palo Alto PAN-OS, FortiOS, Check Point Gaia and Linux. The vendor is
+  detected from the content (or picked from the status bar), and the colours match
+  SheepTerm: interfaces orange, VLANs yellow, addresses cyan, masks purple, MACs pink,
+  up / warning / down states in bold green, amber and red. Cisco VLAN lists and
+  spanning-tree modes are checked — a typo like `vlan 306s` shows in red
+- Smart extension detection (`.cfg` `.ios` `.cisco` `.conf` `.txt` → Network config,
+  `.cx` `.aoscx` → Aruba CX, `.log` → Log, `Dockerfile` by filename)
 - Highlight themes: Adaptive (follows system), One Dark, One Light
-- User-overridable `highlights.scm` queries per language
 
 ### Find & replace
 - Find / Find and Replace in the document (⌘F / ⌘⌥F)
@@ -84,33 +93,9 @@ Convert Line Endings (LF/CRLF), Convert Indentation (2/4 spaces or tabs)
 
 ### Workspace
 - Open a folder as workspace: file tree, create/rename/delete, recent folders
-- **Command palette** (⌘⇧P) with fuzzy search over every command — plugins included
+- **Command palette** (⌘⇧P) with fuzzy search over every command
 - Automatic encoding detection (UTF-8/UTF-16/Latin-1/Windows-1252 …), BOM and
   line-ending preservation
-
-### Plugin system
-JavaScript plugins (JavaScriptCore, sandboxed per plugin) loaded from
-`~/Library/Application Support/SheepText/Plugins/`. A plugin is a folder with a
-`plugin.json` manifest and a `src/index.js`:
-
-```json
-{
-  "id": "hello-world",
-  "name": "Hello World",
-  "version": "1.0.0",
-  "main": "src/index.js",
-  "contributes": {
-    "commands": [{ "id": "hello.reverseLine", "title": "Reverse Current Line" }],
-    "keybindings": [{ "command": "hello.reverseLine", "key": "cmd+alt+r" }]
-  }
-}
-```
-
-Available bridges: `commands` (register/execute), `editor` (text, selection, current
-line, language, extension→language remapping), `fs` (scoped to the workspace and the
-plugin folder), `workspace` (root path, glob file search), `ui` (notifications,
-status messages), and `console` logging. Two example plugins ship in
-[`Plugins/`](Plugins/).
 
 ## Requirements
 
@@ -123,22 +108,14 @@ xcodebuild -project SheepText.xcodeproj -scheme SheepText -configuration Release
   -destination 'platform=macOS,arch=arm64' build
 ```
 
-Swift package dependencies (tree-sitter grammars) resolve automatically. Run the
-tests with:
+There are no remote dependencies: the highlighter (`SheepSyntaxKit`) and the
+network-config scanner (`NetworkHighlightKit`) are local Swift packages in this repo.
+Run the tests with:
 
 ```bash
 xcodebuild test -project SheepText.xcodeproj -scheme SheepText \
   -destination 'platform=macOS,arch=arm64'
 ```
-
-## Acknowledgements
-
-- [swift-tree-sitter](https://github.com/tree-sitter/swift-tree-sitter) and the
-  [tree-sitter](https://tree-sitter.github.io) ecosystem — grammars for each language
-  are pulled via Swift Package Manager; see each grammar's repository for its license
-- Vendored grammars (all MIT): [tree-sitter-diff](TreeSitterDiffVendored/LICENSE)
-  (Michael Davis), [tree-sitter-sql](TreeSitterSqlVendored/LICENSE) (Derek Stride),
-  [tree-sitter-yaml](TreeSitterYAMLVendored/LICENSE) (tree-sitter-grammars / Ika)
 
 ## License
 
